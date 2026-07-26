@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Codex Gate — 실행 관제기</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div><p class="eyebrow">LOCAL CONTROL PLANE</p><h1>Codex Gate</h1></div>
+      <div class="connection"><span id="connection-dot" class="dot"></span><span><span id="connection-text">Codex 연결 전</span><small id="codex-meta"></small></span><button id="connect" class="button ghost">연결</button></div>
+    </header>
+
+    <section class="intro">
+      <p>웹 GPT는 판단하고, Codex는 새 스레드에서 실행합니다. 이 화면은 모델·범위·예산을 통제합니다.</p>
+      <span class="pill">Ultra LOCKED</span>
+    </section>
+
+    <section class="grid primary-grid">
+      <article class="panel project-panel">
+        <div class="panel-title"><span>01</span><h2>프로젝트</h2></div>
+        <label>프로젝트 이름<input id="project-name" value="새 프로젝트" maxlength="120"></label>
+        <label>정본 작업 폴더<input id="root" placeholder="C:\\projects\\my-project" spellcheck="false"></label>
+        <p class="hint">쓰기 권한은 이 폴더 안으로만 제한됩니다.</p>
+      </article>
+      <article class="panel task-panel">
+        <div class="panel-title"><span>02</span><h2>작업 카드</h2></div>
+        <label>원하는 작업<textarea id="task" rows="5" placeholder="예: API timeout 재현 테스트를 추가하고 원인을 조사해줘."></textarea></label>
+        <div class="row"><label>권한<select id="permission"><option value="read-only">Read Only</option><option value="workspace-write">Workspace Write</option></select></label>
+        <label>예산<select id="budget"><option value="tiny">Tiny · 250K</option><option value="standard" selected>Standard · 750K</option><option value="complex">Complex · 2M</option><option value="critical">Critical · 4M</option></select></label></div>
+        <button id="preflight" class="button wide">로컬 사전 분석</button>
+      </article>
+    </section>
+
+    <section class="grid analysis-grid">
+      <article class="panel analysis-panel">
+        <div class="panel-title"><span>03</span><h2>사전 분석</h2></div>
+        <div class="metrics"><div><small>위험도</small><strong id="risk">—</strong></div><div><small>관련 파일</small><strong id="file-count">—</strong></div><div><small>예상 컨텍스트</small><strong id="context">—</strong></div></div>
+        <p id="git-status" class="hint">프로젝트를 분석하면 파일 메타데이터와 Git 상태만 수집합니다.</p>
+      </article>
+      <article class="panel routing-panel">
+        <div class="panel-title"><span>04</span><h2>Codex 라우팅</h2></div>
+        <div class="row"><label>모델<select id="model" disabled><option>먼저 연결</option></select></label><label>추론 강도<select id="effort" disabled><option>—</option></select></label></div>
+        <p class="hint">목록과 강도 순서는 app-server가 제공한 값을 그대로 사용합니다. Ultra는 표시하지 않습니다.</p>
+      </article>
+    </section>
+
+    <section class="grid bridge-grid">
+      <article class="panel">
+        <div class="panel-title"><span>05</span><h2>웹 GPT 상담</h2></div>
+        <textarea id="web-packet" rows="12" readonly placeholder="사전 분석 뒤 상담 패킷이 여기에 생성됩니다."></textarea>
+        <button id="copy-packet" class="button ghost wide">웹 GPT 상담 패킷 복사</button>
+      </article>
+      <article class="panel">
+        <div class="panel-title"><span>06</span><h2>결정 JSON</h2></div>
+        <textarea id="decision" rows="12" spellcheck="false" placeholder='웹 GPT의 JSON을 붙여넣으세요.'></textarea>
+        <p class="hint">execute, allowed_files, validation_commands, stop_conditions를 검증합니다.</p>
+      </article>
+    </section>
+
+    <section class="action-bar"><div id="message" role="status">Codex를 연결하고 작업 카드를 작성하세요.</div><button id="execute" class="button accent" disabled>새 Codex 스레드에서 실행</button></section>
+
+    <section id="run-panel" class="panel run-panel hidden">
+      <div class="panel-title"><span>RUN</span><h2>실행 감시</h2><span id="run-status" class="status">starting</span></div>
+      <div class="metrics five"><div><small>처리 토큰</small><strong id="run-tokens">0 / —</strong></div><div><small>도구 호출</small><strong id="run-tools">0 / —</strong></div><div><small>변경 파일</small><strong id="run-files">0 / —</strong></div><div><small>실패 명령</small><strong id="run-failures">0</strong></div><div><small>모델</small><strong id="run-model">—</strong></div></div>
+      <section id="approvals" class="approvals hidden" aria-live="polite"></section>
+      <div class="event-log" id="events"></div>
+      <button id="interrupt" class="button danger">즉시 종료</button>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
