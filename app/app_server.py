@@ -61,15 +61,16 @@ class AppServerClient:
 
     @property
     def workspace_write_available(self) -> bool:
-        # This release deliberately keeps Workspace Write locked until a real write
-        # validation is approved. `workspace_write_schema_ready` exposes readiness.
         return False
 
     @property
     def workspace_write_schema_ready(self) -> bool:
         return bool(
-            self.protocol and self.protocol.workspace_write_supported and self.protocol.approvals_supported
-            and self.protocol.on_request_supported and self.protocol.approvals_reviewer_user_supported
+            self.protocol
+            and self.protocol.workspace_write_supported
+            and self.protocol.approvals_supported
+            and self.protocol.on_request_supported
+            and self.protocol.approvals_reviewer_user_supported
         )
 
     async def connect(self) -> list[dict[str, Any]]:
@@ -80,8 +81,12 @@ class AppServerClient:
         await self._generate_schema()
         try:
             self.process = await asyncio.create_subprocess_exec(
-                self.command, "app-server", "--stdio",
-                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                self.command,
+                "app-server",
+                "--stdio",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
         except OSError as exc:
             raise AppServerError(f"Codex app-server를 시작하지 못했습니다: {exc}") from exc
@@ -115,7 +120,10 @@ class AppServerClient:
             result = await asyncio.to_thread(
                 subprocess.run,
                 [self.command, "app-server", "generate-json-schema", "--out", str(self.schema_dir)],
-                capture_output=True, text=True, timeout=30, check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
             )
             if result.returncode:
                 raise AppServerError(result.stderr.strip() or "Schema 생성 명령이 실패했습니다.")
@@ -173,7 +181,7 @@ class AppServerClient:
 
     async def _request_once(self, method: str, params: dict[str, Any]) -> Any:
         if not self.connected or not self.process or not self.process.stdin:
-            raise AppServerError("Codex app-server에 연결되어 있지 않습니다.")
+            raise AppServerError("Codex app-server가 연결되어 있지 않습니다.")
         self.request_id += 1
         request_id = self.request_id
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
@@ -189,10 +197,9 @@ class AppServerClient:
         await self._send({"method": method, "params": params})
 
     async def respond(self, request_id: int | str, result: dict[str, Any]) -> None:
-        """Reply to a server-originated JSON-RPC request; never adds a client request id."""
         method = self.server_request_methods.get(request_id)
         if not method:
-            raise AppServerError("알 수 없거나 이미 응답한 server request입니다.")
+            raise AppServerError("이미 응답했거나 서버 요청으로 추적되지 않은 request입니다.")
         self._validate_approval_response(method, result)
         await self._send({"id": request_id, "result": result})
         self.server_request_methods.pop(request_id, None)
@@ -201,11 +208,14 @@ class AppServerClient:
         await self._send({"id": request_id, "error": {"code": code, "message": message}})
         self.server_request_methods.pop(request_id, None)
 
+    async def unsubscribe_thread(self, thread_id: str) -> Any:
+        return await self.request("thread/unsubscribe", {"threadId": thread_id})
+
     def _validate_outgoing_request(self, method: str, params: dict[str, Any]) -> None:
         if method not in {"thread/start", "turn/start"}:
             return
         if not self.protocol:
-            raise AppServerError("생성 schema가 없어 thread/turn 시작 payload를 검증할 수 없습니다.")
+            raise AppServerError("생성된 schema가 없어 thread/turn 시작 payload를 검증할 수 없습니다.")
         schema_name = "thread_start" if method == "thread/start" else "turn_start"
         try:
             self.protocol.validate(schema_name, params)
@@ -214,7 +224,7 @@ class AppServerClient:
 
     def _validate_approval_response(self, method: str, result: dict[str, Any]) -> None:
         if not self.protocol:
-            raise AppServerError("생성 schema가 없어 승인 응답을 검증할 수 없습니다.")
+            raise AppServerError("생성된 schema가 없어 승인 응답을 검증할 수 없습니다.")
         kind = APPROVAL_METHODS.get(method)
         if not kind:
             raise AppServerError("미지원 server request에는 승인 응답을 보낼 수 없습니다.")
@@ -225,7 +235,7 @@ class AppServerClient:
 
     async def _send(self, payload: dict[str, Any]) -> None:
         if not self.process or not self.process.stdin:
-            raise AppServerError("Codex app-server에 연결되어 있지 않습니다.")
+            raise AppServerError("Codex app-server가 연결되어 있지 않습니다.")
         raw = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
         async with self.write_lock:
             self.process.stdin.write(raw)
@@ -296,7 +306,6 @@ class AppServerClient:
         except ProtocolValidationError as exc:
             await self.respond_error(request_id, -32602, str(exc))
         except Exception as exc:
-            # Record the dispatch failure and ensure the server is never left waiting.
             await self.respond_error(request_id, -32603, f"Approval handling failed: {exc}")
             raise
 

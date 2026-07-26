@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
-from app.policy import PolicyError, parse_git_porcelain_v2_z, resolve_project_path, validate_project_file
+from app.policy import PolicyError, forbidden_workspace_reason, parse_git_porcelain_v2_z, resolve_project_path, validate_project_file, validate_workspace_root
 
 
 def test_relative_and_absolute_paths_must_stay_inside_root(tmp_path):
@@ -67,3 +68,19 @@ def test_git_porcelain_v2_z_parser_handles_spaces_quotes_and_renames():
     assert "new path.txt" in paths
     assert "old path.txt" in paths
     assert "untracked file with spaces.txt" in paths
+
+
+def test_forbidden_workspace_blocks_parent_same_and_child_paths_with_windows_semantics():
+    forbidden = [Path(r"E:\.codex")]
+    assert "blocked" in forbidden_workspace_reason(r"E:\\", forbidden)
+    assert "blocked" in forbidden_workspace_reason(r"E:\.codex", forbidden)
+    assert "blocked" in forbidden_workspace_reason(r"e:\.CODEX\cache", forbidden)
+    assert forbidden_workspace_reason(r"E:\OtherProject", forbidden) is None
+
+
+def test_windows_absolute_workspace_string_is_rejected_on_non_windows():
+    if os.name == "nt":
+        assert forbidden_workspace_reason(r"E:\OtherProject", [Path(r"E:\.codex")]) is None
+    else:
+        with pytest.raises(PolicyError, match="Windows absolute workspace paths"):
+            validate_workspace_root(r"E:\OtherProject")

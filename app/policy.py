@@ -5,7 +5,7 @@ import re
 import subprocess
 import uuid
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Sequence
 
 
@@ -83,11 +83,39 @@ def canonical_path_text(value: str | Path) -> str:
     return Path(value).as_posix().casefold()
 
 
+def _normalize_text(value: str | Path) -> str:
+    return str(value).strip()
+
+
+def _windows_absolute_path(value: str | Path) -> PureWindowsPath | None:
+    candidate = PureWindowsPath(_normalize_text(value))
+    if candidate.is_absolute() and candidate.drive:
+        return candidate
+    return None
+
+
+def _windows_parts(value: PureWindowsPath) -> tuple[str, tuple[str, ...]]:
+    return value.drive.casefold(), tuple(part.casefold() for part in value.parts[1:])
+
+
+def _windows_is_relative_to(parent: PureWindowsPath, child: PureWindowsPath) -> bool:
+    parent_drive, parent_parts = _windows_parts(parent)
+    child_drive, child_parts = _windows_parts(child)
+    return parent_drive == child_drive and child_parts[:len(parent_parts)] == parent_parts
+
+
 def _path_key(value: str | Path) -> str:
+    windows_path = _windows_absolute_path(value)
+    if windows_path is not None:
+        return str(windows_path).replace("/", "\\").casefold().rstrip("\\")
     return Path(value).expanduser().resolve(strict=False).as_posix().casefold().rstrip("/")
 
 
 def _is_within_root(root: str | Path, candidate: str | Path) -> bool:
+    windows_root = _windows_absolute_path(root)
+    windows_candidate = _windows_absolute_path(candidate)
+    if windows_root is not None or windows_candidate is not None:
+        return windows_root is not None and windows_candidate is not None and _windows_is_relative_to(windows_root, windows_candidate)
     root_key = _path_key(root)
     candidate_key = _path_key(candidate)
     return candidate_key == root_key or candidate_key.startswith(f"{root_key}/")
@@ -114,11 +142,32 @@ def configured_forbidden_roots(extra: Sequence[str | Path] | None = None) -> tup
     return tuple(deduped)
 
 
-def validate_workspace_root(root: str | Path, forbidden_roots: Sequence[str | Path] | None = None) -> Path:
+def forbidden_workspace_reason(root: str | Path, forbidden_roots: Sequence[str | Path] | None = None) -> str | None:
+    windows_root = _windows_absolute_path(root)
+    if windows_root is not None:
+        for forbidden in configured_forbidden_roots(forbidden_roots):
+            windows_forbidden = _windows_absolute_path(forbidden)
+            if windows_forbidden is None:
+                continue
+            if _windows_is_relative_to(windows_forbidden, windows_root) or _windows_is_relative_to(windows_root, windows_forbidden):
+                return f"workspace root is blocked by forbidden root: {forbidden}"
+        return None
+
     root_path = Path(root).expanduser().resolve(strict=False)
     for forbidden in configured_forbidden_roots(forbidden_roots):
-        if _is_within_root(forbidden, root_path):
-            raise PolicyError(f"workspace root is blocked: {root_path}")
+        if _is_within_root(forbidden, root_path) or _is_within_root(root_path, forbidden):
+            return f"workspace root is blocked by forbidden root: {forbidden}"
+    return None
+
+
+def validate_workspace_root(root: str | Path, forbidden_roots: Sequence[str | Path] | None = None) -> Path:
+    windows_root = _windows_absolute_path(root)
+    if windows_root is not None and os.name != "nt":
+        raise PolicyError("Windows absolute workspace paths are not allowed on this platform")
+    root_path = Path(root).expanduser().resolve(strict=False)
+    reason = forbidden_workspace_reason(root_path if windows_root is None else str(windows_root), forbidden_roots=forbidden_roots)
+    if reason:
+        raise PolicyError(reason)
     if not root_path.is_dir():
         raise PolicyError("project root directory does not exist")
     return root_path
@@ -128,6 +177,8 @@ def resolve_project_path(root: str | Path, value: str) -> tuple[Path, str]:
     """Resolve a candidate path and reject traversal, symlink, junction, and volume escapes."""
     root_path = Path(root).expanduser().resolve(strict=False)
     raw = Path(value).expanduser()
+    if _windows_absolute_path(value) is not None and os.name != "nt":
+        raise PolicyError("project path escapes the configured root")
     if raw.drive and not raw.is_absolute():
         raise PolicyError("project path escapes the configured root")
     candidate = raw if raw.is_absolute() else root_path / raw
@@ -175,6 +226,44 @@ def validate_artifact_name(value: str) -> str:
     if candidate not in ALLOWED_ARTIFACT_NAMES:
         raise PolicyError("artifact name is not allowed")
     return candidate
+
+
+def find_forbidden_root_reference(payload: Any, forbidden_roots: Sequence[str | Path] | None = None) -> str | None:
+    needles = tuple(
+        (_normalize_text(root), _normalize_text(root).casefold().replace("/", "\\").rstrip("\\"))
+        for root in configured_forbidden_roots(forbidden_roots)
+    )
+    return _find_forbidden_root_reference(payload, needles)
+
+
+def _find_forbidden_root_reference(payload: Any, needles: tuple[tuple[str, str], ...]) -> str | None:
+    if isinstance(payload, str):
+        normalized = payload.casefold().replace("/", "\\")
+        for display, needle in needles:
+            if not needle:
+                continue
+            start = normalized.find(needle)
+            while start != -1:
+                end = start + len(needle)
+                before_ok = start == 0 or normalized[start - 1] in "\\/ \t\r\n'\";:,([{"
+                after_ok = end == len(normalized) or normalized[end] in "\\/ \t\r\n'\";:,)]}"
+                if before_ok and after_ok:
+                    return display
+                start = normalized.find(needle, start + 1)
+        return None
+    if isinstance(payload, dict):
+        for value in payload.values():
+            match = _find_forbidden_root_reference(value, needles)
+            if match:
+                return match
+        return None
+    if isinstance(payload, (list, tuple, set)):
+        for value in payload:
+            match = _find_forbidden_root_reference(value, needles)
+            if match:
+                return match
+        return None
+    return None
 
 
 def model_choices(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
