@@ -29,7 +29,7 @@
         <div class="panel-title"><span>02</span><h2>작업 카드</h2></div>
         <label>원하는 작업<textarea id="task" rows="5" placeholder="예: API timeout 재현 테스트를 추가하고 원인을 조사해줘."></textarea></label>
         <div class="row"><label>권한<select id="permission"><option value="read-only">Read Only</option><option value="workspace-write">Workspace Write</option></select></label>
-        <label>예산<select id="budget"><option value="tiny">Tiny · 250K</option><option value="standard" selected>Standard · 750K</option><option value="complex">Complex · 2M</option><option value="critical">Critical · 4M</option></select></label></div>
+        <label>계획 예산<input id="planned-budget" value="Route Plan 생성 후 표시" readonly></label></div>
         <button id="preflight" class="button wide">로컬 사전 분석</button>
       </article>
     </section>
@@ -42,22 +42,64 @@
       </article>
       <article class="panel routing-panel">
         <div class="panel-title"><span>04</span><h2>Codex 라우팅</h2></div>
-        <div class="row"><label>모델<select id="model" disabled><option>먼저 연결</option></select></label><label>추론 강도<select id="effort" disabled><option>—</option></select></label></div>
-        <p class="hint">목록과 강도 순서는 app-server가 제공한 값을 그대로 사용합니다. Ultra는 표시하지 않습니다.</p>
+        <div class="row"><label>카탈로그 모델<select id="model" disabled><option>먼저 연결</option></select></label><label>카탈로그 추론 강도<select id="effort" disabled><option>—</option></select></label></div>
+        <p class="hint">표시 전용입니다. 실행 모델·강도는 결정 JSON으로 만든 Route Plan에서만 가져옵니다. Ultra는 표시하지 않습니다.</p>
       </article>
+    </section>
+
+    <section class="grid account-grid">
+      <article class="panel">
+        <div class="panel-title"><span>05</span><h2>계정 한도</h2><span id="account-state" class="status">UNKNOWN</span></div>
+        <div class="metrics"><div><small>계정 상태</small><strong id="account-auth">UNKNOWN</strong></div><div><small>사용률</small><strong id="account-used">UNKNOWN</strong></div><div><small>리셋 시각</small><strong id="account-reset">UNKNOWN</strong></div></div>
+        <p id="account-meta" class="hint">계정 전체 rate limit은 모델별 잔여량이 아닙니다.</p>
+        <p id="usage-meta" class="hint">일별 토큰 사용량: UNKNOWN</p>
+      </article>
+      <article class="panel">
+        <div class="panel-title"><span>06</span><h2>모델 카탈로그</h2></div>
+        <p class="hint">모델 상태는 수동 상태이며 계정 전체 한도와 독립적입니다.</p>
+        <div class="catalog-scroll"><table class="catalog-table"><thead><tr><th>모델</th><th>Efforts (server order)</th><th>Speed tiers</th><th>수동 상태</th></tr></thead><tbody id="model-catalog"></tbody></table></div>
+      </article>
+    </section>
+
+    <section class="panel router-preview-panel">
+      <div class="panel-title"><span>07</span><h2>자동 하향 라우터 미리보기</h2><span class="status">PREVIEW ONLY</span></div>
+      <div class="row preview-controls">
+        <label>작업 등급<select id="router-task-class"><option value="T0">T0 · Spark</option><option value="T1" selected>T1 · Spark / mini</option><option value="T2">T2 · mini / Luna</option><option value="T3">T3 · 5.4 / Terra</option><option value="T4">T4 · Terra / 5.4</option><option value="T5">T5 · Sol / 5.5</option></select></label>
+        <label>위험도<select id="router-risk"><option value="low">low</option><option value="medium" selected>medium</option><option value="high">high</option></select></label>
+        <label>독립 축 수<input id="router-axes" type="number" min="0" max="20" value="0"></label>
+      </div>
+      <div class="preview-flags"><label><input id="router-parallel" type="checkbox"> parallel audit</label><label><input id="router-ultra-approval" type="checkbox"> Ultra 명시 승인</label></div>
+      <button id="router-preview" class="button wide">웹 GPT 추천 상한 기준 미리보기</button>
+      <p class="hint">계정 상태·사전 분석 파일 수·테스트 여부를 함께 반영합니다. 표시 결과는 실제 thread/start·turn/start의 모델 또는 추론 강도를 바꾸지 않습니다.</p>
+      <div id="router-result" class="router-result" aria-live="polite"></div>
     </section>
 
     <section class="grid bridge-grid">
       <article class="panel">
-        <div class="panel-title"><span>05</span><h2>웹 GPT 상담</h2></div>
+        <div class="panel-title"><span>08</span><h2>웹 GPT 상담</h2></div>
         <textarea id="web-packet" rows="12" readonly placeholder="사전 분석 뒤 상담 패킷이 여기에 생성됩니다."></textarea>
         <button id="copy-packet" class="button ghost wide">웹 GPT 상담 패킷 복사</button>
       </article>
       <article class="panel">
-        <div class="panel-title"><span>06</span><h2>결정 JSON</h2></div>
+        <div class="panel-title"><span>09</span><h2>결정 JSON</h2></div>
         <textarea id="decision" rows="12" spellcheck="false" placeholder='웹 GPT의 JSON을 붙여넣으세요.'></textarea>
-        <p class="hint">execute, allowed_files, validation_commands, stop_conditions를 검증합니다.</p>
+        <button id="create-plan" class="button wide" disabled>불변 Route Plan 생성</button>
+        <p class="hint">risk, parallel_audit, independent_axes와 정확한 allowed_files 범위, validation evidence를 검증합니다.</p>
       </article>
+    </section>
+
+    <section id="route-plan" class="panel route-plan hidden">
+      <div class="panel-title"><span>PLAN</span><h2>불변 Route Plan</h2><span id="plan-status" class="status">HOLD</span></div>
+      <dl class="plan-details">
+        <div><dt>Plan ID</dt><dd id="plan-id">—</dd></div>
+        <div><dt>Decision SHA-256</dt><dd id="plan-hash">—</dd></div>
+        <div><dt>Expires</dt><dd id="plan-expiry">—</dd></div>
+        <div><dt>Final route</dt><dd id="plan-final">—</dd></div>
+        <div><dt>Plan budget</dt><dd id="plan-budget">—</dd></div>
+        <div><dt>Planned scope</dt><dd id="plan-scope">—</dd></div>
+        <div><dt>Validation evidence</dt><dd id="plan-validation">—</dd></div>
+      </dl>
+      <pre id="plan-reasons" class="plan-reasons"></pre>
     </section>
 
     <section class="action-bar"><div id="message" role="status">Codex를 연결하고 작업 카드를 작성하세요.</div><button id="execute" class="button accent" disabled>새 Codex 스레드에서 실행</button></section>

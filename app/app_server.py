@@ -163,12 +163,28 @@ class AppServerClient:
         cursor: str | None = None
         while True:
             response = await self.request("model/list", {"cursor": cursor} if cursor else {})
+            self._validate_server_response("model_list_response", response)
             collected.extend(response.get("data", []))
             cursor = response.get("nextCursor")
             if not cursor:
                 return collected
 
-    async def request(self, method: str, params: dict[str, Any]) -> Any:
+    async def read_account(self) -> dict[str, Any]:
+        response = await self.request("account/read", {})
+        self._validate_server_response("account_response", response)
+        return response
+
+    async def read_rate_limits(self) -> dict[str, Any]:
+        response = await self.request("account/rateLimits/read", None)
+        self._validate_server_response("rate_limits_response", response)
+        return response
+
+    async def read_usage(self) -> dict[str, Any]:
+        response = await self.request("account/usage/read", None)
+        self._validate_server_response("usage_response", response)
+        return response
+
+    async def request(self, method: str, params: dict[str, Any] | None) -> Any:
         self._validate_outgoing_request(method, params)
         for retry in range(4):
             try:
@@ -179,14 +195,17 @@ class AppServerClient:
                 await asyncio.sleep(self.retry_base_seconds * (2 ** retry))
         raise AssertionError("unreachable")
 
-    async def _request_once(self, method: str, params: dict[str, Any]) -> Any:
+    async def _request_once(self, method: str, params: dict[str, Any] | None) -> Any:
         if not self.connected or not self.process or not self.process.stdin:
             raise AppServerError("Codex app-server가 연결되어 있지 않습니다.")
         self.request_id += 1
         request_id = self.request_id
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         self.pending[request_id] = future
-        await self._send({"id": request_id, "method": method, "params": params})
+        payload: dict[str, Any] = {"id": request_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+        await self._send(payload)
         try:
             return await asyncio.wait_for(future, timeout=30)
         except asyncio.TimeoutError as exc:
@@ -211,14 +230,26 @@ class AppServerClient:
     async def unsubscribe_thread(self, thread_id: str) -> Any:
         return await self.request("thread/unsubscribe", {"threadId": thread_id})
 
-    def _validate_outgoing_request(self, method: str, params: dict[str, Any]) -> None:
+    def _validate_outgoing_request(self, method: str, params: dict[str, Any] | None) -> None:
         if method not in {"thread/start", "turn/start"}:
             return
         if not self.protocol:
             raise AppServerError("생성된 schema가 없어 thread/turn 시작 payload를 검증할 수 없습니다.")
+        if not isinstance(params, dict):
+            raise AppServerError("thread/turn payload must be an object")
         schema_name = "thread_start" if method == "thread/start" else "turn_start"
         try:
             self.protocol.validate(schema_name, params)
+        except ProtocolValidationError as exc:
+            raise AppServerError(str(exc)) from exc
+
+    def _validate_server_response(self, schema_name: str, response: Any) -> None:
+        if not isinstance(response, dict):
+            raise AppServerError(f"{schema_name} response must be an object")
+        if not self.protocol:
+            raise AppServerError("Generated schema is unavailable for app-server response validation.")
+        try:
+            self.protocol.validate(schema_name, response)
         except ProtocolValidationError as exc:
             raise AppServerError(str(exc)) from exc
 

@@ -1,6 +1,14 @@
 import pytest
 
-from app.policy import Decision, PolicyError, model_choices, validate_selection, validate_workspace
+from app.policy import (
+    Decision,
+    PolicyError,
+    model_choices,
+    validate_allowed_file_scope,
+    validate_selection,
+    validate_workspace,
+    validation_evidence,
+)
 
 
 MODELS = [{
@@ -30,3 +38,25 @@ def test_workspace_write_rejects_high_risk_work(tmp_path):
 def test_decision_requires_structured_lists():
     with pytest.raises(PolicyError, match="allowed_files"):
         Decision.from_json({"decision": "execute", "task_class": "patch", "recommended_model": "m", "recommended_effort": "high", "allowed_files": "a.py"})
+
+
+def test_decision_route_fields_and_validation_evidence_are_structured(tmp_path):
+    (tmp_path / "tests").mkdir()
+    value = Decision.from_json({
+        "decision": "execute",
+        "task_class": "T3",
+        "recommended_model": "m",
+        "recommended_effort": "high",
+        "allowed_files": ["a.py", "./a.py"],
+        "validation_commands": ["pytest -q"],
+        "risk": "high",
+        "parallel_audit": True,
+        "independent_axes": 3,
+    })
+    files, reasons = validate_allowed_file_scope(tmp_path, value.allowed_files)
+    evidence = validation_evidence(tmp_path, value.validation_commands)
+    assert (value.risk, value.parallel_audit, value.independent_axes) == ("high", True, 3)
+    assert files == ["a.py"] and reasons == []
+    assert evidence["validation_commands_present"] is True
+    assert evidence["local_test_target_exists"] is True
+    assert evidence["has_tests"] is True

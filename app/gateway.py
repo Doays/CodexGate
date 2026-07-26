@@ -5,21 +5,29 @@ import json
 import subprocess
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from .app_server import AppServerClient
 from .policy import (
     Decision,
     PolicyError,
-    budget_for,
+    budget_for_task_class,
+    canonical_json,
     collect_git_paths,
     find_forbidden_root_reference,
+    sha256_json,
+    sha256_text,
+    validate_allowed_file_scope,
     validate_decision_for_run,
+    validate_project_id,
     validate_project_file,
     validate_selection,
+    validation_evidence,
     validate_workspace,
 )
 from .protocol import APPROVAL_METHODS, is_permission_subset
+from .router import route_preview
 from .storage import Store
 
 
@@ -52,6 +60,12 @@ class Run:
     approvals: dict[str, "Approval"] = field(default_factory=dict)
     initial_git_paths: set[str] = field(default_factory=set)
     subscribers: set[asyncio.Queue[dict[str, Any]]] = field(default_factory=set)
+    route_plan_id: str | None = None
+    decision_hash: str | None = None
+    requested_model: str | None = None
+    actual_model: str | None = None
+    reroute_reason: str | None = None
+    token_warning_emitted: bool = False
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -76,6 +90,11 @@ class Run:
             "stop_reason": self.stop_reason,
             "events": self.events,
             "approvals": [approval.snapshot() for approval in self.approvals.values() if approval.status == "pending"],
+            "route_plan_id": self.route_plan_id,
+            "decision_hash": self.decision_hash,
+            "requested_model": self.requested_model,
+            "actual_model": self.actual_model,
+            "reroute_reason": self.reroute_reason,
         }
 
 
@@ -127,7 +146,30 @@ class Gate:
         self.client = AppServerClient(self.handle_event, self.handle_server_request, self.handle_disconnect)
 
     async def connect(self) -> list[dict[str, Any]]:
-        return await self.client.connect()
+        models = await self.client.connect()
+        self.store.save_model_catalog(models)
+        await self._refresh_account_snapshots()
+        return models
+
+    async def _refresh_account_snapshots(self) -> None:
+        queries = (
+            ("account", "read_account", self.store.save_account),
+            ("rate_limits", "read_rate_limits", self.store.save_rate_limits),
+            ("usage", "read_usage", self.store.save_usage),
+        )
+        for kind, name, save in queries:
+            query = getattr(self.client, name, None)
+            if not callable(query):
+                continue
+            try:
+                response = await query()
+                if isinstance(response, dict):
+                    save(response)
+                else:
+                    self.store.mark_account_unknown(kind)
+            except Exception:
+                # A failed account query is explicitly UNKNOWN, never an invented zero balance.
+                self.store.mark_account_unknown(kind)
 
     def status(self) -> dict[str, Any]:
         return {
@@ -140,59 +182,204 @@ class Gate:
             "schema_error": getattr(self.client, "schema_error", None),
             "workspace_write_available": False,
             "workspace_write_schema_ready": getattr(self.client, "workspace_write_schema_ready", False),
+            "account_usage": self.store.account_overview(),
+            "model_catalog": self.store.model_catalog(),
         }
 
-    async def start_run(self, payload: dict[str, Any]) -> Run:
-        models = await self.connect()
-        if payload["permission"] == "workspace-write":
-            raise PolicyError("Workspace Write는 실제 쓰기 검증 전까지 잠금 상태입니다.")
-
-        decision = Decision.from_json(payload["decision"])
+    def create_route_plan(self, payload: dict[str, Any], ttl_seconds: int = 600) -> dict[str, Any]:
+        allowed_fields = {"project_name", "project_id", "root", "task", "decision", "permission", "explicit_ultra_approval"}
+        unexpected = sorted(set(payload) - allowed_fields)
+        if unexpected:
+            raise PolicyError(f"Route Plan input has unsupported fields: {', '.join(unexpected)}")
+        project_id = validate_project_id(payload["project_id"])
         root = validate_workspace(payload["root"], payload["permission"], payload["task"])
-        validate_decision_for_run(decision, payload["permission"])
-        validate_selection(models, payload["model"], payload["effort"])
-        budget = budget_for(payload["budget_level"])
+        decision = Decision.from_json(payload["decision"])
+        normalized_files, scope_reasons = validate_allowed_file_scope(root, decision.allowed_files)
+        evidence = validation_evidence(root, decision.validation_commands)
+        account = self.store.account_overview()
+        models = self.store.router_models()
+        preview = route_preview(
+            models,
+            task_class=decision.task_class,
+            risk=decision.risk,
+            read_only=payload["permission"] == "read-only",
+            file_count=len(normalized_files),
+            has_tests=evidence["has_tests"],
+            web_recommendation={
+                "model": decision.recommended_model,
+                "effort": decision.recommended_effort,
+            },
+            account_state=account["account_state"],
+            account_usage=account,
+            parallel_audit=decision.parallel_audit,
+            independent_axes=decision.independent_axes,
+            explicit_ultra_approval=bool(payload.get("explicit_ultra_approval", False)),
+        )
+        hold_reasons = list(preview.get("hold_reasons", []))
+        hold_reasons.extend(scope_reasons)
+        forbidden = self._forbidden_reference_reason({"task": payload["task"], "decision": decision.as_dict()})
+        if forbidden:
+            hold_reasons.append(forbidden)
+        if decision.decision == "hold":
+            hold_reasons.append("Decision is HOLD.")
+        if payload["permission"] != "read-only":
+            hold_reasons.append("Workspace Write remains locked; Route Plan execution is Read Only only.")
+        if hold_reasons:
+            preview = {**preview, "status": "HOLD", "final": None, "hold_reasons": list(dict.fromkeys(hold_reasons))}
+        decision_payload = decision.as_dict()
+        budget_level, budget = budget_for_task_class(decision.task_class)
+        record = {
+            "decision": decision_payload,
+            "decision_canonical_json": canonical_json(decision_payload),
+            "decision_hash": sha256_json(decision_payload),
+            "task": payload["task"],
+            "task_hash": sha256_text(payload["task"]),
+            "root": str(root),
+            "project_id": project_id,
+            "account_snapshot_at": account.get("rate_limits", {}).get("captured_at"),
+            "account_state": account["account_state"],
+            "model_catalog_hash": sha256_json(models),
+            "status": preview["status"],
+            "final": preview.get("final"),
+            "hold_reasons": preview.get("hold_reasons", []),
+            "candidate_ladder": preview.get("candidate_ladder", []),
+            "planned_file_count": len(normalized_files),
+            "allowed_files": normalized_files,
+            "validation_evidence": evidence,
+            "permission": payload["permission"],
+            "budget_level": budget_level,
+            "budget": budget,
+            "route_preview": preview,
+        }
+        return self.store.create_route_plan(record, ttl_seconds=ttl_seconds)
+
+    async def start_run(self, payload: dict[str, Any]) -> Run:
+        if set(payload) != {"route_plan_id"} or not isinstance(payload.get("route_plan_id"), str):
+            if payload.get("permission") == "workspace-write":
+                raise PolicyError("Workspace Write is locked; Gate.start_run accepts only route_plan_id")
+            raise PolicyError("Gate.start_run accepts only route_plan_id")
+        plan = self.store.load_route_plan(payload["route_plan_id"])
+        models = await self.connect()
+        root = validate_workspace(plan["root"], plan["permission"], plan["task"])
+        plan = self._validate_route_plan(plan, root, models)
+        decision = Decision.from_json(plan["decision"])
+        validate_decision_for_run(decision, plan["permission"])
+        final = plan["final"]
+        validate_selection(models, final["model"], final["effort"])
+        expected_budget_level, expected_budget = budget_for_task_class(decision.task_class)
+        if plan.get("budget_level") != expected_budget_level or plan.get("budget") != expected_budget:
+            raise PolicyError("Route Plan budget does not match its task class")
 
         run = Run(
             id=str(uuid.uuid4()),
-            project_id=payload["project_id"],
+            project_id=plan["project_id"],
             root=str(root),
-            task=payload["task"].strip(),
-            model=payload["model"],
-            effort=payload["effort"],
-            permission=payload["permission"],
-            budget_level=payload["budget_level"],
-            budget=budget,
+            task=plan["task"],
+            model=final["model"],
+            effort=final["effort"],
+            permission=plan["permission"],
+            budget_level=plan["budget_level"],
+            budget=dict(plan["budget"]),
             decision=decision.as_dict(),
+            route_plan_id=plan["plan_id"],
+            decision_hash=plan["decision_hash"],
+            requested_model=final["model"],
         )
-        self.runs[run.id] = run
-        self._store_request_artifacts(run)
-
         blocked_reason = self._forbidden_reference_reason({"task": run.task, "decision": run.decision})
         if blocked_reason:
-            return await self._reject_run_before_start(run, blocked_reason)
+            raise PolicyError(blocked_reason)
 
+        self.store.claim_route_plan(plan["plan_id"], run.id)
+        self.runs[run.id] = run
+        self._store_request_artifacts(run)
         run.initial_git_paths = self._git_paths(run.root)
         self._persist(run)
+        try:
+            thread = await self.client.request("thread/start", self._thread_start_params(run))
+            run.thread_id = thread["thread"]["id"]
+            self.store.update_route_plan_use(plan["plan_id"], "started")
 
-        thread = await self.client.request("thread/start", self._thread_start_params(run))
-        run.thread_id = thread["thread"]["id"]
-
-        turn = await self.client.request("turn/start", {
-            "threadId": run.thread_id,
-            "model": run.model,
-            "effort": run.effort,
-            "cwd": run.root,
-            "approvalPolicy": "on-request",
-            "approvalsReviewer": "user",
-            "sandboxPolicy": self._sandbox_policy(run),
-            "input": [{"type": "text", "text": self._prompt(run)}],
-        })
-        run.turn_id = turn["turn"]["id"]
-        run.status = "running"
-        await self._publish(run, "Codex 작업을 시작했습니다.")
-        self._persist(run)
+            turn = await self.client.request("turn/start", {
+                "threadId": run.thread_id,
+                "model": run.model,
+                "effort": run.effort,
+                "cwd": run.root,
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "user",
+                "sandboxPolicy": self._sandbox_policy(run),
+                "input": [{"type": "text", "text": self._prompt(run)}],
+            })
+            run.turn_id = turn["turn"]["id"]
+            actual_model = turn.get("turn", {}).get("model") if isinstance(turn, dict) else None
+            run.actual_model = actual_model if isinstance(actual_model, str) and actual_model else run.model
+            run.status = "running"
+            await self._publish(run, "Codex 작업을 시작했습니다.")
+            self._persist(run)
+        except Exception as exc:
+            run.status = "failed"
+            run.stop_reason = f"Run start failed: {exc}"
+            await self._cleanup_partial_start(run)
+            self.store.update_route_plan_use(plan["plan_id"], "failed", run.stop_reason)
+            await self._publish(run, run.stop_reason)
+            self.store.write_artifact(run.project_id, run.id, "result.json", run.snapshot())
+            self._persist(run)
         return run
+
+    def _validate_route_plan(self, plan: dict[str, Any], root, models: list[dict[str, Any]]) -> dict[str, Any]:
+        if plan["status"] != "PREVIEW" or not isinstance(plan.get("final"), dict):
+            raise PolicyError("HOLD Route Plan cannot be executed")
+        if plan["used"]:
+            raise PolicyError("Route Plan has already been used")
+        try:
+            expires_at = datetime.fromisoformat(plan["expires_at"])
+        except (TypeError, ValueError) as exc:
+            raise PolicyError("Route Plan expiry was modified") from exc
+        if expires_at <= datetime.now(timezone.utc):
+            raise PolicyError("Route Plan has expired")
+        if plan.get("permission") != "read-only":
+            raise PolicyError("Route Plan execution is Read Only only")
+        if plan["root"] != str(root):
+            raise PolicyError("Route Plan root does not match the run")
+        if not isinstance(plan.get("task"), str) or plan["task_hash"] != sha256_text(plan["task"]):
+            raise PolicyError("Route Plan task was modified")
+        current_account = self.store.account_overview()
+        planned_state = str(plan.get("account_state", "UNKNOWN")).upper()
+        current_state = str(current_account.get("account_state", "UNKNOWN")).upper()
+        severity = {"NORMAL": 0, "CONSERVE": 1, "CRITICAL": 2, "BLOCKED": 3}
+        account_worsened = (
+            current_state == "UNKNOWN" and planned_state != "UNKNOWN"
+        ) or (
+            planned_state == "UNKNOWN" and current_state in {"CRITICAL", "BLOCKED"}
+        ) or (
+            current_state in severity
+            and planned_state in severity
+            and severity[current_state] > severity[planned_state]
+        )
+        if account_worsened:
+            raise PolicyError(f"Route Plan account state worsened: {planned_state} -> {current_state}")
+        catalog = self.store.model_catalog()
+        selected = next((item for item in catalog if item["id"] == plan["final"].get("model")), None)
+        if not selected:
+            raise PolicyError("Route Plan model is no longer in the catalog")
+        if selected["status"] in {"DEPLETED", "UNKNOWN", "DISABLED"}:
+            raise PolicyError(f"Route Plan model is now {selected['status']}")
+        if str(plan["final"].get("effort", "")).casefold() == "ultra":
+            raise PolicyError("Ultra Route Plans cannot be executed in this release")
+        return plan
+
+    async def _cleanup_partial_start(self, run: Run) -> None:
+        if not run.thread_id:
+            return
+        try:
+            if run.turn_id:
+                await self.client.request("turn/interrupt", {"threadId": run.thread_id, "turnId": run.turn_id})
+            unsubscribe = getattr(self.client, "unsubscribe_thread", None)
+            if callable(unsubscribe):
+                await unsubscribe(run.thread_id)
+            else:
+                await self.client.request("thread/unsubscribe", {"threadId": run.thread_id})
+        except Exception as exc:
+            run.events.append(f"Start cleanup warning: {exc}")
 
     def _thread_start_params(self, run: Run) -> dict[str, Any]:
         sandbox = "read-only" if run.permission == "read-only" else "workspace-write"
@@ -236,11 +423,35 @@ class Gate:
 
     async def handle_event(self, message: dict[str, Any]) -> None:
         params = message.get("params", {})
+        method = message["method"]
+        if method == "account/rateLimits/updated":
+            if isinstance(params, dict):
+                self.store.merge_rate_limits(params)
+            return
         run = self._run_for_thread(params.get("threadId"))
         if not run:
             return
+        turn_payload = params.get("turn")
+        actual_model = turn_payload.get("model") if isinstance(turn_payload, dict) else None
+        if isinstance(actual_model, str) and actual_model:
+            run.actual_model = actual_model
 
-        method = message["method"]
+        if method == "model/rerouted":
+            rerouted_model = params.get("actualModel", params.get("model"))
+            reroute_reason = params.get("reason", params.get("rerouteReason"))
+            if isinstance(rerouted_model, str) and rerouted_model:
+                run.actual_model = rerouted_model
+            if isinstance(reroute_reason, str) and reroute_reason:
+                run.reroute_reason = reroute_reason
+            await self._publish(run, "model rerouted")
+            self._persist(run)
+            return
+
+        if method == "thread/compacted":
+            await self.interrupt(run.id, "thread compacted")
+            self._persist(run)
+            return
+
         if method == "serverRequest/resolved":
             self._resolve_server_request(run, params)
             await self._publish(run, "server request resolved")
@@ -263,6 +474,7 @@ class Gate:
             await self._recheck_git_paths(run)
             await self._capture_diff(run)
             await self._unsubscribe_read_only_thread(run)
+            self.store.update_route_plan_use(run.route_plan_id or "", "completed")
             await self._publish(run, f"턴 종료: {run.status}")
             self.store.write_artifact(run.project_id, run.id, "result.json", run.snapshot())
         else:
@@ -469,7 +681,8 @@ class Gate:
             await self.interrupt(run.id, "명령 실패 한도 도달")
         elif run.failed_tests >= 2:
             await self.interrupt(run.id, "테스트 연속 실패 한도 도달")
-        elif run.tokens >= int(run.budget["tokens"] * 0.8):
+        elif run.tokens >= int(run.budget["tokens"] * 0.8) and not run.token_warning_emitted:
+            run.token_warning_emitted = True
             await self._publish(run, "경고: 토큰 예산 80%에 도달했습니다.")
 
     async def _capture_diff(self, run: Run) -> None:

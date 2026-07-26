@@ -12,11 +12,12 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .gateway import Gate
 from .indexer import preflight
 from .policy import PolicyError, model_choices, validate_project_id, validate_workspace_root
+from .router import route_preview
 from .storage import Store
 
 
@@ -31,13 +32,19 @@ class PreflightRequest(BaseModel):
     task: str = Field(min_length=3, max_length=12_000)
 
 
-class RunRequest(PreflightRequest):
+class RunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    route_plan_id: str = Field(min_length=36, max_length=36)
+
+
+class RoutePlanRequest(PreflightRequest):
+    model_config = ConfigDict(extra="forbid")
+
     project_id: str = Field(min_length=1, max_length=80)
     decision: dict[str, Any]
-    model: str = Field(min_length=1)
-    effort: str = Field(min_length=1)
     permission: str
-    budget_level: str
+    explicit_ultra_approval: bool = False
 
     @field_validator("project_id")
     @classmethod
@@ -48,6 +55,28 @@ class RunRequest(PreflightRequest):
 class ApprovalResponseRequest(BaseModel):
     decision: str = Field(pattern="^(accept|acceptForSession|decline|cancel)$")
     permissions: dict[str, Any] | None = None
+
+
+class RouterPreviewRequest(BaseModel):
+    task_class: str = Field(min_length=1, max_length=40)
+    risk: str = Field(min_length=1, max_length=40)
+    read_only: bool
+    file_count: int = Field(ge=0, le=100_000)
+    has_tests: bool
+    web_recommendation: dict[str, Any]
+    parallel_audit: bool = False
+    independent_axes: int = Field(default=0, ge=0, le=20)
+    explicit_ultra_approval: bool = False
+
+
+class ModelStatusRequest(BaseModel):
+    status: str = Field(pattern="^(AVAILABLE|LIMITED|DEPLETED|UNKNOWN|DISABLED)$")
+
+
+class UsageThresholdRequest(BaseModel):
+    conserve: int = Field(ge=0, le=100)
+    critical: int = Field(ge=0, le=100)
+    blocked: int = Field(ge=0, le=100)
 
 
 def _local_host(value: str | None) -> str | None:
@@ -146,6 +175,8 @@ async def connect(request: Request):
                     "schema_error",
                     "workspace_write_available",
                     "workspace_write_schema_ready",
+                    "account_usage",
+                    "model_catalog",
                 )
             },
         }
@@ -168,6 +199,57 @@ async def start_run(payload: RunRequest, request: Request):
     try:
         run = await gate(request).start_run(payload.model_dump())
         return run.snapshot()
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/route-plans")
+async def create_route_plan(payload: RoutePlanRequest, request: Request):
+    try:
+        return gate(request).create_route_plan(payload.model_dump())
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/router/preview")
+async def router_preview(payload: RouterPreviewRequest, request: Request):
+    try:
+        store = gate(request).store
+        account_usage = store.account_overview()
+        return route_preview(
+            store.router_models(),
+            task_class=payload.task_class,
+            risk=payload.risk,
+            read_only=payload.read_only,
+            file_count=payload.file_count,
+            has_tests=payload.has_tests,
+            web_recommendation=payload.web_recommendation,
+            account_state=account_usage["account_state"],
+            account_usage=account_usage,
+            parallel_audit=payload.parallel_audit,
+            independent_axes=payload.independent_axes,
+            explicit_ultra_approval=payload.explicit_ultra_approval,
+        )
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/models/{model_id}/status")
+async def set_model_status(model_id: str, payload: ModelStatusRequest, request: Request):
+    try:
+        store = gate(request).store
+        store.set_model_status(model_id, payload.status)
+        return {"model_catalog": store.model_catalog()}
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/account/thresholds")
+async def set_usage_thresholds(payload: UsageThresholdRequest, request: Request):
+    try:
+        store = gate(request).store
+        thresholds = store.set_usage_thresholds(payload.model_dump())
+        return {"thresholds": thresholds, "account_usage": store.account_overview()}
     except Exception as exc:
         raise as_http_error(exc) from exc
 

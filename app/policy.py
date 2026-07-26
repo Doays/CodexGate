@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 import re
+import hashlib
+import json
+import shlex
 import subprocess
 import uuid
 from dataclasses import asdict, dataclass
@@ -14,6 +17,14 @@ BUDGETS = {
     "standard": {"tokens": 750_000, "tools": 30, "changed_files": 5},
     "complex": {"tokens": 2_000_000, "tools": 50, "changed_files": 10},
     "critical": {"tokens": 4_000_000, "tools": 60, "changed_files": 10},
+}
+ROUTE_PLAN_BUDGET_LEVELS = {
+    "T0": "tiny",
+    "T1": "tiny",
+    "T2": "standard",
+    "T3": "standard",
+    "T4": "complex",
+    "T5": "critical",
 }
 
 HIGH_RISK_TERMS = (
@@ -52,9 +63,22 @@ class Decision:
     forbidden_files: list[str]
     validation_commands: list[str]
     stop_conditions: list[str]
+    risk: str = "medium"
+    parallel_audit: bool = False
+    independent_axes: int = 0
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> "Decision":
+        if not isinstance(payload, dict):
+            raise PolicyError("decision JSON must be an object")
+        known = {
+            "decision", "task_class", "recommended_model", "recommended_effort",
+            "allowed_files", "forbidden_files", "validation_commands", "stop_conditions",
+            "risk", "parallel_audit", "independent_axes",
+        }
+        unexpected = sorted(set(payload) - known)
+        if unexpected:
+            raise PolicyError(f"decision JSON has unknown fields: {', '.join(unexpected)}")
         required = ("decision", "task_class", "recommended_model", "recommended_effort")
         missing = [field for field in required if not isinstance(payload.get(field), str) or not payload[field].strip()]
         if missing:
@@ -67,16 +91,46 @@ class Decision:
             lists[field] = [item.strip() for item in value]
         if payload["decision"] not in {"execute", "hold", "evidence_only"}:
             raise PolicyError("decision must be execute, hold, or evidence_only")
+        risk = payload.get("risk", "medium")
+        if not isinstance(risk, str) or risk.strip().casefold() not in {"low", "medium", "high"}:
+            raise PolicyError("risk must be low, medium, or high")
+        parallel_audit = payload.get("parallel_audit", False)
+        if not isinstance(parallel_audit, bool):
+            raise PolicyError("parallel_audit must be a boolean")
+        independent_axes = payload.get("independent_axes", 0)
+        if isinstance(independent_axes, bool) or not isinstance(independent_axes, int) or not 0 <= independent_axes <= 20:
+            raise PolicyError("independent_axes must be an integer from 0 through 20")
         return cls(
             decision=payload["decision"].strip(),
             task_class=payload["task_class"].strip(),
             recommended_model=payload["recommended_model"].strip(),
             recommended_effort=payload["recommended_effort"].strip(),
             **lists,
+            risk=risk.strip().casefold(),
+            parallel_audit=parallel_audit,
+            independent_axes=independent_axes,
         )
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    def canonical_json(self) -> str:
+        return canonical_json(self.as_dict())
+
+    def sha256(self) -> str:
+        return sha256_text(self.canonical_json())
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def sha256_json(value: Any) -> str:
+    return sha256_text(canonical_json(value))
 
 
 def canonical_path_text(value: str | Path) -> str:
@@ -190,6 +244,82 @@ def resolve_project_path(root: str | Path, value: str) -> tuple[Path, str]:
     except ValueError:
         relative = resolved.as_posix()
     return resolved, relative.casefold()
+
+
+def validate_allowed_file_scope(root: str | Path, allowed_files: list[str]) -> tuple[list[str], list[str]]:
+    """Return unique exact project-relative files and unresolved-scope reasons."""
+    root_path = Path(root).expanduser().resolve(strict=False)
+    normalized: list[str] = []
+    seen: set[str] = set()
+    reasons: list[str] = []
+    glob_characters = frozenset("*?[]{}")
+    for raw in allowed_files:
+        value = raw.strip()
+        if any(character in value for character in glob_characters):
+            reasons.append(f"allowed_files entry is a glob, not an exact file: {value}")
+            continue
+        if value.endswith(("/", "\\")):
+            reasons.append(f"allowed_files entry is a directory, not an exact file: {value}")
+            continue
+        candidate = Path(value)
+        if candidate.is_absolute() or _windows_absolute_path(value) is not None or candidate.drive:
+            reasons.append(f"allowed_files entry must be project-relative: {value}")
+            continue
+        try:
+            resolved, relative_key = resolve_project_path(root_path, value)
+        except PolicyError:
+            reasons.append(f"allowed_files entry escapes the project root: {value}")
+            continue
+        if resolved == root_path or resolved.is_dir():
+            reasons.append(f"allowed_files entry is a directory, not an exact file: {value}")
+            continue
+        relative = resolved.relative_to(root_path).as_posix()
+        if relative_key in seen:
+            continue
+        seen.add(relative_key)
+        normalized.append(relative)
+    return normalized, reasons
+
+
+def validation_evidence(root: str | Path, validation_commands: list[str]) -> dict[str, Any]:
+    """Derive test evidence only from validation commands and local target metadata."""
+    root_path = Path(root).expanduser().resolve(strict=False)
+    commands_present = bool(validation_commands)
+    checked_targets: list[str] = []
+    local_test_target_exists = False
+    for command in validation_commands:
+        try:
+            tokens = shlex.split(command, posix=os.name != "nt")
+        except ValueError:
+            tokens = command.split()
+        lowered = [token.strip("\"'").casefold() for token in tokens]
+        invokes_test_runner = any(
+            token in {"pytest", "unittest", "test"} or token.endswith(("pytest.exe", "pytest", "jest", "vitest"))
+            for token in lowered
+        ) or ("python" in lowered and "-m" in lowered and any(token in {"pytest", "unittest"} for token in lowered))
+        candidates: list[str] = []
+        for token in tokens[1:]:
+            value = token.strip("\"'")
+            if not value or value.startswith("-") or "=" in value or _windows_absolute_path(value) is not None:
+                continue
+            if "/" in value or "\\" in value or Path(value).suffix:
+                candidates.append(value.split("::", 1)[0])
+        if invokes_test_runner and not candidates:
+            candidates.extend(("tests", "test"))
+        for candidate in candidates:
+            try:
+                resolved, relative_key = resolve_project_path(root_path, candidate)
+            except PolicyError:
+                continue
+            checked_targets.append(relative_key)
+            if resolved.exists():
+                local_test_target_exists = True
+    return {
+        "validation_commands_present": commands_present,
+        "local_test_target_exists": local_test_target_exists,
+        "has_tests": commands_present and local_test_target_exists,
+        "checked_targets": list(dict.fromkeys(checked_targets)),
+    }
 
 
 def validate_project_file(root: str | Path, value: str, allowed_files: list[str], forbidden_files: list[str]) -> str:
@@ -322,6 +452,14 @@ def budget_for(level: str) -> dict[str, int]:
         return BUDGETS[level]
     except KeyError as exc:
         raise PolicyError("unknown budget level") from exc
+
+
+def budget_for_task_class(task_class: str) -> tuple[str, dict[str, int]]:
+    try:
+        level = ROUTE_PLAN_BUDGET_LEVELS[task_class.strip().upper()]
+    except (AttributeError, KeyError) as exc:
+        raise PolicyError("unknown task class for Route Plan budget") from exc
+    return level, dict(budget_for(level))
 
 
 def parse_git_porcelain_v2_z(payload: bytes | str) -> list[str]:

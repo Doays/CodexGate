@@ -1,8 +1,10 @@
 import asyncio
-import json
 from pathlib import Path
 
+import pytest
+
 from app.gateway import Gate, thread_is_ephemeral
+from app.policy import PolicyError
 from app.storage import Store
 
 
@@ -15,7 +17,7 @@ class LifecycleClient:
 
     async def connect(self):
         return [{
-            "id": "model",
+            "id": "gpt-terra",
             "hidden": False,
             "defaultReasoningEffort": "high",
             "supportedReasoningEfforts": [{"reasoningEffort": "high"}],
@@ -40,19 +42,16 @@ class LifecycleClient:
         return await self.request("thread/unsubscribe", {"threadId": thread_id})
 
 
-def _payload(root: Path):
+def _plan_payload(root: Path):
     return {
         "project_id": "project",
         "root": str(root),
         "task": "Inspect the workspace safely",
         "permission": "read-only",
-        "budget_level": "tiny",
-        "model": "model",
-        "effort": "high",
         "decision": {
             "decision": "execute",
-            "task_class": "inspect",
-            "recommended_model": "model",
+            "task_class": "T3",
+            "recommended_model": "gpt-terra",
             "recommended_effort": "high",
             "allowed_files": [],
             "forbidden_files": [],
@@ -62,8 +61,19 @@ def _payload(root: Path):
     }
 
 
+def _run_payload(gate: Gate, root: Path):
+    return {"route_plan_id": gate.create_route_plan(_plan_payload(root))["plan_id"]}
+
+
 def _gate(tmp_path):
-    gate = Gate(Store(tmp_path))
+    store = Store(tmp_path)
+    store.save_model_catalog([{
+        "id": "gpt-terra",
+        "hidden": False,
+        "defaultReasoningEffort": "high",
+        "supportedReasoningEfforts": [{"reasoningEffort": "high"}],
+    }])
+    gate = Gate(store)
     gate.client = LifecycleClient()
     return gate
 
@@ -73,7 +83,7 @@ def test_read_only_thread_start_is_ephemeral_and_workspace_write_policy_stays_du
         root = tmp_path / "project"
         root.mkdir()
         gate = _gate(tmp_path)
-        run = await gate.start_run(_payload(root))
+        run = await gate.start_run(_run_payload(gate, root))
         assert run.status == "running"
         assert thread_is_ephemeral("read-only") is True
         assert thread_is_ephemeral("workspace-write") is False
@@ -83,30 +93,28 @@ def test_read_only_thread_start_is_ephemeral_and_workspace_write_policy_stays_du
     asyncio.run(scenario())
 
 
-def test_forbidden_root_reference_in_task_or_decision_is_rejected_before_thread_start(tmp_path):
+def test_forbidden_root_reference_in_task_or_decision_holds_before_thread_start(tmp_path):
     async def scenario():
         root = tmp_path / "project"
         root.mkdir()
 
         gate = _gate(tmp_path)
-        payload = _payload(root)
+        payload = _plan_payload(root)
         payload["task"] = r"Inspect E:\.codex safely"
-        run = await gate.start_run(payload)
-        assert run.status == "failed"
-        assert r"E:\.codex" in (run.stop_reason or "")
+        plan = gate.create_route_plan(payload)
+        assert plan["status"] == "HOLD"
+        with pytest.raises(PolicyError, match="HOLD"):
+            await gate.start_run({"route_plan_id": plan["plan_id"]})
         assert gate.client.requests == []
 
         gate = _gate(tmp_path)
-        payload = _payload(root)
+        payload = _plan_payload(root)
         payload["decision"]["allowed_files"] = [r"E:\.codex\secret.txt"]
-        run = await gate.start_run(payload)
-        assert run.status == "failed"
-        assert r"E:\.codex" in (run.stop_reason or "")
+        plan = gate.create_route_plan(payload)
+        assert plan["status"] == "HOLD"
+        with pytest.raises(PolicyError, match="HOLD"):
+            await gate.start_run({"route_plan_id": plan["plan_id"]})
         assert gate.client.requests == []
-
-        result_path = tmp_path / "projects" / "project" / "tasks" / run.id / "result.json"
-        stored = json.loads(result_path.read_text(encoding="utf-8"))
-        assert r"E:\.codex" in stored["stop_reason"]
     asyncio.run(scenario())
 
 
@@ -115,9 +123,11 @@ def test_read_only_turn_completion_attempts_unsubscribe(tmp_path):
         root = tmp_path / "project"
         root.mkdir()
         gate = _gate(tmp_path)
-        await gate.start_run(_payload(root))
+        payload = _run_payload(gate, root)
+        await gate.start_run(payload)
         await gate.handle_event({"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"status": "completed"}}})
         assert any(method == "thread/unsubscribe" for method, _ in gate.client.requests)
+        assert gate.store.load_route_plan(payload["route_plan_id"])["use_status"] == "completed"
     asyncio.run(scenario())
 
 
@@ -127,7 +137,7 @@ def test_unsubscribe_failure_only_records_warning(tmp_path):
         root.mkdir()
         gate = _gate(tmp_path)
         gate.client.unsubscribe_error = "offline"
-        run = await gate.start_run(_payload(root))
+        run = await gate.start_run(_run_payload(gate, root))
         await gate.handle_event({"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"status": "completed"}}})
         assert run.status == "completed"
         assert any("unsubscribe warning" in event.lower() for event in run.events)
@@ -139,7 +149,7 @@ def test_forbidden_root_reference_in_command_request_is_rejected_and_interrupted
         root = tmp_path / "project"
         root.mkdir()
         gate = _gate(tmp_path)
-        run = await gate.start_run(_payload(root))
+        run = await gate.start_run(_run_payload(gate, root))
         await gate.handle_server_request({
             "id": "approval-1",
             "method": "item/commandExecution/requestApproval",

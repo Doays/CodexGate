@@ -42,6 +42,11 @@ class ProtocolSchema:
             "command_response": _read_json(root / "CommandExecutionRequestApprovalResponse.json"),
             "fileChange_response": _read_json(root / "FileChangeRequestApprovalResponse.json"),
             "permissions_response": _read_json(root / "PermissionsRequestApprovalResponse.json"),
+            "account_response": _read_json(root / "v2" / "GetAccountResponse.json"),
+            "rate_limits_response": _read_json(root / "v2" / "GetAccountRateLimitsResponse.json"),
+            "usage_response": _read_json(root / "v2" / "GetAccountTokenUsageResponse.json"),
+            "model_list_response": _read_json(root / "v2" / "ModelListResponse.json"),
+            "rate_limits_updated": _read_json(root / "v2" / "AccountRateLimitsUpdatedNotification.json"),
         }
         validators = {name: Draft7Validator(schema) for name, schema in schemas.items()}
         methods = _methods(server_requests)
