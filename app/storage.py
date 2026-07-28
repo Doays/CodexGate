@@ -17,6 +17,7 @@ from .policy import (
     validate_source_alias,
     validate_task_id,
 )
+from .token_ledger import build_report, normalize_baseline_payload, normalize_run_record, normalize_usage_event, render_markdown
 
 
 DEFAULT_USAGE_THRESHOLDS = {"conserve": 70, "critical": 90, "blocked": 100}
@@ -180,6 +181,124 @@ class Store:
                     model_id TEXT PRIMARY KEY,
                     status TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS ledger_runs (
+                    run_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    route_plan_id TEXT,
+                    comparison_key TEXT NOT NULL,
+                    success_criteria_hash TEXT NOT NULL,
+                    task_class TEXT NOT NULL,
+                    planned_model TEXT,
+                    actual_model TEXT,
+                    effort TEXT,
+                    status TEXT NOT NULL,
+                    quality TEXT NOT NULL,
+                    input_tokens INTEGER,
+                    cached_input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    provider_total_tokens INTEGER,
+                    processed_tokens INTEGER,
+                    non_cached_input_tokens INTEGER,
+                    cache_ratio REAL,
+                    codex_context_bytes INTEGER,
+                    web_packet_bytes INTEGER,
+                    evidence_bytes INTEGER,
+                    source_bytes INTEGER,
+                    catalog_source_bytes INTEGER,
+                    probe_bytes INTEGER,
+                    model_turns INTEGER,
+                    high_model_turns INTEGER,
+                    retries INTEGER,
+                    reroutes INTEGER,
+                    compactions INTEGER,
+                    subagent_count INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    payload TEXT NOT NULL,
+                    integrity_hash TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS ledger_usage_events (
+                    event_id TEXT PRIMARY KEY,
+                    source_event_id TEXT NOT NULL UNIQUE,
+                    source TEXT NOT NULL,
+                    quality TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    run_id TEXT,
+                    task_id TEXT,
+                    route_plan_id TEXT,
+                    comparison_key TEXT,
+                    success_criteria_hash TEXT,
+                    task_class TEXT,
+                    planned_model TEXT,
+                    actual_model TEXT,
+                    effort TEXT,
+                    status TEXT,
+                    input_tokens INTEGER,
+                    cached_input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    provider_total_tokens INTEGER,
+                    codex_context_bytes INTEGER,
+                    web_packet_bytes INTEGER,
+                    evidence_bytes INTEGER,
+                    source_bytes INTEGER,
+                    catalog_source_bytes INTEGER,
+                    probe_bytes INTEGER,
+                    model_turns INTEGER,
+                    high_model_turns INTEGER,
+                    retries INTEGER,
+                    reroutes INTEGER,
+                    compactions INTEGER,
+                    subagent_count INTEGER,
+                    occurred_at TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    integrity_hash TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS ledger_baselines (
+                    baseline_id TEXT PRIMARY KEY,
+                    task_id TEXT,
+                    route_plan_id TEXT,
+                    comparison_key TEXT NOT NULL,
+                    success_criteria_hash TEXT NOT NULL,
+                    task_class TEXT NOT NULL,
+                    planned_model TEXT NOT NULL,
+                    actual_model TEXT,
+                    effort TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    quality TEXT NOT NULL,
+                    input_tokens INTEGER,
+                    cached_input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    provider_total_tokens INTEGER,
+                    processed_tokens INTEGER,
+                    non_cached_input_tokens INTEGER,
+                    cache_ratio REAL,
+                    codex_context_bytes INTEGER,
+                    web_packet_bytes INTEGER,
+                    evidence_bytes INTEGER,
+                    source_bytes INTEGER,
+                    catalog_source_bytes INTEGER,
+                    probe_bytes INTEGER,
+                    model_turns INTEGER,
+                    high_model_turns INTEGER,
+                    retries INTEGER,
+                    reroutes INTEGER,
+                    compactions INTEGER,
+                    subagent_count INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    integrity_hash TEXT NOT NULL
                 )"""
             )
             conn.execute(
@@ -1397,6 +1516,285 @@ class Store:
                    turn_id=excluded.turn_id, payload=excluded.payload""",
                 (task_id, project_id, now, status, thread_id, turn_id, json.dumps(payload, ensure_ascii=False)),
             )
+
+    def record_ledger_run(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        record = normalize_run_record(payload)
+        if record["status"] in {"SUCCESS", "FAILED"} and not record.get("finished_at"):
+            record["finished_at"] = _now()
+        integrity_hash = sha256_json(record)
+        with self._connection() as conn:
+            conn.execute(
+                """INSERT INTO ledger_runs (
+                    run_id, task_id, route_plan_id, comparison_key, success_criteria_hash, task_class,
+                    planned_model, actual_model, effort, status, quality, input_tokens, cached_input_tokens,
+                    output_tokens, reasoning_tokens, provider_total_tokens, processed_tokens,
+                    non_cached_input_tokens, cache_ratio, codex_context_bytes, web_packet_bytes,
+                    evidence_bytes, source_bytes, catalog_source_bytes, probe_bytes, model_turns,
+                    high_model_turns, retries, reroutes, compactions, subagent_count, created_at, updated_at,
+                    finished_at, payload, integrity_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    task_id=excluded.task_id,
+                    route_plan_id=excluded.route_plan_id,
+                    comparison_key=excluded.comparison_key,
+                    success_criteria_hash=excluded.success_criteria_hash,
+                    task_class=excluded.task_class,
+                    planned_model=excluded.planned_model,
+                    actual_model=excluded.actual_model,
+                    effort=excluded.effort,
+                    status=excluded.status,
+                    quality=excluded.quality,
+                    input_tokens=excluded.input_tokens,
+                    cached_input_tokens=excluded.cached_input_tokens,
+                    output_tokens=excluded.output_tokens,
+                    reasoning_tokens=excluded.reasoning_tokens,
+                    provider_total_tokens=excluded.provider_total_tokens,
+                    processed_tokens=excluded.processed_tokens,
+                    non_cached_input_tokens=excluded.non_cached_input_tokens,
+                    cache_ratio=excluded.cache_ratio,
+                    codex_context_bytes=excluded.codex_context_bytes,
+                    web_packet_bytes=excluded.web_packet_bytes,
+                    evidence_bytes=excluded.evidence_bytes,
+                    source_bytes=excluded.source_bytes,
+                    catalog_source_bytes=excluded.catalog_source_bytes,
+                    probe_bytes=excluded.probe_bytes,
+                    model_turns=excluded.model_turns,
+                    high_model_turns=excluded.high_model_turns,
+                    retries=excluded.retries,
+                    reroutes=excluded.reroutes,
+                    compactions=excluded.compactions,
+                    subagent_count=excluded.subagent_count,
+                    updated_at=excluded.updated_at,
+                    finished_at=excluded.finished_at,
+                    payload=excluded.payload,
+                    integrity_hash=excluded.integrity_hash""",
+                (
+                    record["run_id"],
+                    record["task_id"],
+                    record["route_plan_id"],
+                    record["comparison_key"],
+                    record["success_criteria_hash"],
+                    record["task_class"],
+                    record["planned_model"],
+                    record["actual_model"],
+                    record["effort"],
+                    record["status"],
+                    record["quality"],
+                    record["input_tokens"],
+                    record["cached_input_tokens"],
+                    record["output_tokens"],
+                    record["reasoning_tokens"],
+                    record["provider_total_tokens"],
+                    record["processed_tokens"],
+                    record["non_cached_input_tokens"],
+                    record["cache_ratio"],
+                    record["codex_context_bytes"],
+                    record["web_packet_bytes"],
+                    record["evidence_bytes"],
+                    record["source_bytes"],
+                    record["catalog_source_bytes"],
+                    record["probe_bytes"],
+                    record["model_turns"],
+                    record["high_model_turns"],
+                    record["retries"],
+                    record["reroutes"],
+                    record["compactions"],
+                    record["subagent_count"],
+                    record["created_at"],
+                    record["updated_at"],
+                    record["finished_at"],
+                    json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    integrity_hash,
+                ),
+            )
+        return {**record, "integrity_hash": integrity_hash}
+
+    def record_ledger_usage_event(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        record = normalize_usage_event(payload)
+        integrity_hash = sha256_json(record)
+        with self._connection() as conn:
+            existing = conn.execute(
+                "SELECT payload, integrity_hash FROM ledger_usage_events WHERE source_event_id = ?",
+                (record["source_event_id"],),
+            ).fetchone()
+            if existing:
+                if existing[1] != integrity_hash:
+                    raise PolicyError("usage event source_event_id was reused with different content")
+                return {**json.loads(existing[0]), "integrity_hash": existing[1]}
+            try:
+                conn.execute(
+                    """INSERT INTO ledger_usage_events (
+                        event_id, source_event_id, source, quality, event_type, run_id, task_id, route_plan_id,
+                        comparison_key, success_criteria_hash, task_class, planned_model, actual_model, effort, status,
+                        input_tokens, cached_input_tokens, output_tokens, reasoning_tokens, provider_total_tokens,
+                        codex_context_bytes, web_packet_bytes, evidence_bytes, source_bytes, catalog_source_bytes,
+                        probe_bytes, model_turns, high_model_turns, retries, reroutes, compactions, subagent_count,
+                        occurred_at, payload, integrity_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        str(uuid.uuid4()),
+                        record["source_event_id"],
+                        record["source"],
+                        record["quality"],
+                        record["event_type"],
+                        record.get("run_id"),
+                        record.get("task_id"),
+                        record.get("route_plan_id"),
+                        record.get("comparison_key"),
+                        record.get("success_criteria_hash"),
+                        record.get("task_class"),
+                        record.get("planned_model"),
+                        record.get("actual_model"),
+                        record.get("effort"),
+                        record.get("status"),
+                        record["input_tokens"],
+                        record["cached_input_tokens"],
+                        record["output_tokens"],
+                        record["reasoning_tokens"],
+                        record["provider_total_tokens"],
+                        record["codex_context_bytes"],
+                        record["web_packet_bytes"],
+                        record["evidence_bytes"],
+                        record["source_bytes"],
+                        record["catalog_source_bytes"],
+                        record["probe_bytes"],
+                        record["model_turns"],
+                        record["high_model_turns"],
+                        record["retries"],
+                        record["reroutes"],
+                        record["compactions"],
+                        record["subagent_count"],
+                        record["occurred_at"],
+                        json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                        integrity_hash,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                existing = conn.execute(
+                    "SELECT payload, integrity_hash FROM ledger_usage_events WHERE source_event_id = ?",
+                    (record["source_event_id"],),
+                ).fetchone()
+                if not existing:
+                    raise
+                if existing[1] != integrity_hash:
+                    raise PolicyError("usage event source_event_id was reused with different content")
+                return {**json.loads(existing[0]), "integrity_hash": existing[1]}
+        return {**record, "integrity_hash": integrity_hash}
+
+    def record_ledger_baseline(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        record = normalize_baseline_payload(payload)
+        integrity_hash = sha256_json(record)
+        with self._connection() as conn:
+            conn.execute(
+                """INSERT INTO ledger_baselines (
+                    baseline_id, task_id, route_plan_id, comparison_key, success_criteria_hash, task_class,
+                    planned_model, actual_model, effort, status, quality, input_tokens, cached_input_tokens,
+                    output_tokens, reasoning_tokens, provider_total_tokens, processed_tokens,
+                    non_cached_input_tokens, cache_ratio, codex_context_bytes, web_packet_bytes,
+                    evidence_bytes, source_bytes, catalog_source_bytes, probe_bytes, model_turns,
+                    high_model_turns, retries, reroutes, compactions, subagent_count, created_at, updated_at,
+                    payload, integrity_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(baseline_id) DO UPDATE SET
+                    task_id=excluded.task_id,
+                    route_plan_id=excluded.route_plan_id,
+                    comparison_key=excluded.comparison_key,
+                    success_criteria_hash=excluded.success_criteria_hash,
+                    task_class=excluded.task_class,
+                    planned_model=excluded.planned_model,
+                    actual_model=excluded.actual_model,
+                    effort=excluded.effort,
+                    status=excluded.status,
+                    quality=excluded.quality,
+                    input_tokens=excluded.input_tokens,
+                    cached_input_tokens=excluded.cached_input_tokens,
+                    output_tokens=excluded.output_tokens,
+                    reasoning_tokens=excluded.reasoning_tokens,
+                    provider_total_tokens=excluded.provider_total_tokens,
+                    processed_tokens=excluded.processed_tokens,
+                    non_cached_input_tokens=excluded.non_cached_input_tokens,
+                    cache_ratio=excluded.cache_ratio,
+                    codex_context_bytes=excluded.codex_context_bytes,
+                    web_packet_bytes=excluded.web_packet_bytes,
+                    evidence_bytes=excluded.evidence_bytes,
+                    source_bytes=excluded.source_bytes,
+                    catalog_source_bytes=excluded.catalog_source_bytes,
+                    probe_bytes=excluded.probe_bytes,
+                    model_turns=excluded.model_turns,
+                    high_model_turns=excluded.high_model_turns,
+                    retries=excluded.retries,
+                    reroutes=excluded.reroutes,
+                    compactions=excluded.compactions,
+                    subagent_count=excluded.subagent_count,
+                    updated_at=excluded.updated_at,
+                    payload=excluded.payload,
+                    integrity_hash=excluded.integrity_hash""",
+                (
+                    record["baseline_id"],
+                    record["task_id"],
+                    record["route_plan_id"],
+                    record["comparison_key"],
+                    record["success_criteria_hash"],
+                    record["task_class"],
+                    record["planned_model"],
+                    record["actual_model"],
+                    record["effort"],
+                    record["status"],
+                    record["quality"],
+                    record["input_tokens"],
+                    record["cached_input_tokens"],
+                    record["output_tokens"],
+                    record["reasoning_tokens"],
+                    record["provider_total_tokens"],
+                    record["processed_tokens"],
+                    record["non_cached_input_tokens"],
+                    record["cache_ratio"],
+                    record["codex_context_bytes"],
+                    record["web_packet_bytes"],
+                    record["evidence_bytes"],
+                    record["source_bytes"],
+                    record["catalog_source_bytes"],
+                    record["probe_bytes"],
+                    record["model_turns"],
+                    record["high_model_turns"],
+                    record["retries"],
+                    record["reroutes"],
+                    record["compactions"],
+                    record["subagent_count"],
+                    record["created_at"],
+                    _now(),
+                    json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    integrity_hash,
+                ),
+            )
+        return {**record, "integrity_hash": integrity_hash}
+
+    def ledger_runs(self) -> list[dict[str, Any]]:
+        with self._connection() as conn:
+            rows = conn.execute("SELECT payload, integrity_hash FROM ledger_runs ORDER BY updated_at DESC, run_id DESC").fetchall()
+        return [{**json.loads(payload), "integrity_hash": integrity_hash} for payload, integrity_hash in rows]
+
+    def ledger_baselines(self) -> list[dict[str, Any]]:
+        with self._connection() as conn:
+            rows = conn.execute("SELECT payload, integrity_hash FROM ledger_baselines ORDER BY updated_at DESC, baseline_id DESC").fetchall()
+        return [{**json.loads(payload), "integrity_hash": integrity_hash} for payload, integrity_hash in rows]
+
+    def ledger_usage_events(self) -> list[dict[str, Any]]:
+        with self._connection() as conn:
+            rows = conn.execute("SELECT payload, integrity_hash FROM ledger_usage_events ORDER BY occurred_at DESC, source_event_id DESC").fetchall()
+        return [{**json.loads(payload), "integrity_hash": integrity_hash} for payload, integrity_hash in rows]
+
+    def token_ledger_report(self) -> dict[str, Any]:
+        report = build_report(self.ledger_runs(), self.ledger_baselines(), self.ledger_usage_events())
+        return report
+
+    def export_token_ledger_report(self, format: str = "json") -> str:
+        report = self.token_ledger_report()
+        if format == "markdown":
+            return render_markdown(report)
+        if format != "json":
+            raise PolicyError("Token ledger export format is not supported")
+        return canonical_json(report)
 
     def write_artifact(self, project_id: str, task_id: str, name: str, content: str | dict[str, Any]) -> Path:
         task_id, project_id = self._validate_ids(task_id, project_id)

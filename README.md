@@ -148,3 +148,10 @@ The registry recognizes UnityFS/Raw/Web bundles, PMX/PMD, FBX binary/ASCII, GLB/
 Phase 2 cache reuse is intentionally conservative. Before any cache lookup, the app validates current Catalog metadata, reads only the detector-sized bounded sample, hashes just that sample, and builds the cache identity from `size`, `mtime_ns`, `file_id`, and `sample_sha256`. Only a prior `COMPLETED` result with the same identity is reusable; `FAILED`, `REJECTED`, and `STALE` attempts never become permanent cache entries and can be retried against the same file state. Each probe attempt is numbered and timestamped, and app startup atomically recovers orphaned `PENDING`/`PROBING` rows to `FAILED/probe_interrupted`.
 
 Confidence and `next_inspector` are also conservative. `next_inspector` is assigned only when exactly one detector reaches `HIGH` confidence. Structural checks now validate GLB version/declared length, bounded glTF JSON `asset.version`, PMX/PMD header versions, BMP size/offset/DIB fields, and MP3 frame-header fields; weak evidence such as a bare FBX ASCII banner, fake `BM`, fake `Pmd`, fake `FF E0`, malformed glTF JSON, or malformed GLB remains `MEDIUM` or `UNKNOWN` so downstream Inspector and Codex tokens are not wasted on a bad guess.
+## Token Savings Ledger
+
+Token Savings Ledger Phase 1 records observed, imported, and estimated usage signals without storing raw prompts, raw responses, or full logs.
+
+It tracks ledger runs, usage events, and manually imported baselines, then exports a JSON or Markdown summary through the `/api/token-ledger/*` endpoints.
+
+If no successful live run has been recorded, the report shows `실제 토큰 절감 미측정`.

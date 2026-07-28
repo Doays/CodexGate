@@ -139,3 +139,10 @@ def collect(request: Mapping[str, Any], root: str | Path) -> dict[str, Any]:
     if bridge_packet_safety_reason(result) or _DB_URL.search(canonical_json(result)):
         raise PolicyError("Evidence result contains sensitive content")
     return {**result, "result_hash": sha256_json(result), "size_bytes": len(encoded)}
+
+
+def evidence_result_bytes(result: Mapping[str, Any]) -> int:
+    size = result.get("size_bytes")
+    if isinstance(size, int) and size >= 0:
+        return size
+    return len(canonical_json(result).encode("utf-8"))

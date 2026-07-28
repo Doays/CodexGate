@@ -91,6 +91,7 @@ class AppServerClient:
         self.server_request_methods: dict[int | str, str] = {}
         self.server_request_tasks: set[asyncio.Task[None]] = set()
         self.server_request_errors: list[str] = []
+        self.retry_count = 0
 
     @property
     def connected(self) -> bool:
@@ -310,6 +311,7 @@ class AppServerClient:
             except AppServerError as exc:
                 if exc.code != -32001 or retry == 3:
                     raise
+                self.retry_count += 1
                 await asyncio.sleep(self.retry_base_seconds * (2 ** retry))
         raise AssertionError("unreachable")
 

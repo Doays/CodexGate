@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import re
 import uuid
+import threading
 from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
 from typing import Any, Callable, Mapping
 from urllib.parse import urlsplit
 
 from .policy import BRIDGE_MAX_PACKET_BYTES, BRIDGE_SCHEMA_VERSION, Decision, PolicyError, bridge_packet_safety_reason, canonical_json, sha256_json, validate_project_id, validate_task_id, validate_workspace_root
-from .evidence import COLLECTOR_VERSION, MAX_TOTAL_BYTES, collect as collect_evidence, normalize_requested_evidence
+from .evidence import COLLECTOR_VERSION, MAX_TOTAL_BYTES, collect as collect_evidence, evidence_result_bytes, normalize_requested_evidence
 from .policy import resolve_safe_evidence_mapping
 from .storage import Store
 
@@ -120,6 +122,8 @@ class BridgeService:
 
     def __init__(self, store: Store, route_plan_creator: Callable[[dict[str, Any]], dict[str, Any]]):
         self.store, self.route_plan_creator = store, route_plan_creator
+        self._evidence_lock_guard = threading.Lock()
+        self._evidence_locks: dict[tuple[str, str], threading.Lock] = {}
 
     @staticmethod
     def active_action(state: str) -> str:
@@ -215,6 +219,22 @@ class BridgeService:
         if len(packet.encode("utf-8")) > BRIDGE_MAX_PACKET_BYTES:
             self._hold(record, "Bridge packet exceeds 60KB.")
             raise PolicyError("Bridge packet exceeds 60KB.")
+        try:
+            self.store.record_ledger_usage_event({
+                "source_event_id": f"bridge:{record['task_id']}:{record['phase']}:{record['pending_nonce']}:packet",
+                "source": "LOCAL_ESTIMATE",
+                "quality": "OBSERVED",
+                "event_type": "bridge_packet",
+                "task_id": record["task_id"],
+                "route_plan_id": record.get("route_plan_id"),
+                "comparison_key": f"bridge:{record['task_id']}",
+                "task_class": record.get("phase"),
+                "status": record.get("status"),
+                "web_packet_bytes": len(packet.encode("utf-8")),
+                "occurred_at": _now(),
+            })
+        except Exception as exc:
+            record.setdefault("events", []).append(f"Token ledger warning: {exc}")
         return packet
 
     def copied(self, task_id: str) -> dict[str, Any]:
@@ -349,35 +369,63 @@ class BridgeService:
         self.store.update_evidence_request(task_id, request_id, {"mapped_path": relative, **details, "state": "MAPPED", "error_code": None, "error_reason": None})
         return self.get(task_id)
 
-    def collect_evidence(self, task_id: str, request_id: str) -> dict[str, Any]:
-        record = self._current_record(task_id)
-        if record["status"] != NEED_MORE_EVIDENCE:
-            raise PolicyError("Evidence collection is only available while evidence is required")
-        requests = {item["request_id"]: item for item in self.store.evidence_requests(task_id)}
-        request = requests.get(request_id)
-        if request is None:
-            raise PolicyError("Evidence request was not found")
-        existing = {item["request_id"]: item for item in self.store.evidence_results(task_id)}.get(request_id)
-        if request.get("state") == "READY" and existing:
-            return self._advance_if_evidence_ready(record)
-        if request.get("state") not in {"MAPPED", "FAILED", "REJECTED", "COLLECTING"}:
-            raise PolicyError("Evidence request must be mapped before collection")
-        self.store.update_evidence_request(task_id, request_id, {"state": "COLLECTING", "error_code": None, "error_reason": None})
+    @contextmanager
+    def _evidence_request_lock(self, task_id: str, request_id: str):
+        key = (task_id, request_id)
+        with self._evidence_lock_guard:
+            lock = self._evidence_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._evidence_locks[key] = lock
+        lock.acquire()
         try:
-            result = collect_evidence({**request, "state": "COLLECTING"}, record["root"])
-            prior_results = self.store.evidence_results(task_id)
-            used = sum(int(item.get("size_bytes", 0)) for item in prior_results if item.get("request_id") != request_id)
-            if used + int(result["size_bytes"]) > MAX_TOTAL_BYTES:
-                raise PolicyError("Total web evidence exceeds 50KB")
-            if result.get("type") in {"text_range", "log_excerpt"}:
-                prior_lines = sum(len(item.get("lines", [])) for item in prior_results if item.get("path") == result.get("path") and item.get("type") in {"text_range", "log_excerpt"})
-                if prior_lines + len(result.get("lines", [])) > 1000:
-                    raise PolicyError("Text evidence exceeds 1000 lines for one file")
-            self.store.finalize_evidence_collection(task_id, request_id, result, "READY")
-        except PolicyError as exc:
-            self.store.finalize_evidence_collection(task_id, request_id, {"type": request["type"], "label": request["label"], "error_code": "collection_rejected", "error_reason": str(exc)}, "FAILED", error_code="collection_rejected", error_reason=str(exc))
-            return self.get(task_id)
-        return self._advance_if_evidence_ready(record)
+            yield
+        finally:
+            lock.release()
+
+    def collect_evidence(self, task_id: str, request_id: str) -> dict[str, Any]:
+        with self._evidence_request_lock(task_id, request_id):
+            record = self._current_record(task_id)
+            requests = {item["request_id"]: item for item in self.store.evidence_requests(task_id)}
+            request = requests.get(request_id)
+            if request is None:
+                raise PolicyError("Evidence request was not found")
+            existing = {item["request_id"]: item for item in self.store.evidence_results(task_id)}.get(request_id)
+            if record["status"] != NEED_MORE_EVIDENCE:
+                if request.get("state") == "READY" and existing:
+                    return self.get(task_id)
+                raise PolicyError("Evidence collection is only available while evidence is required")
+            if request.get("state") == "READY" and existing:
+                return self._advance_if_evidence_ready(record)
+            if request.get("state") not in {"MAPPED", "FAILED", "REJECTED", "COLLECTING"}:
+                raise PolicyError("Evidence request must be mapped before collection")
+            self.store.update_evidence_request(task_id, request_id, {"state": "COLLECTING", "error_code": None, "error_reason": None})
+            try:
+                result = collect_evidence({**request, "state": "COLLECTING"}, record["root"])
+                prior_results = self.store.evidence_results(task_id)
+                used = sum(int(item.get("size_bytes", 0)) for item in prior_results if item.get("request_id") != request_id)
+                if used + int(result["size_bytes"]) > MAX_TOTAL_BYTES:
+                    raise PolicyError("Total web evidence exceeds 50KB")
+                if result.get("type") in {"text_range", "log_excerpt"}:
+                    prior_lines = sum(len(item.get("lines", [])) for item in prior_results if item.get("path") == result.get("path") and item.get("type") in {"text_range", "log_excerpt"})
+                    if prior_lines + len(result.get("lines", [])) > 1000:
+                        raise PolicyError("Text evidence exceeds 1000 lines for one file")
+                self.store.finalize_evidence_collection(task_id, request_id, result, "READY")
+                self.store.record_ledger_usage_event({
+                    "source_event_id": f"evidence:{task_id}:{request_id}:{result['result_hash']}",
+                    "source": "LOCAL_ESTIMATE",
+                    "quality": "OBSERVED",
+                    "event_type": "evidence_collection",
+                    "task_id": task_id,
+                    "comparison_key": f"bridge:{task_id}",
+                    "web_packet_bytes": 0,
+                    "evidence_bytes": evidence_result_bytes(result),
+                    "occurred_at": _now(),
+                })
+            except PolicyError as exc:
+                self.store.finalize_evidence_collection(task_id, request_id, {"type": request["type"], "label": request["label"], "error_code": "collection_rejected", "error_reason": str(exc)}, "FAILED", error_code="collection_rejected", error_reason=str(exc))
+                return self.get(task_id)
+            return self._advance_if_evidence_ready(record)
 
     def _advance_if_evidence_ready(self, record: Mapping[str, Any]) -> dict[str, Any]:
         requests = self.store.evidence_requests(record["task_id"])

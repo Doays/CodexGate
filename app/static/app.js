@@ -1,4 +1,4 @@
-const $ = (id) => document.getElementById(id);
+﻿const $ = (id) => document.getElementById(id);
 
 let catalog = [];
 let currentRun = null;
@@ -219,6 +219,7 @@ async function connect() {
     renderAccount(data.account_usage);
     renderCatalog(data.model_catalog);
     renderIsolation(data.isolation);
+    renderTokenLedger(data.token_ledger || {});
     $("connection-dot").classList.add("live");
     $("connection-text").textContent = `${data.choices.length} models connected`;
     $("codex-meta").textContent = `${data.codex_version || "version unavailable"} · ${data.codex_path || "path unavailable"}`;
@@ -489,6 +490,7 @@ function renderRun(run) {
   $("events").textContent = run.events.join("\n") || "Waiting for events...";
   $("interrupt").disabled = !["running", "starting", "interrupting"].includes(run.status);
   renderApprovals(run.approvals || []);
+  refreshTokenLedger().catch(() => {});
 }
 
 async function answerApproval(requestId, decision) {
@@ -882,22 +884,99 @@ async function runFormatProbe() {
   }
 }
 
-$("connect").onclick = connect;
-$("preflight").onclick = makePreflight;
-$("copy-packet").onclick = copyPacket;
-$("router-preview").onclick = previewRouter;
-$("create-plan").onclick = createRoutePlan;
-$("create-capsule").onclick = createCapsule;
-$("run-isolation-probe").onclick = runIsolationProbe;
-$("execute").onclick = execute;
-$("interrupt").onclick = interrupt;
-$("bridge-start").onclick = startBridge;
-$("bridge-action").onclick = bridgeAction;
-$("catalog-register").onclick = registerCatalogSource;
-$("catalog-scan").onclick = () => scanCatalog(false);
-$("catalog-resume").onclick = () => scanCatalog(true);
-$("catalog-cancel").onclick = cancelCatalog;
-$("catalog-probe").onclick = runFormatProbe;
+function formatLedgerCount(value) {
+  if (typeof value !== "number" || Number.isNaN(value)) return "?";
+  return value.toLocaleString();
+}
+
+function formatLedgerValue(record) {
+  if (!record) return "?";
+  const processed = typeof record.processed_tokens === "number" ? record.processed_tokens.toLocaleString() : "?";
+  const quality = record.quality || "UNKNOWN";
+  return `${processed} (${quality})`;
+}
+
+function renderTokenLedger(report) {
+  const summary = report?.summary || {};
+  const usage = report?.usage_totals || {};
+  $("ledger-summary-status").textContent = summary.comparison_count ? "ACTIVE" : "NO DATA";
+  $("ledger-summary-message").textContent = summary.message || "?? ?? ?? ???";
+  $("ledger-baseline-processed").textContent = formatLedgerCount(report?.baselines?.[0]?.processed_tokens);
+  $("ledger-actual-processed").textContent = formatLedgerCount(report?.runs?.[0]?.processed_tokens);
+  $("ledger-processed-savings").textContent = summary.comparable_count ? String(report?.comparisons?.[0]?.processed_savings ?? "?") : "?";
+  $("ledger-model-turns").textContent = formatLedgerCount(report?.runs?.reduce((total, run) => total + (Number.isFinite(run.model_turns) ? run.model_turns : 0), 0));
+  $("ledger-retries").textContent = formatLedgerCount(report?.runs?.reduce((total, run) => total + (Number.isFinite(run.retries) ? run.retries : 0), 0));
+  $("ledger-report").textContent = JSON.stringify(report || {}, null, 2);
+  const body = $("ledger-comparisons");
+  body.replaceChildren();
+  for (const comparison of report?.comparisons || []) {
+    const row = document.createElement("tr");
+    appendCell(row, comparison.comparison_key || "?");
+    appendCell(row, comparison.status || "NOT_COMPARABLE");
+    const baseline = document.createElement("td");
+    baseline.textContent = formatLedgerValue(comparison.baseline);
+    baseline.className = `ledger-quality ${(comparison.baseline?.quality || "").toLowerCase()}`;
+    row.appendChild(baseline);
+    const actual = document.createElement("td");
+    actual.textContent = formatLedgerValue(comparison.actual);
+    actual.className = `ledger-quality ${(comparison.actual?.quality || "").toLowerCase()}`;
+    row.appendChild(actual);
+    appendCell(row, comparison.processed_savings == null ? "?" : String(comparison.processed_savings));
+    appendCell(row, `${comparison.baseline?.model_turns ?? "?"} / ${comparison.actual?.model_turns ?? "?"}`);
+    appendCell(row, `${comparison.baseline?.retries ?? "?"} / ${comparison.actual?.retries ?? "?"}`);
+    body.appendChild(row);
+  }
+  if (usage.web_packet_bytes || usage.evidence_bytes || usage.catalog_source_bytes || usage.probe_bytes) {
+    $("ledger-summary-message").textContent = `${summary.message || "?? ?? ?? ???"} Bridge=${usage.web_packet_bytes || 0} Evidence=${usage.evidence_bytes || 0} Catalog=${usage.catalog_source_bytes || 0} Probe=${usage.probe_bytes || 0}`;
+  }
+}
+
+async function refreshTokenLedger() {
+  try {
+    const report = await api("/api/token-ledger/report");
+    renderTokenLedger(report);
+  } catch (error) {
+    $("ledger-summary-status").textContent = "ERROR";
+    $("ledger-summary-message").textContent = error.message;
+  }
+}
+
+async function importTokenLedgerBaseline() {
+  try {
+    const report = await api("/api/token-ledger/baselines", {
+      method: "POST",
+      body: $("ledger-baseline-input").value,
+    });
+    renderTokenLedger(report.token_ledger || report);
+    say("Token ledger baseline imported.");
+  } catch (error) {
+    say(error.message, true);
+  }
+}
+
+async function exportTokenLedger(format) {
+  try {
+    const response = await fetch(`/api/token-ledger/export?format=${encodeURIComponent(format)}`, {
+      headers: { "Content-Type": "application/json" },
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(text || "Export failed");
+    const mime = format === "markdown" ? "text/markdown" : "application/json";
+    const blob = new Blob([text], { type: `${mime};charset=utf-8` });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `TOKEN_SAVINGS_REPORT.${format === "markdown" ? "md" : "json"}`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    say(error.message, true);
+  }
+}
+$("ledger-refresh").onclick = refreshTokenLedger;
+$("ledger-import").onclick = importTokenLedgerBaseline;
+$("ledger-export-json").onclick = () => exportTokenLedger("json");
+$("ledger-export-md").onclick = () => exportTokenLedger("markdown");
 for (const id of ["catalog-filter-status", "catalog-filter-kind", "catalog-filter-extension"]) $(id).addEventListener("change", () => refreshCatalogEntries().catch((error) => say(error.message, true)));
 renderBridge(null);
 restoreBridge();

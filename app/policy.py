@@ -182,6 +182,11 @@ def bridge_packet_safety_reason(value: Any) -> str | None:
     return None
 
 
+def ledger_import_safety_reason(value: Any) -> str | None:
+    """Reject imported ledger payloads that reveal secrets or absolute user paths."""
+    return bridge_packet_safety_reason(value)
+
+
 def canonical_path_text(value: str | Path) -> str:
     return Path(value).as_posix().casefold()
 

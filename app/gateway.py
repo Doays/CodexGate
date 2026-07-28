@@ -74,10 +74,21 @@ class Run:
     subscribers: set[asyncio.Queue[dict[str, Any]]] = field(default_factory=set)
     route_plan_id: str | None = None
     decision_hash: str | None = None
+    comparison_key: str | None = None
+    success_criteria_hash: str | None = None
+    codex_context_bytes: int | None = None
     requested_model: str | None = None
     actual_model: str | None = None
     reroute_reason: str | None = None
     token_warning_emitted: bool = False
+    ledger_event_seq: int = 0
+    retries: int = 0
+    reroutes: int = 0
+    compactions: int = 0
+    subagent_count: int = 0
+    retry_base_count: int = 0
+    created_at: str | None = None
+    updated_at: str | None = None
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -104,9 +115,16 @@ class Run:
             "approvals": [approval.snapshot() for approval in self.approvals.values() if approval.status == "pending"],
             "route_plan_id": self.route_plan_id,
             "decision_hash": self.decision_hash,
+            "comparison_key": self.comparison_key,
+            "success_criteria_hash": self.success_criteria_hash,
+            "codex_context_bytes": self.codex_context_bytes,
             "requested_model": self.requested_model,
             "actual_model": self.actual_model,
             "reroute_reason": self.reroute_reason,
+            "retries": self.retries,
+            "reroutes": self.reroutes,
+            "compactions": self.compactions,
+            "subagent_count": self.subagent_count,
         }
 
 
@@ -201,6 +219,7 @@ class Gate:
             "account_usage": self.store.account_overview(),
             "model_catalog": self.store.model_catalog(),
             "isolation": public_result(isolation),
+            "token_ledger": self.store.token_ledger_report(),
         }
 
     def _loaded_schema_hash(self) -> str | None:
@@ -318,6 +337,16 @@ class Gate:
             "budget": budget,
             "route_preview": preview,
         }
+        record["codex_context_bytes"] = len(canonical_json({
+            "task": record["task"],
+            "decision": decision_payload,
+            "validation_evidence": evidence,
+            "route_preview": preview,
+            "allowed_files": normalized_files,
+            "evidence_files": evidence_files,
+            "evidence_ranges": evidence_ranges,
+            "budget": budget,
+        }).encode("utf-8"))
         if "bridge_idempotency_key" in payload:
             key = payload["bridge_idempotency_key"]
             if not isinstance(key, str) or not key.startswith("bridge:") or len(key) > 200:
@@ -342,6 +371,16 @@ class Gate:
         expected_budget_level, expected_budget = budget_for_task_class(decision.task_class)
         if plan.get("budget_level") != expected_budget_level or plan.get("budget") != expected_budget:
             raise PolicyError("Route Plan budget does not match its task class")
+        comparison_key = sha256_json({
+            "task_hash": plan["task_hash"],
+            "decision_hash": plan["decision_hash"],
+            "root": plan["root"],
+            "permission": plan["permission"],
+        })
+        success_criteria_hash = sha256_json({
+            "validation_evidence": plan.get("validation_evidence"),
+            "stop_conditions": decision.stop_conditions,
+        })
 
         run = Run(
             id=str(uuid.uuid4()),
@@ -356,7 +395,13 @@ class Gate:
             decision=decision.as_dict(),
             route_plan_id=plan["plan_id"],
             decision_hash=plan["decision_hash"],
+            comparison_key=comparison_key,
+            success_criteria_hash=success_criteria_hash,
+            codex_context_bytes=int(plan.get("codex_context_bytes") or 0),
             requested_model=final["model"],
+            actual_model=final["model"],
+            created_at=datetime.now(timezone.utc).isoformat(),
+            updated_at=datetime.now(timezone.utc).isoformat(),
         )
         blocked_reason = self._forbidden_reference_reason({"task": run.task, "decision": run.decision})
         if blocked_reason:
@@ -366,6 +411,7 @@ class Gate:
         self.runs[run.id] = run
         self._store_request_artifacts(run)
         run.initial_git_paths = self._git_paths(run.root)
+        run.retry_base_count = getattr(self.client, "retry_count", 0)
         self._persist(run)
         try:
             thread = await self.client.request("thread/start", self._thread_start_params(run))
@@ -516,11 +562,13 @@ class Gate:
                 run.actual_model = rerouted_model
             if isinstance(reroute_reason, str) and reroute_reason:
                 run.reroute_reason = reroute_reason
+            run.reroutes += 1
             await self._publish(run, "model rerouted")
             self._persist(run)
             return
 
         if method == "thread/compacted":
+            run.compactions += 1
             await self.interrupt(run.id, "thread compacted")
             self._persist(run)
             return
@@ -823,8 +871,48 @@ class Gate:
         for queue in list(run.subscribers):
             await queue.put(event)
 
+    @staticmethod
+    def _is_high_effort(effort: str | None) -> bool:
+        if not isinstance(effort, str):
+            return False
+        return effort.strip().casefold() in {"high", "very-high", "very high", "xhigh", "x-high", "max", "ultra"}
+
+    def _ledger_payload(self, run: Run) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        ledger_status = "SUCCESS" if run.status == "completed" and not run.stop_reason else "FAILED" if run.status in {"failed", "interrupted"} else run.status.upper()
+        retries = max(int(getattr(self.client, "retry_count", 0)) - int(getattr(run, "retry_base_count", 0)), 0)
+        return {
+            "run_id": run.id,
+            "task_id": run.id,
+            "route_plan_id": run.route_plan_id,
+            "comparison_key": run.comparison_key or "",
+            "success_criteria_hash": run.success_criteria_hash or "",
+            "task_class": str(run.decision.get("task_class", "UNKNOWN")),
+            "planned_model": run.model,
+            "actual_model": run.actual_model or run.model,
+            "effort": run.effort,
+            "status": ledger_status,
+            "quality": "OBSERVED",
+            "provider_total_tokens": run.tokens,
+            "codex_context_bytes": run.codex_context_bytes,
+            "model_turns": 1 if run.turn_id else 0,
+            "high_model_turns": 1 if self._is_high_effort(run.effort) else 0,
+            "retries": retries,
+            "reroutes": run.reroutes,
+            "compactions": run.compactions,
+            "subagent_count": run.subagent_count,
+            "created_at": run.created_at or now,
+            "updated_at": now,
+            "finished_at": now if ledger_status in {"SUCCESS", "FAILED"} else None,
+        }
+
     def _persist(self, run: Run) -> None:
+        run.updated_at = datetime.now(timezone.utc).isoformat()
         self.store.save_task(run.id, run.project_id, run.status, run.snapshot(), run.thread_id, run.turn_id)
+        try:
+            self.store.record_ledger_run(self._ledger_payload(run))
+        except Exception as exc:
+            run.events.append(f"Token ledger warning: {exc}")
 
     def _run(self, run_id: str) -> Run:
         try:

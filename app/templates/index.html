@@ -61,6 +61,29 @@
       </article>
     </section>
 
+    <section id="token-ledger-panel" class="panel ledger-panel">
+      <div class="panel-title"><span>LEDGER</span><h2>Token Savings Ledger</h2><span id="ledger-summary-status" class="status">NO DATA</span></div>
+      <p id="ledger-summary-message" class="hint">실제 토큰 절감 미측정</p>
+      <div class="metrics five ledger-metrics">
+        <div><small>Baseline processed</small><strong id="ledger-baseline-processed">—</strong></div>
+        <div><small>Actual processed</small><strong id="ledger-actual-processed">—</strong></div>
+        <div><small>Processed savings</small><strong id="ledger-processed-savings">—</strong></div>
+        <div><small>Model turns</small><strong id="ledger-model-turns">—</strong></div>
+        <div><small>Retries</small><strong id="ledger-retries">—</strong></div>
+      </div>
+      <div class="row ledger-actions">
+        <button id="ledger-refresh" class="button" type="button">Refresh ledger</button>
+        <button id="ledger-export-json" class="button ghost" type="button">Export JSON</button>
+        <button id="ledger-export-md" class="button ghost" type="button">Export Markdown</button>
+      </div>
+      <label>Import baseline JSON<textarea id="ledger-baseline-input" rows="6" spellcheck="false" placeholder='{"comparison_key":"...","success_criteria_hash":"..."}'></textarea></label>
+      <div class="row ledger-actions">
+        <button id="ledger-import" class="button wide" type="button">Import baseline</button>
+      </div>
+      <div class="catalog-scroll"><table class="catalog-table"><thead><tr><th>Comparison key</th><th>Status</th><th>Baseline</th><th>Actual</th><th>Savings</th><th>Turns</th><th>Retries</th></tr></thead><tbody id="ledger-comparisons"></tbody></table></div>
+      <pre id="ledger-report" class="plan-reasons"></pre>
+    </section>
+
     <section class="panel">
       <div class="panel-title"><span>ISOLATION</span><h2>Read isolation probe</h2><span id="isolation-status" class="status">UNKNOWN</span></div>
       <p id="isolation-result" class="hint">The probe reports `ERROR`, `UNSAFE_FULL_DISK_READ`, or `SAFE_CANDIDATE`; live execution stays locked in this release.</p>

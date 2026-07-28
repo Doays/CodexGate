@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -256,6 +256,7 @@ async def connect(request: Request):
                     "account_usage",
                     "model_catalog",
                     "isolation",
+                    "token_ledger",
                 )
             },
         }
@@ -419,7 +420,22 @@ async def register_catalog_source(payload: CatalogSourceRequest, request: Reques
 async def scan_catalog_source(source_id: str, payload: CatalogScanRequest, request: Request):
     try:
         # scandir/stat metadata only; this path cannot reach app-server or a model turn.
-        return await asyncio.to_thread(catalog(request).scan, source_id, max_files=payload.max_files)
+        scan = await asyncio.to_thread(catalog(request).scan, source_id, max_files=payload.max_files)
+        try:
+            gate(request).store.record_ledger_usage_event({
+                "source_event_id": f"catalog:{source_id}:{scan.get('scan_id')}:{scan.get('generation')}",
+                "source": "LOCAL_ESTIMATE",
+                "quality": "OBSERVED",
+                "event_type": "catalog_scan",
+                "task_id": source_id,
+                "comparison_key": f"catalog:{source_id}",
+                "source_bytes": int(scan.get("metrics", {}).get("bytes_indexed", 0)),
+                "catalog_source_bytes": int(scan.get("metrics", {}).get("bytes_indexed", 0)),
+                "occurred_at": scan.get("finished_at") or None,
+            })
+        except Exception:
+            pass
+        return scan
     except Exception as exc:
         raise as_http_error(exc) from exc
 
@@ -427,7 +443,22 @@ async def scan_catalog_source(source_id: str, payload: CatalogScanRequest, reque
 @app.post("/api/catalog/sources/{source_id}/resume")
 async def resume_catalog_source(source_id: str, payload: CatalogScanRequest, request: Request):
     try:
-        return await asyncio.to_thread(catalog(request).scan, source_id, resume=True, max_files=payload.max_files)
+        scan = await asyncio.to_thread(catalog(request).scan, source_id, resume=True, max_files=payload.max_files)
+        try:
+            gate(request).store.record_ledger_usage_event({
+                "source_event_id": f"catalog:{source_id}:{scan.get('scan_id')}:{scan.get('generation')}:resume",
+                "source": "LOCAL_ESTIMATE",
+                "quality": "OBSERVED",
+                "event_type": "catalog_scan",
+                "task_id": source_id,
+                "comparison_key": f"catalog:{source_id}",
+                "source_bytes": int(scan.get("metrics", {}).get("bytes_indexed", 0)),
+                "catalog_source_bytes": int(scan.get("metrics", {}).get("bytes_indexed", 0)),
+                "occurred_at": scan.get("finished_at") or None,
+            })
+        except Exception:
+            pass
+        return scan
     except Exception as exc:
         raise as_http_error(exc) from exc
 
@@ -462,7 +493,22 @@ async def list_catalog_entries(
 async def run_format_probe(payload: FormatProbeRequest, request: Request):
     try:
         # Targeted header sampling only: no app-server RPC, no model turn, and no whole-file parsing.
-        return {"results": await asyncio.to_thread(format_probe(request).probe, payload.catalog_entry_ids)}
+        results = await asyncio.to_thread(format_probe(request).probe, payload.catalog_entry_ids)
+        store = gate(request).store
+        if results:
+            try:
+                store.record_ledger_usage_event({
+                    "source_event_id": f"probe:{results[0].get('probe_id') or '-'}:{len(results)}",
+                    "source": "LOCAL_ESTIMATE",
+                    "quality": "OBSERVED",
+                    "event_type": "format_probe",
+                    "comparison_key": f"probe:{results[0].get('alias') or 'catalog'}",
+                    "probe_bytes": sum(int(item.get("bytes_read", 0)) for item in results),
+                    "occurred_at": results[0].get("updated_at") or results[0].get("created_at") or None,
+                })
+            except Exception:
+                pass
+        return {"results": results}
     except Exception as exc:
         raise as_http_error(exc) from exc
 
@@ -486,6 +532,40 @@ async def router_preview(payload: RouterPreviewRequest, request: Request):
             independent_axes=payload.independent_axes,
             explicit_ultra_approval=payload.explicit_ultra_approval,
         )
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.get("/api/token-ledger/report")
+async def token_ledger_report(request: Request):
+    try:
+        return gate(request).store.token_ledger_report()
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/token-ledger/baselines")
+async def import_token_ledger_baseline(request: Request):
+    try:
+        body = await request.body()
+        if len(body) > 64 * 1024:
+            raise PolicyError("Token ledger baseline import exceeds 64KB")
+        payload = json.loads(body.decode("utf-8"))
+        store = gate(request).store
+        baseline = store.record_ledger_baseline(payload)
+        return {"baseline": baseline, "token_ledger": store.token_ledger_report()}
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.get("/api/token-ledger/export")
+async def export_token_ledger(request: Request, format: str = "json"):
+    try:
+        store = gate(request).store
+        data = store.export_token_ledger_report(format)
+        if format == "markdown":
+            return PlainTextResponse(data)
+        return JSONResponse(content=json.loads(data))
     except Exception as exc:
         raise as_http_error(exc) from exc
 
