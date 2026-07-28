@@ -57,6 +57,7 @@ _BRIDGE_SECRET_PATTERNS = (
 )
 _ABSOLUTE_USER_PATH = re.compile(r"(?i)(?:\b[a-z]:[\\/]|(?:^|\s)/(?:users|home)/)")
 _SENSITIVE_EVIDENCE_NAME = re.compile(r"(?i)(?:^|[\\/])(?:\.env|[^\\/]*\.(?:pem|key|pfx)|credentials(?:\.[^\\/]*)?|service-account[^\\/]*)$")
+_WSL_DISTRO_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 class PolicyError(ValueError):
@@ -305,6 +306,16 @@ def validate_source_alias(value: str) -> str:
     if "\x00" in alias or _windows_absolute_path(alias) is not None or Path(alias).is_absolute():
         raise PolicyError("catalog source alias is invalid")
     return alias
+
+
+def validate_wsl_distro(value: str) -> str:
+    """Accept a deliberately narrow WSL distribution name for direct exec argv use."""
+    if not isinstance(value, str):
+        raise PolicyError("WSL distribution must be a string")
+    distro = value.strip()
+    if not _WSL_DISTRO_NAME.fullmatch(distro):
+        raise PolicyError("WSL distribution name is invalid")
+    return distro
 
 
 def resolve_project_path(root: str | Path, value: str) -> tuple[Path, str]:

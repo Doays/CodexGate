@@ -5,6 +5,7 @@ let currentRun = null;
 let currentPlan = null;
 let currentCapsule = null;
 let isolationStatus = "UNKNOWN";
+let wslIsolationStatus = "UNCONFIGURED";
 let stream = null;
 let planExpiryTimer = null;
 let currentBridge = null;
@@ -219,6 +220,7 @@ async function connect() {
     renderAccount(data.account_usage);
     renderCatalog(data.model_catalog);
     renderIsolation(data.isolation);
+    renderWSLIsolation(data.wsl_isolation);
     renderTokenLedger(data.token_ledger || {});
     $("connection-dot").classList.add("live");
     $("connection-text").textContent = `${data.choices.length} models connected`;
@@ -261,6 +263,27 @@ function renderIsolation(result) {
   updateExecuteState();
 }
 
+function renderWSLIsolation(result) {
+  wslIsolationStatus = result?.status || "UNCONFIGURED";
+  $("wsl-isolation-status").textContent = wslIsolationStatus;
+  if (result?.distro) $("wsl-isolation-distro").value = result.distro;
+  const environmentText = result?.environment_changed ? " Environment changed; cached result was invalidated." : "";
+  const code = result?.error_code ? ` Code: ${result.error_code}.` : "";
+  $("wsl-isolation-result").textContent = `${wslIsolationStatus}.${code}${environmentText} Live runs remain locked in this release.`;
+  updateExecuteState();
+  const reproButton = $("run-wsl-isolation-repro");
+  if (reproButton) reproButton.disabled = wslIsolationStatus !== "SAFE_CANDIDATE";
+}
+
+function renderWSLRepro(result) {
+  const node = $("wsl-isolation-repro-result");
+  if (!node) return;
+  const status = result?.status || "UNKNOWN";
+  const completed = Number(result?.completed_runs || 0);
+  const success = Number(result?.success_count || 0);
+  node.textContent = `Repeatability: ${success}/${completed || 10} successful; final status ${status}. Live runs remain locked.`;
+}
+
 async function runIsolationProbe() {
   try {
     $("run-isolation-probe").disabled = true;
@@ -272,6 +295,47 @@ async function runIsolationProbe() {
     say(error.message, true);
   } finally {
     $("run-isolation-probe").disabled = false;
+  }
+}
+
+async function saveWSLIsolationConfig() {
+  try {
+    const data = await api("/api/isolation/wsl/config", {
+      method: "POST",
+      body: JSON.stringify({ distro: $("wsl-isolation-distro").value }),
+    });
+    $("wsl-isolation-distro").value = data.distro;
+    say("WSL distribution saved. Run the fixed bwrap preflight when ready.");
+  } catch (error) {
+    say(error.message, true);
+  }
+}
+
+async function runWSLIsolationProbe() {
+  try {
+    $("run-wsl-isolation-probe").disabled = true;
+    say("Running fixed WSL2+bubblewrap canaries without an app-server or model turn...");
+    const result = await api("/api/isolation/wsl/probe", { method: "POST" });
+    renderWSLIsolation(result);
+    say(`WSL isolation probe recorded: ${result.status}. Live execution remains locked.`, result.status !== "SAFE_CANDIDATE");
+  } catch (error) {
+    say(error.message, true);
+  } finally {
+    $("run-wsl-isolation-probe").disabled = false;
+  }
+}
+
+async function runWSLIsolationRepro() {
+  try {
+    $("run-wsl-isolation-repro").disabled = true;
+    say("Running the fixed 10-run WSL check without a model turn...");
+    const result = await api("/api/isolation/wsl/repro", { method: "POST" });
+    renderWSLRepro(result);
+    say(`WSL repeatability check: ${result.status}. Live execution remains locked.`, result.status !== "SAFE_REPRODUCIBLE");
+  } catch (error) {
+    say(error.message, true);
+  } finally {
+    $("run-wsl-isolation-repro").disabled = wslIsolationStatus !== "SAFE_CANDIDATE";
   }
 }
 
@@ -977,6 +1041,9 @@ $("ledger-refresh").onclick = refreshTokenLedger;
 $("ledger-import").onclick = importTokenLedgerBaseline;
 $("ledger-export-json").onclick = () => exportTokenLedger("json");
 $("ledger-export-md").onclick = () => exportTokenLedger("markdown");
+$("save-wsl-isolation-config").onclick = saveWSLIsolationConfig;
+$("run-wsl-isolation-probe").onclick = runWSLIsolationProbe;
+$("run-wsl-isolation-repro").onclick = runWSLIsolationRepro;
 for (const id of ["catalog-filter-status", "catalog-filter-kind", "catalog-filter-extension"]) $(id).addEventListener("change", () => refreshCatalogEntries().catch((error) => say(error.message, true)));
 renderBridge(null);
 restoreBridge();

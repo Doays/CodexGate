@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -16,6 +17,7 @@ from .policy import (
     validate_project_id,
     validate_source_alias,
     validate_task_id,
+    validate_wsl_distro,
 )
 from .token_ledger import build_report, normalize_baseline_payload, normalize_run_record, normalize_usage_event, render_markdown
 
@@ -356,6 +358,59 @@ class Store:
                 )"""
             )
             conn.execute(
+                """CREATE TABLE IF NOT EXISTS wsl_isolation_config (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    distro TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS wsl_isolation_probe_results (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    backend TEXT NOT NULL,
+                    distro TEXT,
+                    config_hash TEXT,
+                    tool_fingerprint TEXT,
+                    cache_key TEXT,
+                    probe_version TEXT,
+                    status TEXT NOT NULL,
+                    checked_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    integrity_hash TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS wsl_isolation_preflight_cache (
+                    config_hash TEXT PRIMARY KEY,
+                    tool_fingerprint TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    checked_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    integrity_hash TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS wsl_isolation_repro_runs (
+                    repro_id TEXT PRIMARY KEY,
+                    cache_key TEXT NOT NULL UNIQUE,
+                    config_hash TEXT NOT NULL,
+                    tool_fingerprint TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    requested_runs INTEGER NOT NULL,
+                    completed_runs INTEGER NOT NULL DEFAULT 0,
+                    success_count INTEGER NOT NULL DEFAULT 0,
+                    result_hash TEXT,
+                    duration_ms INTEGER NOT NULL DEFAULT 0,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    error_code TEXT,
+                    payload TEXT NOT NULL,
+                    integrity_hash TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
                 """CREATE TABLE IF NOT EXISTS bridge_tasks (
                     task_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL,
@@ -467,6 +522,7 @@ class Store:
             self._migrate_route_plans(conn)
             self._migrate_bridge_nonces(conn)
             self._migrate_format_probes(conn)
+            self._migrate_wsl_isolation_probe_results(conn)
 
     def _connection(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db_path)
@@ -1497,6 +1553,475 @@ class Store:
             })
         return {**record, "integrity_hash": row[6]}
 
+    def save_wsl_isolation_config(self, distro: str) -> dict[str, Any]:
+        clean_distro = validate_wsl_distro(distro)
+        updated_at = _now()
+        with self._connection() as conn:
+            conn.execute(
+                """INSERT INTO wsl_isolation_config (singleton, distro, updated_at)
+                   VALUES (1, ?, ?)
+                   ON CONFLICT(singleton) DO UPDATE SET distro=excluded.distro, updated_at=excluded.updated_at""",
+                (clean_distro, updated_at),
+            )
+        return {"backend": "WSL2_BWRAP", "distro": clean_distro, "updated_at": updated_at}
+
+    def wsl_isolation_config(self) -> dict[str, Any]:
+        with self._connection() as conn:
+            row = conn.execute("SELECT distro, updated_at FROM wsl_isolation_config WHERE singleton=1").fetchone()
+        if not row:
+            return {"backend": "WSL2_BWRAP", "status": "UNCONFIGURED", "distro": None}
+        return {"backend": "WSL2_BWRAP", "status": "CONFIGURED", "distro": row[0], "updated_at": row[1]}
+
+    def save_wsl_isolation_preflight(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Store only a successful, short-lived preflight cache entry."""
+        record = dict(payload)
+        required = {"config_hash", "tool_fingerprint", "status", "checked_at", "expires_at"}
+        if required - record.keys():
+            raise PolicyError("WSL preflight cache is missing fields")
+        if record.get("status") != "READY":
+            raise PolicyError("only successful WSL preflights may be cached")
+        for field in ("config_hash", "tool_fingerprint", "checked_at", "expires_at"):
+            if not isinstance(record.get(field), str) or not record[field]:
+                raise PolicyError("WSL preflight cache metadata is invalid")
+        if any(key in record for key in ("stdout", "stderr", "raw_stdout", "raw_stderr", "argv", "command", "path")):
+            raise PolicyError("WSL preflight cache includes sensitive data")
+        digest = sha256_json(record)
+        with self._connection() as conn:
+            conn.execute(
+                """INSERT INTO wsl_isolation_preflight_cache
+                   (config_hash, tool_fingerprint, status, checked_at, expires_at, payload, integrity_hash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(config_hash) DO UPDATE SET
+                     tool_fingerprint=excluded.tool_fingerprint, status=excluded.status,
+                     checked_at=excluded.checked_at, expires_at=excluded.expires_at,
+                     payload=excluded.payload, integrity_hash=excluded.integrity_hash""",
+                (
+                    record["config_hash"], record["tool_fingerprint"], record["status"],
+                    record["checked_at"], record["expires_at"],
+                    json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")), digest,
+                ),
+            )
+        return {**record, "integrity_hash": digest}
+
+    def wsl_isolation_preflight(self, config_hash: str) -> dict[str, Any] | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT config_hash, tool_fingerprint, status, checked_at, expires_at, payload, integrity_hash
+                   FROM wsl_isolation_preflight_cache WHERE config_hash=?""",
+                (config_hash,),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            record = json.loads(row[5])
+        except json.JSONDecodeError as exc:
+            raise PolicyError("WSL preflight cache payload was modified") from exc
+        expected = {
+            "config_hash": row[0], "tool_fingerprint": row[1], "status": row[2],
+            "checked_at": row[3], "expires_at": row[4],
+        }
+        if not isinstance(record, dict) or any(record.get(key) != value for key, value in expected.items()):
+            raise PolicyError("WSL preflight cache metadata was modified")
+        if sha256_json(record) != row[6]:
+            raise PolicyError("WSL preflight cache integrity check failed")
+        return {**record, "integrity_hash": row[6]}
+
+    # Explicit aliases keep the storage API discoverable without coupling callers
+    # to the cache table's shorter internal name.
+    save_wsl_isolation_preflight_result = save_wsl_isolation_preflight
+    wsl_isolation_preflight_result = wsl_isolation_preflight
+
+    def save_wsl_isolation_result(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Persist only redacted WSL probe metadata, never paths, canaries, commands, or process output."""
+        record = dict(payload)
+        required = {"backend", "status", "checked_at", "expires_at", "tool_versions"}
+        missing = required - record.keys()
+        if missing:
+            raise PolicyError(f"WSL isolation result is missing fields: {', '.join(sorted(missing))}")
+        statuses = {
+            "UNCONFIGURED", "UNAVAILABLE", "MISCONFIGURED", "PROBING", "SAFE_CANDIDATE",
+            "UNSAFE_HOST_FS", "UNSAFE_WRITE", "UNSAFE_NETWORK", "ERROR",
+        }
+        if record.get("backend") != "WSL2_BWRAP" or record.get("status") not in statuses:
+            raise PolicyError("WSL isolation result is not supported")
+        if record.get("distro") is not None:
+            record["distro"] = validate_wsl_distro(record["distro"])
+        if record.get("config_hash") is not None and not isinstance(record["config_hash"], str):
+            raise PolicyError("WSL isolation config hash is invalid")
+        for field in ("tool_fingerprint", "cache_key", "probe_version"):
+            if record.get(field) is not None and not isinstance(record[field], str):
+                raise PolicyError(f"WSL isolation {field} is invalid")
+        if not isinstance(record.get("tool_versions"), Mapping):
+            raise PolicyError("WSL isolation tool versions are invalid")
+        for name, value in record["tool_versions"].items():
+            if (
+                not isinstance(name, str)
+                or not (isinstance(value, str) or (isinstance(value, bool) and name in {"wsl2", "bwrap_present"}))
+                or not value
+                or (isinstance(value, str) and (
+                    len(value) > 120
+                    or "\n" in value
+                    or "\r" in value
+                    or "/" in value
+                    or "\\" in value
+                    or re.search(r"\b[A-Za-z]:", value)
+                ))
+            ):
+                raise PolicyError("WSL isolation tool version is not sanitized")
+        forbidden = (
+            "inside_path", "outside_path", "host_path", "probe_root", "capsule_root",
+            "command", "argv", "stdout", "stderr", "raw_stdout", "raw_stderr",
+            "canary", "canary_bytes", "windows_path", "wsl_path",
+        )
+        if any(key in record for key in forbidden):
+            raise PolicyError("WSL isolation result includes sensitive probe data")
+        integrity_hash = sha256_json(record)
+        with self._connection() as conn:
+            conn.execute(
+                """INSERT INTO wsl_isolation_probe_results
+                   (singleton, backend, distro, config_hash, tool_fingerprint, cache_key, probe_version,
+                    status, checked_at, expires_at, payload, integrity_hash)
+                   VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(singleton) DO UPDATE SET
+                     backend=excluded.backend, distro=excluded.distro, config_hash=excluded.config_hash,
+                     tool_fingerprint=excluded.tool_fingerprint, cache_key=excluded.cache_key,
+                     probe_version=excluded.probe_version,
+                     status=excluded.status, checked_at=excluded.checked_at, expires_at=excluded.expires_at,
+                     payload=excluded.payload, integrity_hash=excluded.integrity_hash""",
+                (
+                    record["backend"], record.get("distro"), record.get("config_hash"),
+                    record.get("tool_fingerprint"), record.get("cache_key"), record.get("probe_version"),
+                    record["status"], record["checked_at"], record["expires_at"],
+                    json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")), integrity_hash,
+                ),
+            )
+        return {**record, "integrity_hash": integrity_hash}
+
+    def wsl_isolation_result(
+        self,
+        config_hash: str | None = None,
+        tool_fingerprint: str | None = None,
+        cache_key: str | None = None,
+    ) -> dict[str, Any]:
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT backend, distro, config_hash, tool_fingerprint, cache_key, probe_version,
+                          status, checked_at, expires_at, payload, integrity_hash
+                   FROM wsl_isolation_probe_results WHERE singleton=1"""
+            ).fetchone()
+        if not row:
+            return {"backend": "WSL2_BWRAP", "status": "UNCONFIGURED", "distro": None}
+        try:
+            record = json.loads(row[9])
+        except json.JSONDecodeError as exc:
+            raise PolicyError("WSL isolation result payload was modified") from exc
+        expected = {
+            "backend": row[0], "distro": row[1], "config_hash": row[2],
+            "tool_fingerprint": row[3], "cache_key": row[4], "probe_version": row[5],
+            "status": row[6], "checked_at": row[7], "expires_at": row[8],
+        }
+        if not isinstance(record, dict) or any(record.get(key) != value for key, value in expected.items()):
+            raise PolicyError("WSL isolation result metadata was modified")
+        if sha256_json(record) != row[10]:
+            raise PolicyError("WSL isolation result integrity check failed")
+        if config_hash is not None and record.get("config_hash") != config_hash:
+            return {"backend": "WSL2_BWRAP", "status": "UNCONFIGURED", "distro": record.get("distro")}
+        if tool_fingerprint is not None and record.get("tool_fingerprint") != tool_fingerprint:
+            return {"backend": "WSL2_BWRAP", "status": "UNCONFIGURED", "distro": record.get("distro")}
+        if cache_key is not None and record.get("cache_key") != cache_key:
+            return {"backend": "WSL2_BWRAP", "status": "UNCONFIGURED", "distro": record.get("distro")}
+        if config_hash is None:
+            current_config = self.wsl_isolation_config()
+            current_distro = current_config.get("distro")
+            if isinstance(current_distro, str) and current_distro != record.get("distro"):
+                return {"backend": "WSL2_BWRAP", "status": "UNCONFIGURED", "distro": current_distro}
+        return {**record, "integrity_hash": row[10]}
+
+    @staticmethod
+    def _migrate_wsl_isolation_probe_results(conn: sqlite3.Connection) -> None:
+        """Add environment identity columns without changing legacy payloads."""
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(wsl_isolation_probe_results)")}
+        for name, declaration in (("tool_fingerprint", "TEXT"), ("cache_key", "TEXT"), ("probe_version", "TEXT")):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE wsl_isolation_probe_results ADD COLUMN {name} {declaration}")
+
+    def recover_interrupted_wsl_isolation_probes(self) -> int:
+        now = _now()
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT payload, integrity_hash FROM wsl_isolation_probe_results WHERE singleton=1 AND status='PROBING'"
+            ).fetchone()
+            if not row:
+                return 0
+            try:
+                record = json.loads(row[0])
+            except json.JSONDecodeError:
+                record = {"backend": "WSL2_BWRAP"}
+            record = dict(record)
+            record.update({
+                "status": "ERROR", "checked_at": now, "expires_at": now,
+                "error_code": "probe_interrupted", "reused": False,
+            })
+            digest = sha256_json(record)
+            cursor = conn.execute(
+                """UPDATE wsl_isolation_probe_results
+                   SET status='ERROR', checked_at=?, expires_at=?, payload=?, integrity_hash=?
+                   WHERE singleton=1 AND status='PROBING'""",
+                (now, now, json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")), digest),
+            )
+        return int(cursor.rowcount)
+
+    def save_wsl_isolation_repro(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Persist a redacted deterministic reproducibility summary."""
+        record = dict(payload)
+        required = {"repro_id", "cache_key", "config_hash", "tool_fingerprint", "status",
+                    "requested_runs", "completed_runs", "success_count", "duration_ms", "started_at"}
+        if required - record.keys():
+            raise PolicyError("WSL reproducibility result is missing fields")
+        allowed = {"RUNNING", "COMPLETED", "SAFE_REPRODUCIBLE", "NONDETERMINISTIC", "UNSAFE_HOST_FS", "UNSAFE_WRITE",
+                   "UNSAFE_NETWORK", "ERROR", "REJECTED"}
+        if record.get("status") not in allowed:
+            raise PolicyError("WSL reproducibility status is invalid")
+        for name in ("repro_id", "cache_key", "config_hash", "tool_fingerprint", "started_at"):
+            if not isinstance(record.get(name), str) or not record[name] or len(record[name]) > 256:
+                raise PolicyError("WSL reproducibility identity is invalid")
+        for name in ("requested_runs", "completed_runs", "success_count", "duration_ms"):
+            if not isinstance(record.get(name), int) or record[name] < 0:
+                raise PolicyError("WSL reproducibility counters are invalid")
+        if record["requested_runs"] != 10 or record["completed_runs"] > record["requested_runs"]:
+            raise PolicyError("WSL reproducibility run count is invalid")
+        if record.get("error_code") is not None and (not isinstance(record["error_code"], str) or len(record["error_code"]) > 80):
+            raise PolicyError("WSL reproducibility error is invalid")
+        if record.get("result_hash") is not None and (not isinstance(record["result_hash"], str) or len(record["result_hash"]) != 64):
+            raise PolicyError("WSL reproducibility result hash is invalid")
+        diagnostic = record.get("diagnostic")
+        if diagnostic is not None:
+            if not isinstance(diagnostic, Mapping) or set(diagnostic) != {"exit_code", "stdout_bytes", "stderr_bytes", "frame_count", "error_code", "fixture_bytes"}:
+                raise PolicyError("WSL reproducibility diagnostic is invalid")
+            if diagnostic["exit_code"] is not None and not isinstance(diagnostic["exit_code"], int):
+                raise PolicyError("WSL reproducibility diagnostic is invalid")
+            for name in ("stdout_bytes", "stderr_bytes", "frame_count"):
+                if not isinstance(diagnostic[name], int) or diagnostic[name] < 0 or diagnostic[name] > 8192:
+                    raise PolicyError("WSL reproducibility diagnostic is invalid")
+            if diagnostic["stdout_bytes"] + diagnostic["stderr_bytes"] > 8192:
+                raise PolicyError("WSL reproducibility diagnostic is invalid")
+            if diagnostic["fixture_bytes"] is not None and (not isinstance(diagnostic["fixture_bytes"], int) or diagnostic["fixture_bytes"] < 0 or diagnostic["fixture_bytes"] > 8192):
+                raise PolicyError("WSL reproducibility diagnostic is invalid")
+            if diagnostic["error_code"] is not None and (not isinstance(diagnostic["error_code"], str) or len(diagnostic["error_code"]) > 80):
+                raise PolicyError("WSL reproducibility diagnostic is invalid")
+        forbidden = ("path", "root", "fixture", "canary", "stdout", "stderr", "raw", "argv", "command", "content")
+        if any(any(token in str(key).casefold() for token in forbidden) for key in record):
+            raise PolicyError("WSL reproducibility result includes sensitive data")
+        allowed_keys = required | {"result_hash", "finished_at", "error_code", "diagnostic"}
+        if set(record) - allowed_keys:
+            raise PolicyError("WSL reproducibility result contains unsupported fields")
+        digest = sha256_json(record)
+        with self._connection() as conn:
+            conn.execute(
+                """INSERT INTO wsl_isolation_repro_runs
+                   (repro_id, cache_key, config_hash, tool_fingerprint, status, requested_runs,
+                    completed_runs, success_count, result_hash, duration_ms, started_at, finished_at,
+                    error_code, payload, integrity_hash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(cache_key) DO UPDATE SET
+                     repro_id=excluded.repro_id, config_hash=excluded.config_hash,
+                     tool_fingerprint=excluded.tool_fingerprint, status=excluded.status,
+                     requested_runs=excluded.requested_runs, completed_runs=excluded.completed_runs,
+                     success_count=excluded.success_count, result_hash=excluded.result_hash,
+                     duration_ms=excluded.duration_ms, started_at=excluded.started_at,
+                     finished_at=excluded.finished_at, error_code=excluded.error_code,
+                     payload=excluded.payload, integrity_hash=excluded.integrity_hash""",
+                (record["repro_id"], record["cache_key"], record["config_hash"], record["tool_fingerprint"],
+                 record["status"], record["requested_runs"], record["completed_runs"], record["success_count"],
+                 record.get("result_hash"), record["duration_ms"], record["started_at"], record.get("finished_at"),
+                 record.get("error_code"), json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")), digest),
+            )
+        return {**record, "integrity_hash": digest}
+
+    def wsl_isolation_repro(self, cache_key: str) -> dict[str, Any] | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT payload, integrity_hash FROM wsl_isolation_repro_runs WHERE cache_key=?", (cache_key,)
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            record = json.loads(row[0])
+        except json.JSONDecodeError as exc:
+            raise PolicyError("WSL reproducibility payload was modified") from exc
+        if not isinstance(record, dict) or sha256_json(record) != row[1]:
+            raise PolicyError("WSL reproducibility integrity check failed")
+        return {**record, "integrity_hash": row[1]}
+
+    save_wsl_isolation_repro_result = save_wsl_isolation_repro
+    wsl_isolation_repro_result = wsl_isolation_repro
+
+    def recover_interrupted_wsl_isolation_repros(self) -> int:
+        now = _now()
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT repro_id, payload FROM wsl_isolation_repro_runs WHERE status='RUNNING'"
+            ).fetchall()
+            count = 0
+            for repro_id, payload in rows:
+                try:
+                    record = json.loads(payload)
+                except json.JSONDecodeError:
+                    record = {}
+                record = dict(record)
+                record.update({"status": "ERROR", "finished_at": now, "error_code": "repro_interrupted"})
+                digest = sha256_json(record)
+                cursor = conn.execute(
+                    """UPDATE wsl_isolation_repro_runs SET status='ERROR', finished_at=?, error_code=?, payload=?, integrity_hash=?
+                       WHERE repro_id=? AND status='RUNNING'""",
+                    (now, "repro_interrupted", json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")), digest, repro_id),
+                )
+                count += int(cursor.rowcount)
+        return count
+
+    recover_interrupted_isolation_repros = recover_interrupted_wsl_isolation_repros
+
+    def record_wsl_isolation_repro_ledger(self, result: Mapping[str, Any]) -> dict[str, Any]:
+        checked_at = result.get("finished_at") if isinstance(result.get("finished_at"), str) else _now()
+        key = result.get("cache_key") if isinstance(result.get("cache_key"), str) else "unknown"
+        record = {
+            "source_event_id": f"wsl-repro:{key}:{checked_at}", "source": "LOCAL_ESTIMATE", "quality": "OBSERVED",
+            "event_type": "WSL_ISOLATION_REPRO", "status": result.get("status", "ERROR"),
+            "cache_key": key, "local_executions": int(result.get("completed_runs") or 0),
+            "local_duration_ms": int(result.get("duration_ms") or 0), "tokens": 0, "app_server_rpc_calls": 0,
+            "occurred_at": checked_at,
+        }
+        digest = sha256_json(record)
+        with self._connection() as conn:
+            existing = conn.execute("SELECT payload, integrity_hash FROM ledger_usage_events WHERE source_event_id=?", (record["source_event_id"],)).fetchone()
+            if existing:
+                if existing[1] != digest:
+                    raise PolicyError("WSL reproducibility ledger event was reused with different content")
+                return {**json.loads(existing[0]), "integrity_hash": existing[1]}
+            conn.execute(
+                """INSERT INTO ledger_usage_events
+                   (event_id, source_event_id, source, quality, event_type, status, payload, integrity_hash, occurred_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str(uuid.uuid4()), record["source_event_id"], record["source"], record["quality"], record["event_type"],
+                 record["status"], json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")), digest, checked_at),
+            )
+        return {**record, "integrity_hash": digest}
+
+    def record_wsl_isolation_probe_ledger(self, result: Mapping[str, Any]) -> dict[str, Any]:
+        """Store only local probe count/time; token and app-server counters remain exactly zero."""
+        checked_at = result.get("checked_at") if isinstance(result.get("checked_at"), str) else _now()
+        duration = result.get("local_duration_ms")
+        duration = duration if isinstance(duration, int) and duration >= 0 else 0
+        config_hash = result.get("config_hash") if isinstance(result.get("config_hash"), str) else "unconfigured"
+        record = {
+            "source_event_id": f"wsl-isolation:{config_hash}:{checked_at}",
+            "source": "LOCAL_ESTIMATE",
+            "quality": "OBSERVED",
+            "event_type": "WSL_ISOLATION_PROBE",
+            "status": result.get("status") if isinstance(result.get("status"), str) else "ERROR",
+            "config_hash": config_hash,
+            "tool_fingerprint": result.get("tool_fingerprint") if isinstance(result.get("tool_fingerprint"), str) else None,
+            "input_tokens": None,
+            "cached_input_tokens": None,
+            "output_tokens": None,
+            "reasoning_tokens": None,
+            "provider_total_tokens": None,
+            "probe_bytes": 0,
+            "model_turns": 0,
+            "high_model_turns": 0,
+            "retries": 0,
+            "reroutes": 0,
+            "compactions": 0,
+            "subagent_count": 0,
+            "probe_executions": 1,
+            "preflight_executions": 0,
+            "preflight_duration_ms": 0,
+            "local_duration_ms": duration,
+            "tokens": 0,
+            "app_server_rpc_calls": 0,
+            "occurred_at": checked_at,
+        }
+        digest = sha256_json(record)
+        with self._connection() as conn:
+            existing = conn.execute(
+                "SELECT payload, integrity_hash FROM ledger_usage_events WHERE source_event_id=?", (record["source_event_id"],)
+            ).fetchone()
+            if existing:
+                if existing[1] != digest:
+                    raise PolicyError("WSL isolation ledger event id was reused with different content")
+                return {**json.loads(existing[0]), "integrity_hash": existing[1]}
+            conn.execute(
+                """INSERT INTO ledger_usage_events (
+                    event_id, source_event_id, source, quality, event_type, run_id, task_id, route_plan_id,
+                    comparison_key, success_criteria_hash, task_class, planned_model, actual_model, effort, status,
+                    input_tokens, cached_input_tokens, output_tokens, reasoning_tokens, provider_total_tokens,
+                    codex_context_bytes, web_packet_bytes, evidence_bytes, source_bytes, catalog_source_bytes,
+                    probe_bytes, model_turns, high_model_turns, retries, reroutes, compactions, subagent_count,
+                    occurred_at, payload, integrity_hash
+                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, ?, ?, ?)""",
+                (
+                    str(uuid.uuid4()), record["source_event_id"], record["source"], record["quality"],
+                    record["event_type"], record["status"], record["occurred_at"],
+                    json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")), digest,
+                ),
+            )
+        return {**record, "integrity_hash": digest}
+
+    def record_wsl_isolation_preflight_ledger(self, result: Mapping[str, Any]) -> dict[str, Any]:
+        """Record the fixed metadata preflight separately from canary executions."""
+        checked_at = _now()
+        config_hash = result.get("config_hash") if isinstance(result.get("config_hash"), str) else "unconfigured"
+        tool_fp = result.get("tool_fingerprint") if isinstance(result.get("tool_fingerprint"), str) else "unknown"
+        duration = result.get("preflight_duration_ms")
+        duration = duration if isinstance(duration, int) and duration >= 0 else 0
+        record = {
+            "source_event_id": f"wsl-isolation-preflight:{config_hash}:{tool_fp}:{checked_at}",
+            "source": "LOCAL_ESTIMATE",
+            "quality": "OBSERVED",
+            "event_type": "WSL_ISOLATION_PREFLIGHT",
+            "status": result.get("status") if isinstance(result.get("status"), str) else "ERROR",
+            "config_hash": config_hash,
+            "tool_fingerprint": tool_fp,
+            "preflight_executions": 1,
+            "preflight_duration_ms": duration,
+            "stages": list(result.get("stages")) if isinstance(result.get("stages"), list) else [],
+            "error_code": result.get("error_code") if isinstance(result.get("error_code"), str) else None,
+            "probe_executions": 0,
+            "local_duration_ms": 0,
+            "tokens": 0,
+            "app_server_rpc_calls": 0,
+            "occurred_at": checked_at,
+        }
+        digest = sha256_json(record)
+        with self._connection() as conn:
+            existing = conn.execute(
+                "SELECT payload, integrity_hash FROM ledger_usage_events WHERE source_event_id=?",
+                (record["source_event_id"],),
+            ).fetchone()
+            if existing:
+                if existing[1] != digest:
+                    raise PolicyError("WSL preflight ledger event id was reused with different content")
+                return {**json.loads(existing[0]), "integrity_hash": existing[1]}
+            conn.execute(
+                """INSERT INTO ledger_usage_events (
+                    event_id, source_event_id, source, quality, event_type, run_id, task_id, route_plan_id,
+                    comparison_key, success_criteria_hash, task_class, planned_model, actual_model, effort, status,
+                    input_tokens, cached_input_tokens, output_tokens, reasoning_tokens, provider_total_tokens,
+                    codex_context_bytes, web_packet_bytes, evidence_bytes, source_bytes, catalog_source_bytes,
+                    probe_bytes, model_turns, high_model_turns, retries, reroutes, compactions, subagent_count,
+                    occurred_at, payload, integrity_hash
+                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL, NULL,
+                    NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, ?, ?, ?)""",
+                (
+                    str(uuid.uuid4()), record["source_event_id"], record["source"], record["quality"],
+                    record["event_type"], record["status"], record["occurred_at"],
+                    json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")), digest,
+                ),
+            )
+        return {**record, "integrity_hash": digest}
+
     def save_task(
         self,
         task_id: str,
@@ -1785,7 +2310,28 @@ class Store:
         return [{**json.loads(payload), "integrity_hash": integrity_hash} for payload, integrity_hash in rows]
 
     def token_ledger_report(self) -> dict[str, Any]:
-        report = build_report(self.ledger_runs(), self.ledger_baselines(), self.ledger_usage_events())
+        usage_events = self.ledger_usage_events()
+        report = build_report(self.ledger_runs(), self.ledger_baselines(), usage_events)
+        wsl_events = [event for event in usage_events if event.get("event_type") in {"WSL_ISOLATION_PROBE", "WSL_ISOLATION_PREFLIGHT", "WSL_ISOLATION_REPRO"}]
+        report["wsl_isolation_probes"] = {
+            "executions": sum(int(event.get("probe_executions") or 0) for event in wsl_events),
+            "local_duration_ms": sum(int(event.get("local_duration_ms") or 0) for event in wsl_events),
+            "tokens": 0,
+            "app_server_rpc_calls": 0,
+        }
+        report["wsl_isolation_preflight"] = {
+            "executions": sum(int(event.get("preflight_executions") or 0) for event in wsl_events),
+            "local_duration_ms": sum(int(event.get("preflight_duration_ms") or 0) for event in wsl_events),
+            "tokens": 0,
+            "app_server_rpc_calls": 0,
+        }
+        repro_events = [event for event in usage_events if event.get("event_type") == "WSL_ISOLATION_REPRO"]
+        report["wsl_isolation_repro"] = {
+            "executions": sum(int(event.get("local_executions") or 0) for event in repro_events),
+            "local_duration_ms": sum(int(event.get("local_duration_ms") or 0) for event in repro_events),
+            "tokens": 0,
+            "app_server_rpc_calls": 0,
+        }
         return report
 
     def export_token_ledger_report(self, format: str = "json") -> str:

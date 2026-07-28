@@ -18,6 +18,8 @@ from .capsule import create_evidence_capsule
 from .catalog import CatalogService
 from .bridge import BridgeService
 from .gateway import Gate
+from .isolation_wsl import WSLBubblewrapIsolation, public_result as public_wsl_isolation_result
+from .isolation_repro import IsolationReproService, public_repro_result
 from .format_probe import FormatProbeService
 from .indexer import preflight
 from .policy import PolicyError, model_choices, validate_project_id, validate_workspace_root
@@ -140,6 +142,12 @@ class FormatProbeRequest(BaseModel):
     catalog_entry_ids: list[str] = Field(min_length=1, max_length=50)
 
 
+class WSLIsolationConfigRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    distro: str = Field(min_length=1, max_length=128)
+
+
 def _local_host(value: str | None) -> str | None:
     if not value:
         return None
@@ -183,7 +191,11 @@ def _enforce_local_request(request: Request) -> JSONResponse | None:
 async def lifespan(app: FastAPI):
     store = Store(DATA_ROOT)
     store.recover_interrupted_format_probes()
+    store.recover_interrupted_wsl_isolation_probes()
+    store.recover_interrupted_wsl_isolation_repros()
     gate_instance = Gate(store)
+    app.state.wsl_isolation_service = WSLBubblewrapIsolation(store)
+    app.state.wsl_repro_service = IsolationReproService(store, app.state.wsl_isolation_service)
     BridgeService(store, gate_instance.create_route_plan).recover_processing_on_startup()
     app.state.gate = gate_instance
     yield
@@ -220,6 +232,14 @@ def format_probe(request: Request) -> FormatProbeService:
     return FormatProbeService(gate(request).store)
 
 
+def wsl_isolation(request: Request) -> WSLBubblewrapIsolation:
+    return request.app.state.wsl_isolation_service
+
+
+def wsl_repro(request: Request) -> IsolationReproService:
+    return request.app.state.wsl_repro_service
+
+
 def as_http_error(error: Exception) -> HTTPException:
     return HTTPException(status_code=400, detail=str(error))
 
@@ -232,6 +252,7 @@ async def home(request: Request):
 @app.get("/api/status")
 async def status(request: Request):
     state = gate(request).status()
+    state["wsl_isolation"] = public_wsl_isolation_result(gate(request).store.wsl_isolation_result())
     state["choices"] = model_choices(state["models"])
     return state
 
@@ -241,6 +262,7 @@ async def connect(request: Request):
     try:
         models = await gate(request).connect()
         state = gate(request).status()
+        state["wsl_isolation"] = public_wsl_isolation_result(gate(request).store.wsl_isolation_result())
         return {
             "models": models,
             "choices": model_choices(models),
@@ -256,6 +278,7 @@ async def connect(request: Request):
                     "account_usage",
                     "model_catalog",
                     "isolation",
+                    "wsl_isolation",
                     "token_ledger",
                 )
             },
@@ -269,6 +292,45 @@ async def isolation_probe(request: Request):
     try:
         # This endpoint opens a throwaway command/exec-only transport; it never starts a turn.
         return await gate(request).run_isolation_probe()
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/isolation/wsl/config")
+async def configure_wsl_isolation(payload: WSLIsolationConfigRequest, request: Request):
+    try:
+        return gate(request).store.save_wsl_isolation_config(payload.distro)
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/isolation/wsl/probe")
+async def wsl_isolation_probe(request: Request):
+    try:
+        # This local probe uses only fixed direct WSL/bwrap argv; it never opens app-server.
+        return public_wsl_isolation_result(await wsl_isolation(request).probe())
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.get("/api/isolation/wsl/repro")
+async def wsl_isolation_repro_status(request: Request):
+    try:
+        result = gate(request).store.wsl_isolation_repro(
+            request.query_params.get("cache_key", "")
+        ) if request.query_params.get("cache_key") else None
+        return public_repro_result(result)
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/isolation/wsl/repro")
+async def wsl_isolation_repro(request: Request):
+    try:
+        # Identity is taken from the sanitized SAFE_CANDIDATE snapshot; the
+        # optional body is intentionally ignored to prevent policy overrides.
+        result = await wsl_repro(request).run()
+        return public_repro_result(result)
     except Exception as exc:
         raise as_http_error(exc) from exc
 

@@ -90,6 +90,19 @@
       <button id="run-isolation-probe" class="button wide" type="button">Test Read Only isolation (no model turn)</button>
     </section>
 
+    <section class="panel wsl-isolation-panel">
+      <div class="panel-title"><span>WSL2</span><h2>bubblewrap Read Only preflight</h2><span id="wsl-isolation-status" class="status">UNCONFIGURED</span></div>
+      <p id="wsl-isolation-result" class="hint">Choose a WSL2 distribution explicitly. The fixed bwrap canary checks remain preflight-only and never unlock live execution.</p>
+      <div class="row wsl-isolation-actions">
+        <label>WSL distribution<input id="wsl-isolation-distro" maxlength="128" autocomplete="off" placeholder="Ubuntu"></label>
+        <button id="save-wsl-isolation-config" class="button ghost" type="button">Save distribution</button>
+        <button id="run-wsl-isolation-probe" class="button" type="button">Run WSL2+bwrap probe</button>
+        <button id="run-wsl-isolation-repro" class="button ghost" type="button">Repeat fixed check (10x)</button>
+      </div>
+      <p class="hint">Checks only the selected distribution, `/usr/bin/python3`, and `bwrap`; the sandbox binds the Capsule as read-only at `/work`, leaves Windows mounts unbound, and keeps the run button locked.</p>
+      <p id="wsl-isolation-repro-result" class="hint">Repeatability check is available only after SAFE_CANDIDATE; live runs remain locked.</p>
+    </section>
+
     <section class="panel router-preview-panel">
       <div class="panel-title"><span>07</span><h2>자동 하향 라우터 미리보기</h2><span class="status">PREVIEW ONLY</span></div>
       <div class="row preview-controls">

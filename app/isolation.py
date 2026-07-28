@@ -30,6 +30,10 @@ MAX_CAPTURED_OUTPUT_BYTES = 1024
 TIMEOUT_SECONDS = 10
 CANARY_BYTES = 32
 
+NATIVE_WINDOWS_APP_SERVER = "NATIVE_WINDOWS_APP_SERVER"
+WSL2_BWRAP = "WSL2_BWRAP"
+ISOLATION_BACKENDS = frozenset({NATIVE_WINDOWS_APP_SERVER, WSL2_BWRAP})
+
 _PROBE_SCRIPT = (
     "from pathlib import Path\n"
     "import sys\n"
@@ -51,6 +55,14 @@ class IsolationCommandClient(Protocol):
     def read_only_sandbox_policy(self) -> dict[str, Any]: ...
     async def command_exec(self, params: dict[str, Any], *, timeout_seconds: float = 10) -> dict[str, Any]: ...
     async def close(self) -> None: ...
+
+
+class IsolationBackend(Protocol):
+    """A backend returns only a redacted preflight result and never authorizes a live turn by itself."""
+
+    backend: str
+
+    async def probe(self) -> dict[str, Any]: ...
 
 
 def _sha256_bytes(value: bytes) -> str:
