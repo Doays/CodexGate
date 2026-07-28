@@ -9,6 +9,7 @@ let stream = null;
 let planExpiryTimer = null;
 let currentBridge = null;
 let bridgeManualMode = null;
+let currentCatalogSource = null;
 
 function say(message, isError = false) {
   const node = $("message");
@@ -756,6 +757,72 @@ async function restoreBridge() {
   } catch { $("bridge-recent").textContent = "Bridge recovery is unavailable."; }
 }
 
+function renderCatalogEntries(entries) {
+  const body = $("catalog-entries");
+  body.replaceChildren();
+  for (const entry of entries) {
+    const row = document.createElement("tr");
+    for (const value of [currentCatalogSource?.alias || "-", entry.relative_path, entry.asset_kind, String(entry.size), entry.status, entry.entry_id]) {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      row.appendChild(cell);
+    }
+    body.appendChild(row);
+  }
+}
+
+async function refreshCatalogEntries() {
+  if (!currentCatalogSource) return;
+  const query = new URLSearchParams();
+  const fields = [["status", "catalog-filter-status"], ["asset_kind", "catalog-filter-kind"], ["extension", "catalog-filter-extension"]];
+  for (const [name, id] of fields) { if ($(id).value.trim()) query.set(name, $(id).value.trim()); }
+  const suffix = query.toString() ? `?${query}` : "";
+  const data = await api(`/api/catalog/sources/${encodeURIComponent(currentCatalogSource.source_id)}/entries${suffix}`);
+  renderCatalogEntries(data.entries || []);
+}
+
+function renderCatalogScan(scan) {
+  const metrics = scan.metrics || {};
+  $("catalog-scan-status").textContent = scan.status;
+  $("catalog-progress").textContent = `${currentCatalogSource?.alias || "Source"}: ${metrics.files_seen || 0} files, ${metrics.bytes_indexed || 0} indexed bytes, ${metrics.content_bytes_read || 0} content bytes read; added ${metrics.added || 0}, modified ${metrics.modified || 0}, missing ${metrics.missing || 0}, rejected ${metrics.rejected || 0}.`;
+  $("catalog-scan").disabled = false;
+  $("catalog-resume").disabled = scan.status !== "INTERRUPTED";
+  $("catalog-cancel").disabled = true;
+}
+
+async function registerCatalogSource() {
+  try {
+    const source = await api("/api/catalog/sources", { method: "POST", body: JSON.stringify({alias: $("catalog-alias").value, root: $("catalog-root").value}) });
+    currentCatalogSource = source;
+    $("catalog-scan").disabled = false;
+    $("catalog-resume").disabled = true;
+    $("catalog-progress").textContent = `${source.alias} is registered. Its local path remains private.`;
+    renderCatalogEntries([]);
+  } catch (error) { say(error.message, true); }
+}
+
+async function scanCatalog(resume = false) {
+  if (!currentCatalogSource) return;
+  try {
+    $("catalog-scan").disabled = true;
+    $("catalog-resume").disabled = true;
+    $("catalog-cancel").disabled = false;
+    $("catalog-scan-status").textContent = "SCANNING";
+    const action = resume ? "resume" : "scan";
+    const scan = await api(`/api/catalog/sources/${encodeURIComponent(currentCatalogSource.source_id)}/${action}`, {method: "POST", body: JSON.stringify({})});
+    renderCatalogScan(scan);
+    await refreshCatalogEntries();
+  } catch (error) { $("catalog-scan-status").textContent = "FAILED"; $("catalog-scan").disabled = false; say(error.message, true); }
+}
+
+async function cancelCatalog() {
+  if (!currentCatalogSource) return;
+  try {
+    await api(`/api/catalog/sources/${encodeURIComponent(currentCatalogSource.source_id)}/cancel`, {method: "POST"});
+    $("catalog-progress").textContent = "Cancellation requested; the current metadata batch will finish safely.";
+  } catch (error) { say(error.message, true); }
+}
+
 $("connect").onclick = connect;
 $("preflight").onclick = makePreflight;
 $("copy-packet").onclick = copyPacket;
@@ -767,6 +834,11 @@ $("execute").onclick = execute;
 $("interrupt").onclick = interrupt;
 $("bridge-start").onclick = startBridge;
 $("bridge-action").onclick = bridgeAction;
+$("catalog-register").onclick = registerCatalogSource;
+$("catalog-scan").onclick = () => scanCatalog(false);
+$("catalog-resume").onclick = () => scanCatalog(true);
+$("catalog-cancel").onclick = cancelCatalog;
+for (const id of ["catalog-filter-status", "catalog-filter-kind", "catalog-filter-extension"]) $(id).addEventListener("change", () => refreshCatalogEntries().catch((error) => say(error.message, true)));
 renderBridge(null);
 restoreBridge();
 for (const id of ["project-name", "root", "task", "decision", "permission"]) {

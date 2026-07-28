@@ -276,6 +276,32 @@ def validate_workspace_root(root: str | Path, forbidden_roots: Sequence[str | Pa
     return root_path
 
 
+def validate_catalog_source_root(root: str | Path, forbidden_roots: Sequence[str | Path] | None = None) -> Path:
+    """Validate an explicitly selected catalog root without dereferencing links."""
+    raw = _normalize_text(root)
+    windows_root = _windows_absolute_path(raw)
+    if windows_root is not None and os.name != "nt":
+        raise PolicyError("Windows absolute source roots are not allowed on this platform")
+    path = Path(raw).expanduser()
+    if windows_root is None and not path.is_absolute():
+        raise PolicyError("catalog source root must be an absolute path")
+    if is_link_or_junction(path):
+        raise PolicyError("catalog source root cannot be a symlink or junction")
+    resolved = validate_workspace_root(raw, forbidden_roots=forbidden_roots)
+    if is_link_or_junction(resolved):
+        raise PolicyError("catalog source root cannot be a symlink or junction")
+    return resolved
+
+
+def validate_source_alias(value: str) -> str:
+    alias = value.strip()
+    if not alias or len(alias) > 120:
+        raise PolicyError("catalog source alias must be 1 to 120 characters")
+    if "\x00" in alias or _windows_absolute_path(alias) is not None or Path(alias).is_absolute():
+        raise PolicyError("catalog source alias is invalid")
+    return alias
+
+
 def resolve_project_path(root: str | Path, value: str) -> tuple[Path, str]:
     """Resolve a candidate path and reject traversal, symlink, junction, and volume escapes."""
     root_path = Path(root).expanduser().resolve(strict=False)

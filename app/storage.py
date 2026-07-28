@@ -14,6 +14,7 @@ from .policy import (
     sha256_json,
     validate_artifact_name,
     validate_project_id,
+    validate_source_alias,
     validate_task_id,
 )
 
@@ -298,12 +299,216 @@ class Store:
                     updated_at TEXT NOT NULL
                 )"""
             )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS catalog_sources (
+                    source_id TEXT PRIMARY KEY,
+                    alias TEXT NOT NULL UNIQUE,
+                    root TEXT NOT NULL,
+                    generation INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'READY',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS catalog_scans (
+                    scan_id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL REFERENCES catalog_sources(source_id),
+                    generation INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    cursor TEXT,
+                    cancel_requested INTEGER NOT NULL DEFAULT 0,
+                    payload TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS catalog_entries (
+                    entry_id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL REFERENCES catalog_sources(source_id),
+                    relative_path TEXT NOT NULL,
+                    normalized_path TEXT NOT NULL,
+                    extension TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    file_id TEXT NOT NULL,
+                    asset_kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    scan_generation INTEGER NOT NULL,
+                    fingerprint_state TEXT NOT NULL DEFAULT 'QUEUED',
+                    UNIQUE(source_id, normalized_path)
+                )"""
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS catalog_entries_source_generation ON catalog_entries(source_id, scan_generation)")
+            conn.execute("CREATE INDEX IF NOT EXISTS catalog_scans_source_status ON catalog_scans(source_id, status)")
             self._migrate_route_plan_uses(conn)
             self._migrate_route_plans(conn)
             self._migrate_bridge_nonces(conn)
 
     def _connection(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db_path)
+
+    # Asset Catalog storage deliberately keeps the source root private.  These
+    # methods return aliases and project-relative paths only.
+    def create_catalog_source(self, alias: str, root: Path) -> dict[str, Any]:
+        clean_alias = validate_source_alias(alias)
+        source_id = str(uuid.uuid4())
+        now = _now()
+        with self._connection() as conn:
+            try:
+                conn.execute(
+                    """INSERT INTO catalog_sources
+                       (source_id, alias, root, generation, status, created_at, updated_at)
+                       VALUES (?, ?, ?, 0, 'READY', ?, ?)""",
+                    (source_id, clean_alias, str(root), now, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise PolicyError("catalog source alias is already registered") from exc
+        return {"source_id": source_id, "alias": clean_alias, "generation": 0, "status": "READY", "created_at": now}
+
+    def catalog_source_private(self, source_id: str) -> dict[str, Any]:
+        try:
+            uuid.UUID(source_id)
+        except (ValueError, TypeError) as exc:
+            raise PolicyError("catalog source id is invalid") from exc
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT source_id, alias, root, generation, status, created_at, updated_at FROM catalog_sources WHERE source_id=?",
+                (source_id,),
+            ).fetchone()
+        if not row:
+            raise PolicyError("catalog source was not found")
+        return dict(zip(("source_id", "alias", "root", "generation", "status", "created_at", "updated_at"), row))
+
+    @staticmethod
+    def _catalog_public_source(record: Mapping[str, Any]) -> dict[str, Any]:
+        return {key: record[key] for key in ("source_id", "alias", "generation", "status", "created_at", "updated_at") if key in record}
+
+    def catalog_sources(self) -> list[dict[str, Any]]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT source_id, alias, generation, status, created_at, updated_at FROM catalog_sources ORDER BY alias COLLATE NOCASE"
+            ).fetchall()
+        return [dict(zip(("source_id", "alias", "generation", "status", "created_at", "updated_at"), row)) for row in rows]
+
+    def begin_catalog_scan(self, source_id: str, *, resume: bool = False) -> dict[str, Any]:
+        source = self.catalog_source_private(source_id)
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            active = conn.execute(
+                "SELECT scan_id FROM catalog_scans WHERE source_id=? AND status='SCANNING'", (source_id,)
+            ).fetchone()
+            if active:
+                raise PolicyError("a catalog scan is already running for this source")
+            interrupted = conn.execute(
+                "SELECT scan_id, generation, cursor, payload FROM catalog_scans WHERE source_id=? AND status='INTERRUPTED' ORDER BY started_at DESC LIMIT 1",
+                (source_id,),
+            ).fetchone() if resume else None
+            now = _now()
+            if interrupted:
+                scan_id, generation, cursor, payload = interrupted
+                conn.execute("UPDATE catalog_scans SET status='SCANNING', cancel_requested=0, finished_at=NULL WHERE scan_id=?", (scan_id,))
+                return {"scan_id": scan_id, "source": source, "generation": generation, "cursor": json.loads(cursor) if cursor else None, "payload": json.loads(payload), "resumed": True}
+            generation = int(source["generation"]) + 1
+            scan_id = str(uuid.uuid4())
+            payload = {"files_seen": 0, "bytes_indexed": 0, "content_bytes_read": 0, "added": 0, "modified": 0, "missing": 0, "moved_candidates": 0, "rejected": 0, "unchanged": 0, "duration": 0.0}
+            conn.execute("UPDATE catalog_sources SET generation=?, status='SCANNING', updated_at=? WHERE source_id=?", (generation, now, source_id))
+            conn.execute("INSERT INTO catalog_scans (scan_id, source_id, generation, status, started_at, cursor, payload) VALUES (?, ?, ?, 'SCANNING', ?, ?, ?)", (scan_id, source_id, generation, now, json.dumps([""], separators=(",", ":")), json.dumps(payload, separators=(",", ":"))))
+            return {"scan_id": scan_id, "source": source, "generation": generation, "cursor": [""], "payload": payload, "resumed": False}
+
+    def catalog_scan_cancel_requested(self, scan_id: str) -> bool:
+        with self._connection() as conn:
+            row = conn.execute("SELECT cancel_requested FROM catalog_scans WHERE scan_id=?", (scan_id,)).fetchone()
+        return bool(row and row[0])
+
+    def request_catalog_scan_cancel(self, source_id: str) -> None:
+        with self._connection() as conn:
+            conn.execute("UPDATE catalog_scans SET cancel_requested=1 WHERE source_id=? AND status='SCANNING'", (source_id,))
+
+    def apply_catalog_batch(self, scan_id: str, source_id: str, generation: int, entries: list[Mapping[str, Any]], rejected: list[Mapping[str, Any]], cursor: list[str], counters: Mapping[str, Any]) -> None:
+        """Commit at most one scanner batch. Metadata only; file content is never accepted."""
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for record in entries:
+                old = conn.execute("SELECT entry_id, size, mtime_ns, file_id FROM catalog_entries WHERE source_id=? AND normalized_path=?", (source_id, record["normalized_path"])).fetchone()
+                status = record["status"]
+                if old:
+                    status = "UNCHANGED" if tuple(old[1:]) == (record["size"], record["mtime_ns"], record["file_id"]) else "MODIFIED"
+                    conn.execute("UPDATE catalog_entries SET relative_path=?, extension=?, size=?, mtime_ns=?, file_id=?, asset_kind=?, status=?, scan_generation=?, fingerprint_state='QUEUED' WHERE entry_id=?", (record["relative_path"], record["extension"], record["size"], record["mtime_ns"], record["file_id"], record["asset_kind"], status, generation, old[0]))
+                else:
+                    conn.execute("INSERT INTO catalog_entries (entry_id, source_id, relative_path, normalized_path, extension, size, mtime_ns, file_id, asset_kind, status, scan_generation, fingerprint_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED')", (str(uuid.uuid4()), source_id, record["relative_path"], record["normalized_path"], record["extension"], record["size"], record["mtime_ns"], record["file_id"], record["asset_kind"], status, generation))
+            # Reparse points never get followed or turned into ordinary entries.
+            for record in rejected:
+                normalized = str(record["normalized_path"])
+                old = conn.execute("SELECT entry_id FROM catalog_entries WHERE source_id=? AND normalized_path=?", (source_id, normalized)).fetchone()
+                values = (record["relative_path"], record["extension"], 0, 0, "", "unknown", "REJECTED", generation)
+                if old:
+                    conn.execute("UPDATE catalog_entries SET relative_path=?, extension=?, size=?, mtime_ns=?, file_id=?, asset_kind=?, status=?, scan_generation=? WHERE entry_id=?", (*values, old[0]))
+                else:
+                    conn.execute("INSERT INTO catalog_entries (entry_id, source_id, relative_path, normalized_path, extension, size, mtime_ns, file_id, asset_kind, status, scan_generation, fingerprint_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED')", (str(uuid.uuid4()), source_id, record["relative_path"], normalized, record["extension"], 0, 0, "", "unknown", "REJECTED", generation))
+            conn.execute("UPDATE catalog_scans SET cursor=?, payload=? WHERE scan_id=?", (json.dumps(cursor, separators=(",", ":")), json.dumps(dict(counters), separators=(",", ":")), scan_id))
+
+    def finish_catalog_scan(self, scan_id: str, source_id: str, generation: int, status: str, counters: Mapping[str, Any], cursor: list[str] | None = None) -> dict[str, Any]:
+        if status not in {"COMPLETED", "INTERRUPTED", "FAILED"}:
+            raise PolicyError("catalog scan state is invalid")
+        now = _now()
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if status == "COMPLETED":
+                # Anything not encountered in this full generation is retained as MISSING.
+                missing = conn.execute("SELECT COUNT(*) FROM catalog_entries WHERE source_id=? AND scan_generation < ? AND status NOT IN ('REJECTED', 'MISSING')", (source_id, generation)).fetchone()[0]
+                conn.execute("UPDATE catalog_entries SET status='MISSING' WHERE source_id=? AND scan_generation < ? AND status NOT IN ('REJECTED', 'MISSING')", (source_id, generation))
+                values = dict(counters)
+                values["missing"] = int(values.get("missing", 0)) + int(missing)
+                counters = values
+                # A new path with identical stable metadata is only a candidate; the old missing record is retained.
+                rows = conn.execute("SELECT entry_id, size, mtime_ns, file_id FROM catalog_entries WHERE source_id=? AND scan_generation=? AND status='ADDED'", (source_id, generation)).fetchall()
+                moved = 0
+                for entry_id, size, mtime_ns, file_id in rows:
+                    old = conn.execute("SELECT 1 FROM catalog_entries WHERE source_id=? AND scan_generation < ? AND status='MISSING' AND size=? AND mtime_ns=? AND file_id=?", (source_id, generation, size, mtime_ns, file_id)).fetchone()
+                    if old:
+                        conn.execute("UPDATE catalog_entries SET status='MOVED_CANDIDATE' WHERE entry_id=?", (entry_id,))
+                        moved += 1
+                values = dict(counters)
+                values["moved_candidates"] = int(values.get("moved_candidates", 0)) + moved
+                counters = values
+            conn.execute("UPDATE catalog_scans SET status=?, finished_at=?, cursor=?, payload=? WHERE scan_id=?", (status, now, json.dumps(cursor or [], separators=(",", ":")), json.dumps(dict(counters), separators=(",", ":")), scan_id))
+            conn.execute("UPDATE catalog_sources SET status=?, updated_at=? WHERE source_id=?", ("READY" if status == "COMPLETED" else status, now, source_id))
+        return self.catalog_scan(scan_id)
+
+    def catalog_scan(self, scan_id: str) -> dict[str, Any]:
+        with self._connection() as conn:
+            row = conn.execute("SELECT scan_id, source_id, generation, status, started_at, finished_at, payload FROM catalog_scans WHERE scan_id=?", (scan_id,)).fetchone()
+        if not row:
+            raise PolicyError("catalog scan was not found")
+        result = dict(zip(("scan_id", "source_id", "generation", "status", "started_at", "finished_at", "metrics"), (*row[:6], json.loads(row[6]))))
+        return result
+
+    def catalog_entries(self, source_id: str, *, status: str | None = None, asset_kind: str | None = None, extension: str | None = None, min_size: int | None = None, max_size: int | None = None) -> list[dict[str, Any]]:
+        self.catalog_source_private(source_id)
+        clauses = ["source_id=?"]
+        values: list[Any] = [source_id]
+        for column, value in (("status", status), ("asset_kind", asset_kind), ("extension", extension.casefold() if extension else None)):
+            if value:
+                clauses.append(f"{column}=?")
+                values.append(value)
+        if min_size is not None:
+            clauses.append("size>=?")
+            values.append(min_size)
+        if max_size is not None:
+            clauses.append("size<=?")
+            values.append(max_size)
+        with self._connection() as conn:
+            rows = conn.execute("SELECT entry_id, relative_path, extension, size, mtime_ns, file_id, asset_kind, status, scan_generation, fingerprint_state FROM catalog_entries WHERE " + " AND ".join(clauses) + " ORDER BY normalized_path", values).fetchall()
+        keys = ("entry_id", "relative_path", "extension", "size", "mtime_ns", "file_id", "asset_kind", "status", "scan_generation", "fingerprint_state")
+        return [dict(zip(keys, row)) for row in rows]
+
+    def catalog_entry_metadata(self, source_id: str) -> dict[str, dict[str, Any]]:
+        """Private scan helper; only metadata and no source root leaves SQLite."""
+        with self._connection() as conn:
+            rows = conn.execute("SELECT normalized_path, size, mtime_ns, file_id, scan_generation, status FROM catalog_entries WHERE source_id=?", (source_id,)).fetchall()
+        return {row[0]: {"size": row[1], "mtime_ns": row[2], "file_id": row[3], "scan_generation": row[4], "status": row[5]} for row in rows}
 
     @staticmethod
     def _migrate_route_plan_uses(conn: sqlite3.Connection) -> None:

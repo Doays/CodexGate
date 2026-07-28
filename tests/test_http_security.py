@@ -84,3 +84,10 @@ def test_bridge_creation_rejects_forbidden_windows_roots_immediately(client, roo
     )
     assert response.status_code == 400
     assert "blocked" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("root", [r"E:\\", r"E:\.codex", r"E:\.codex\assets"])
+def test_catalog_registration_rejects_forbidden_windows_roots(client, root):
+    response = client.post("/api/catalog/sources", json={"alias": "blocked", "root": root})
+    assert response.status_code == 400
+    assert "blocked" in response.json()["detail"]

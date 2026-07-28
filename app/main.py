@@ -8,13 +8,14 @@ from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .capsule import create_evidence_capsule
+from .catalog import CatalogService
 from .bridge import BridgeService
 from .gateway import Gate
 from .indexer import preflight
@@ -119,6 +120,19 @@ class EvidenceMapRequest(BaseModel):
     context_after: int | None = Field(default=None, ge=0)
 
 
+class CatalogSourceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    alias: str = Field(min_length=1, max_length=120)
+    root: str = Field(min_length=1, max_length=4096)
+
+
+class CatalogScanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_files: int | None = Field(default=None, ge=1, le=10_000_000)
+
+
 def _local_host(value: str | None) -> str | None:
     if not value:
         return None
@@ -187,6 +201,10 @@ def gate(request: Request) -> Gate:
 def bridge(request: Request) -> BridgeService:
     current_gate = gate(request)
     return BridgeService(current_gate.store, current_gate.create_route_plan)
+
+
+def catalog(request: Request) -> CatalogService:
+    return CatalogService(gate(request).store)
 
 
 def as_http_error(error: Exception) -> HTTPException:
@@ -363,6 +381,66 @@ async def collect_bridge_evidence(task_id: str, request_id: str, request: Reques
     try:
         # Local bounded collector only: no shell command or app-server RPC is reachable here.
         return bridge(request).collect_evidence(task_id, request_id)
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.get("/api/catalog/sources")
+async def list_catalog_sources(request: Request):
+    try:
+        return {"sources": catalog(request).sources()}
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/catalog/sources")
+async def register_catalog_source(payload: CatalogSourceRequest, request: Request):
+    try:
+        # Registration records a local root only in SQLite; public responses use its alias.
+        return catalog(request).register_source(payload.alias, payload.root)
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/catalog/sources/{source_id}/scan")
+async def scan_catalog_source(source_id: str, payload: CatalogScanRequest, request: Request):
+    try:
+        # scandir/stat metadata only; this path cannot reach app-server or a model turn.
+        return await asyncio.to_thread(catalog(request).scan, source_id, max_files=payload.max_files)
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/catalog/sources/{source_id}/resume")
+async def resume_catalog_source(source_id: str, payload: CatalogScanRequest, request: Request):
+    try:
+        return await asyncio.to_thread(catalog(request).scan, source_id, resume=True, max_files=payload.max_files)
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/catalog/sources/{source_id}/cancel")
+async def cancel_catalog_source(source_id: str, request: Request):
+    try:
+        return catalog(request).cancel(source_id)
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.get("/api/catalog/sources/{source_id}/entries")
+async def list_catalog_entries(
+    source_id: str,
+    request: Request,
+    status: str | None = None,
+    asset_kind: str | None = None,
+    extension: str | None = None,
+    min_size: int | None = Query(default=None, ge=0),
+    max_size: int | None = Query(default=None, ge=0),
+):
+    try:
+        if min_size is not None and max_size is not None and min_size > max_size:
+            raise PolicyError("min_size cannot exceed max_size")
+        return {"entries": catalog(request).entries(source_id, status=status, asset_kind=asset_kind, extension=extension, min_size=min_size, max_size=max_size)}
     except Exception as exc:
         raise as_http_error(exc) from exc
 

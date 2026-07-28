@@ -140,6 +140,23 @@
       <button id="create-capsule" class="button wide" type="button">Create Evidence Capsule</button>
     </section>
 
+    <section id="asset-catalog" class="panel catalog-panel">
+      <div class="panel-title"><span>CATALOG</span><h2>Asset Catalog — metadata only</h2><span id="catalog-scan-status" class="status">IDLE</span></div>
+      <p class="hint">Register a local source explicitly. Phase 1 records names and filesystem metadata only; it never reads file bodies, hashes whole files, parses assets, or sends catalog entries to Web GPT.</p>
+      <div class="row">
+        <label>Source alias<input id="catalog-alias" maxlength="120" placeholder="Game data"></label>
+        <label>Local Source Root<input id="catalog-root" maxlength="4096" placeholder="D:\\GameData" spellcheck="false"></label>
+      </div>
+      <div class="row catalog-actions"><button id="catalog-register" class="button" type="button">Register source</button><button id="catalog-scan" class="button" type="button" disabled>Start scan</button><button id="catalog-resume" class="button ghost" type="button" disabled>Resume</button><button id="catalog-cancel" class="button danger" type="button" disabled>Cancel</button></div>
+      <p id="catalog-progress" class="hint">No source selected.</p>
+      <div class="row catalog-filters">
+        <label>Status<input id="catalog-filter-status" placeholder="ADDED"></label>
+        <label>Kind<input id="catalog-filter-kind" placeholder="texture"></label>
+        <label>Extension<input id="catalog-filter-extension" placeholder=".png"></label>
+      </div>
+      <div class="catalog-scroll"><table class="catalog-table"><thead><tr><th>Source</th><th>Relative path</th><th>Kind</th><th>Size</th><th>Status</th><th>Entry ID</th></tr></thead><tbody id="catalog-entries"></tbody></table></div>
+    </section>
+
     <section class="action-bar"><div id="message" role="status">Codex를 연결하고 작업 카드를 작성하세요.</div><button id="execute" class="button accent" disabled>새 Codex 스레드에서 실행</button></section>
 
     <section id="run-panel" class="panel run-panel hidden">
