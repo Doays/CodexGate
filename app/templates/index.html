@@ -154,7 +154,9 @@
         <label>Kind<input id="catalog-filter-kind" placeholder="texture"></label>
         <label>Extension<input id="catalog-filter-extension" placeholder=".png"></label>
       </div>
-      <div class="catalog-scroll"><table class="catalog-table"><thead><tr><th>Source</th><th>Relative path</th><th>Kind</th><th>Size</th><th>Status</th><th>Entry ID</th></tr></thead><tbody id="catalog-entries"></tbody></table></div>
+      <div class="catalog-scroll"><table class="catalog-table"><thead><tr><th>Select</th><th>Source</th><th>Relative path</th><th>Kind</th><th>Size</th><th>Status</th><th>Entry ID</th></tr></thead><tbody id="catalog-entries"></tbody></table></div>
+      <div class="row catalog-actions format-probe-actions"><button id="catalog-probe" class="button" type="button" disabled>Run targeted format probe</button><span id="catalog-probe-summary" class="hint">Select up to 50 catalog entries. Phase 2 samples only limited file regions and never parses the whole file.</span></div>
+      <div class="catalog-scroll"><table class="catalog-table"><thead><tr><th>Source</th><th>Relative path</th><th>Detected format</th><th>Confidence</th><th>Extension</th><th>Next inspector</th><th>Bytes read</th><th>Status</th></tr></thead><tbody id="format-probe-results"></tbody></table></div>
     </section>
 
     <section class="action-bar"><div id="message" role="status">Codex를 연결하고 작업 카드를 작성하세요.</div><button id="execute" class="button accent" disabled>새 Codex 스레드에서 실행</button></section>

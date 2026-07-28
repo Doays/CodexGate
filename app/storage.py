@@ -340,11 +340,14 @@ class Store:
                     UNIQUE(source_id, normalized_path)
                 )"""
             )
+            self._create_format_probe_schema(conn)
             conn.execute("CREATE INDEX IF NOT EXISTS catalog_entries_source_generation ON catalog_entries(source_id, scan_generation)")
             conn.execute("CREATE INDEX IF NOT EXISTS catalog_scans_source_status ON catalog_scans(source_id, status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS format_probes_entry_status ON format_probes(entry_id, status)")
             self._migrate_route_plan_uses(conn)
             self._migrate_route_plans(conn)
             self._migrate_bridge_nonces(conn)
+            self._migrate_format_probes(conn)
 
     def _connection(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db_path)
@@ -509,6 +512,339 @@ class Store:
         with self._connection() as conn:
             rows = conn.execute("SELECT normalized_path, size, mtime_ns, file_id, scan_generation, status FROM catalog_entries WHERE source_id=?", (source_id,)).fetchall()
         return {row[0]: {"size": row[1], "mtime_ns": row[2], "file_id": row[3], "scan_generation": row[4], "status": row[5]} for row in rows}
+
+    def catalog_entry_private(self, entry_id: str) -> dict[str, Any]:
+        try:
+            normalized_id = str(uuid.UUID(entry_id))
+        except (ValueError, TypeError) as exc:
+            raise PolicyError("catalog entry id is invalid") from exc
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT entry.entry_id, entry.source_id, source.alias, source.root, entry.relative_path,
+                          entry.normalized_path, entry.extension, entry.size, entry.mtime_ns, entry.file_id,
+                          entry.asset_kind, entry.status, entry.scan_generation
+                   FROM catalog_entries AS entry
+                   JOIN catalog_sources AS source ON source.source_id = entry.source_id
+                   WHERE entry.entry_id=?""",
+                (normalized_id,),
+            ).fetchone()
+        if not row:
+            raise PolicyError("catalog entry was not found")
+        keys = (
+            "entry_id", "source_id", "alias", "root", "relative_path", "normalized_path",
+            "extension", "size", "mtime_ns", "file_id", "asset_kind", "status", "scan_generation",
+        )
+        return dict(zip(keys, row))
+
+    def begin_format_probe(
+        self,
+        entry_id: str,
+        probe_version: str,
+        cache_identity: str,
+        sample_sha256: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        entry = self.catalog_entry_private(entry_id)
+        if not isinstance(probe_version, str) or not probe_version:
+            raise PolicyError("format probe version is invalid")
+        if not isinstance(cache_identity, str) or not cache_identity:
+            raise PolicyError("format probe cache identity is invalid")
+        if not isinstance(sample_sha256, str) or not sample_sha256:
+            raise PolicyError("format probe sample hash is invalid")
+        now = _now()
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                """SELECT probe_id FROM format_probes
+                   WHERE entry_id=? AND probe_version=? AND cache_identity=? AND status='COMPLETED'
+                   ORDER BY attempt DESC, created_at DESC LIMIT 1""",
+                (entry["entry_id"], probe_version, cache_identity),
+            ).fetchone()
+            if existing:
+                snapshot = self.load_format_probe(existing[0])
+                snapshot["reused"] = True
+                return snapshot
+            active = conn.execute(
+                "SELECT probe_id FROM format_probes WHERE entry_id=? AND status IN ('PENDING', 'PROBING')",
+                (entry["entry_id"],),
+            ).fetchone()
+            if active:
+                raise PolicyError("a format probe is already running for this catalog entry")
+            row = conn.execute("SELECT COALESCE(MAX(attempt), 0) FROM format_probes WHERE entry_id=?", (entry["entry_id"],)).fetchone()
+            attempt = int(row[0]) + 1
+            probe_id = str(uuid.uuid4())
+            record = {
+                **dict(payload),
+                "probe_id": probe_id,
+                "entry_id": entry["entry_id"],
+                "source_id": entry["source_id"],
+                "probe_version": probe_version,
+                "cache_identity": cache_identity,
+                "sample_sha256": sample_sha256,
+                "attempt": attempt,
+                "status": "PENDING",
+                "created_at": now,
+                "updated_at": now,
+                "finished_at": None,
+            }
+            integrity_hash = sha256_json(record)
+            conn.execute(
+                """INSERT INTO format_probes
+                   (probe_id, entry_id, source_id, probe_version, cache_identity, sample_sha256, attempt, status, created_at, updated_at, finished_at, payload, integrity_hash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, NULL, ?, ?)""",
+                (
+                    probe_id,
+                    entry["entry_id"],
+                    entry["source_id"],
+                    probe_version,
+                    cache_identity,
+                    sample_sha256,
+                    attempt,
+                    now,
+                    now,
+                    json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    integrity_hash,
+                ),
+            )
+        return {**record, "integrity_hash": integrity_hash, "reused": False}
+
+    def mark_format_probe_probing(self, probe_id: str) -> dict[str, Any]:
+        now = _now()
+        probe = self.load_format_probe(probe_id)
+        if probe["status"] != "PENDING":
+            raise PolicyError("format probe is not pending")
+        record = dict(probe)
+        record["status"] = "PROBING"
+        record["updated_at"] = now
+        record.pop("integrity_hash", None)
+        record.pop("reused", None)
+        integrity_hash = sha256_json(record)
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """UPDATE format_probes
+                   SET status='PROBING', updated_at=?, payload=?, integrity_hash=?
+                   WHERE probe_id=? AND status='PENDING'""",
+                (
+                    now,
+                    json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    integrity_hash,
+                    probe_id,
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise PolicyError("format probe could not start")
+        return {**record, "integrity_hash": integrity_hash, "reused": False}
+
+    def complete_format_probe(self, probe_id: str, status: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        if status not in {"COMPLETED", "STALE", "REJECTED", "FAILED"}:
+            raise PolicyError("format probe state is invalid")
+        current = self.load_format_probe(probe_id)
+        if current["status"] not in {"PENDING", "PROBING"}:
+            raise PolicyError("format probe is already finished")
+        now = _now()
+        record_payload = dict(payload)
+        record_payload.pop("integrity_hash", None)
+        record_payload.pop("reused", None)
+        record = {
+            **record_payload,
+            "probe_id": current["probe_id"],
+            "entry_id": current["entry_id"],
+            "source_id": current["source_id"],
+            "probe_version": current["probe_version"],
+            "cache_identity": current["cache_identity"],
+            "sample_sha256": current["sample_sha256"],
+            "attempt": current["attempt"],
+            "status": status,
+            "created_at": current["created_at"],
+            "updated_at": now,
+            "finished_at": now,
+        }
+        integrity_hash = sha256_json(record)
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """UPDATE format_probes
+                   SET status=?, updated_at=?, finished_at=?, payload=?, integrity_hash=?
+                   WHERE probe_id=? AND status IN ('PENDING', 'PROBING')""",
+                (
+                    status,
+                    now,
+                    now,
+                    json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    integrity_hash,
+                    probe_id,
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise PolicyError("format probe could not be completed")
+        return {**record, "integrity_hash": integrity_hash, "reused": False}
+
+    def load_format_probe(self, probe_id: str) -> dict[str, Any]:
+        try:
+            normalized_id = str(uuid.UUID(probe_id))
+        except (ValueError, TypeError) as exc:
+            raise PolicyError("format probe id is invalid") from exc
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT probe_id, entry_id, source_id, probe_version, cache_identity, sample_sha256, attempt, status, created_at, updated_at, finished_at, payload, integrity_hash
+                   FROM format_probes WHERE probe_id=?""",
+                (normalized_id,),
+            ).fetchone()
+        if not row:
+            raise PolicyError("format probe was not found")
+        try:
+            payload = json.loads(row[11])
+        except json.JSONDecodeError as exc:
+            raise PolicyError("format probe payload was modified") from exc
+        expected = {
+            "probe_id": row[0],
+            "entry_id": row[1],
+            "source_id": row[2],
+            "probe_version": row[3],
+            "cache_identity": row[4],
+            "sample_sha256": row[5],
+            "attempt": row[6],
+            "status": row[7],
+            "created_at": row[8],
+            "updated_at": row[9],
+            "finished_at": row[10],
+        }
+        if not isinstance(payload, dict) or any(payload.get(key) != value for key, value in expected.items()):
+            raise PolicyError("format probe metadata was modified")
+        if sha256_json(payload) != row[12]:
+            raise PolicyError("format probe integrity check failed")
+        return {**payload, "integrity_hash": row[12]}
+
+    def recover_interrupted_format_probes(self) -> int:
+        now = _now()
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """SELECT probe_id, payload
+                   FROM format_probes
+                   WHERE status IN ('PENDING', 'PROBING')"""
+            ).fetchall()
+            recovered = 0
+            for probe_id, raw_payload in rows:
+                try:
+                    payload = json.loads(raw_payload)
+                except json.JSONDecodeError:
+                    payload = {"probe_id": probe_id}
+                payload = dict(payload)
+                payload.update({
+                    "status": "FAILED",
+                    "updated_at": now,
+                    "finished_at": now,
+                    "reason_code": "probe_interrupted",
+                    "next_inspector": "NONE",
+                })
+                integrity_hash = sha256_json(payload)
+                cursor = conn.execute(
+                    """UPDATE format_probes
+                       SET status='FAILED', updated_at=?, finished_at=?, payload=?, integrity_hash=?
+                       WHERE probe_id=? AND status IN ('PENDING', 'PROBING')""",
+                    (
+                        now,
+                        now,
+                        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                        integrity_hash,
+                        probe_id,
+                    ),
+                )
+                recovered += int(cursor.rowcount)
+        return recovered
+
+    @staticmethod
+    def _create_format_probe_schema(conn: sqlite3.Connection, table_name: str = "format_probes") -> None:
+        conn.execute(
+            f"""CREATE TABLE IF NOT EXISTS {table_name} (
+                probe_id TEXT PRIMARY KEY,
+                entry_id TEXT NOT NULL REFERENCES catalog_entries(entry_id),
+                source_id TEXT NOT NULL REFERENCES catalog_sources(source_id),
+                probe_version TEXT NOT NULL,
+                cache_identity TEXT NOT NULL,
+                sample_sha256 TEXT NOT NULL,
+                attempt INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                finished_at TEXT,
+                payload TEXT NOT NULL,
+                integrity_hash TEXT NOT NULL
+            )"""
+        )
+        conn.execute(f"CREATE INDEX IF NOT EXISTS {table_name}_entry_status ON {table_name}(entry_id, status)")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS {table_name}_cache_lookup ON {table_name}(entry_id, probe_version, cache_identity, status)")
+
+    @classmethod
+    def _migrate_format_probes(cls, conn: sqlite3.Connection) -> None:
+        existing = [row[1] for row in conn.execute("PRAGMA table_info(format_probes)")]
+        required = {
+            "probe_id", "entry_id", "source_id", "probe_version", "cache_identity", "sample_sha256",
+            "attempt", "status", "created_at", "updated_at", "finished_at", "payload", "integrity_hash",
+        }
+        if required.issubset(existing):
+            conn.execute("CREATE INDEX IF NOT EXISTS format_probes_entry_status ON format_probes(entry_id, status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS format_probes_cache_lookup ON format_probes(entry_id, probe_version, cache_identity, status)")
+            return
+        if not existing:
+            cls._create_format_probe_schema(conn)
+            return
+
+        conn.execute("ALTER TABLE format_probes RENAME TO format_probes_legacy")
+        cls._create_format_probe_schema(conn)
+        legacy_rows = conn.execute(
+            """SELECT probe_id, entry_id, source_id, probe_version, metadata_key, status, created_at, updated_at, payload, integrity_hash
+               FROM format_probes_legacy
+               ORDER BY created_at, probe_id"""
+        ).fetchall()
+        attempts: dict[str, int] = {}
+        for probe_id, entry_id, source_id, probe_version, metadata_key, status, created_at, updated_at, payload_json, _ in legacy_rows:
+            try:
+                payload = json.loads(payload_json)
+            except json.JSONDecodeError:
+                payload = {}
+            payload = dict(payload) if isinstance(payload, dict) else {}
+            attempts[entry_id] = attempts.get(entry_id, 0) + 1
+            sample_sha256 = str(payload.get("sample_sha256") or "")
+            cache_identity = str(payload.get("cache_identity") or metadata_key or "")
+            if sample_sha256 and sample_sha256 not in cache_identity:
+                cache_identity = f"{cache_identity}|{sample_sha256}" if cache_identity else sample_sha256
+            finished_at = updated_at if status in {"COMPLETED", "STALE", "REJECTED", "FAILED"} else None
+            normalized = {
+                **payload,
+                "probe_id": probe_id,
+                "entry_id": entry_id,
+                "source_id": source_id,
+                "probe_version": probe_version,
+                "cache_identity": cache_identity,
+                "sample_sha256": sample_sha256,
+                "attempt": attempts[entry_id],
+                "status": status,
+                "created_at": created_at,
+                "updated_at": updated_at,
+                "finished_at": finished_at,
+            }
+            conn.execute(
+                """INSERT INTO format_probes
+                   (probe_id, entry_id, source_id, probe_version, cache_identity, sample_sha256, attempt, status, created_at, updated_at, finished_at, payload, integrity_hash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    probe_id,
+                    entry_id,
+                    source_id,
+                    probe_version,
+                    cache_identity,
+                    sample_sha256,
+                    attempts[entry_id],
+                    status,
+                    created_at,
+                    updated_at,
+                    finished_at,
+                    json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    sha256_json(normalized),
+                ),
+            )
+        conn.execute("DROP TABLE format_probes_legacy")
 
     @staticmethod
     def _migrate_route_plan_uses(conn: sqlite3.Connection) -> None:

@@ -18,6 +18,7 @@ from .capsule import create_evidence_capsule
 from .catalog import CatalogService
 from .bridge import BridgeService
 from .gateway import Gate
+from .format_probe import FormatProbeService
 from .indexer import preflight
 from .policy import PolicyError, model_choices, validate_project_id, validate_workspace_root
 from .router import route_preview
@@ -133,6 +134,12 @@ class CatalogScanRequest(BaseModel):
     max_files: int | None = Field(default=None, ge=1, le=10_000_000)
 
 
+class FormatProbeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    catalog_entry_ids: list[str] = Field(min_length=1, max_length=50)
+
+
 def _local_host(value: str | None) -> str | None:
     if not value:
         return None
@@ -174,8 +181,10 @@ def _enforce_local_request(request: Request) -> JSONResponse | None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    gate_instance = Gate(Store(DATA_ROOT))
-    BridgeService(gate_instance.store, gate_instance.create_route_plan).recover_processing_on_startup()
+    store = Store(DATA_ROOT)
+    store.recover_interrupted_format_probes()
+    gate_instance = Gate(store)
+    BridgeService(store, gate_instance.create_route_plan).recover_processing_on_startup()
     app.state.gate = gate_instance
     yield
     await app.state.gate.client.close()
@@ -205,6 +214,10 @@ def bridge(request: Request) -> BridgeService:
 
 def catalog(request: Request) -> CatalogService:
     return CatalogService(gate(request).store)
+
+
+def format_probe(request: Request) -> FormatProbeService:
+    return FormatProbeService(gate(request).store)
 
 
 def as_http_error(error: Exception) -> HTTPException:
@@ -441,6 +454,15 @@ async def list_catalog_entries(
         if min_size is not None and max_size is not None and min_size > max_size:
             raise PolicyError("min_size cannot exceed max_size")
         return {"entries": catalog(request).entries(source_id, status=status, asset_kind=asset_kind, extension=extension, min_size=min_size, max_size=max_size)}
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/format-probes")
+async def run_format_probe(payload: FormatProbeRequest, request: Request):
+    try:
+        # Targeted header sampling only: no app-server RPC, no model turn, and no whole-file parsing.
+        return {"results": await asyncio.to_thread(format_probe(request).probe, payload.catalog_entry_ids)}
     except Exception as exc:
         raise as_http_error(exc) from exc
 

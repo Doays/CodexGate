@@ -10,6 +10,7 @@ let planExpiryTimer = null;
 let currentBridge = null;
 let bridgeManualMode = null;
 let currentCatalogSource = null;
+let selectedCatalogEntries = new Set();
 
 function say(message, isError = false) {
   const node = $("message");
@@ -762,6 +763,18 @@ function renderCatalogEntries(entries) {
   body.replaceChildren();
   for (const entry of entries) {
     const row = document.createElement("tr");
+    const selectCell = document.createElement("td");
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.className = "catalog-select";
+    checkbox.checked = selectedCatalogEntries.has(entry.entry_id);
+    checkbox.onchange = () => {
+      if (checkbox.checked) selectedCatalogEntries.add(entry.entry_id);
+      else selectedCatalogEntries.delete(entry.entry_id);
+      updateCatalogProbeButton();
+    };
+    selectCell.appendChild(checkbox);
+    row.appendChild(selectCell);
     for (const value of [currentCatalogSource?.alias || "-", entry.relative_path, entry.asset_kind, String(entry.size), entry.status, entry.entry_id]) {
       const cell = document.createElement("td");
       cell.textContent = value;
@@ -769,6 +782,7 @@ function renderCatalogEntries(entries) {
     }
     body.appendChild(row);
   }
+  updateCatalogProbeButton();
 }
 
 async function refreshCatalogEntries() {
@@ -790,14 +804,42 @@ function renderCatalogScan(scan) {
   $("catalog-cancel").disabled = true;
 }
 
+function updateCatalogProbeButton() {
+  const count = selectedCatalogEntries.size;
+  $("catalog-probe").disabled = !currentCatalogSource || count === 0 || count > 50;
+  $("catalog-probe-summary").textContent = count
+    ? `${count} catalog entr${count === 1 ? "y" : "ies"} selected. Probe reads limited header/sample bytes only and never returns an absolute path.`
+    : "Select up to 50 catalog entries. Phase 2 samples only limited file regions and never parses the whole file.";
+}
+
+function renderFormatProbeResults(results) {
+  const body = $("format-probe-results");
+  body.replaceChildren();
+  for (const result of results) {
+    const row = document.createElement("tr");
+    appendCell(row, result.alias || currentCatalogSource?.alias || "-");
+    appendCell(row, result.relative_path || "-");
+    appendCell(row, result.detected_format || "UNKNOWN");
+    appendCell(row, result.detected_confidence || "-");
+    const extensionCell = appendCell(row, result.extension_match || "UNKNOWN");
+    extensionCell.className = result.extension_match === "MISMATCH" ? "probe-mismatch" : result.extension_match === "MATCH" ? "probe-match" : "";
+    appendCell(row, result.next_inspector || "NONE");
+    appendCell(row, String(result.bytes_read || 0));
+    appendCell(row, result.status || "UNKNOWN");
+    body.appendChild(row);
+  }
+}
+
 async function registerCatalogSource() {
   try {
     const source = await api("/api/catalog/sources", { method: "POST", body: JSON.stringify({alias: $("catalog-alias").value, root: $("catalog-root").value}) });
     currentCatalogSource = source;
+    selectedCatalogEntries = new Set();
     $("catalog-scan").disabled = false;
     $("catalog-resume").disabled = true;
     $("catalog-progress").textContent = `${source.alias} is registered. Its local path remains private.`;
     renderCatalogEntries([]);
+    renderFormatProbeResults([]);
   } catch (error) { say(error.message, true); }
 }
 
@@ -823,6 +865,23 @@ async function cancelCatalog() {
   } catch (error) { say(error.message, true); }
 }
 
+async function runFormatProbe() {
+  if (!currentCatalogSource || !selectedCatalogEntries.size) return;
+  try {
+    $("catalog-probe").disabled = true;
+    const data = await api("/api/format-probes", {
+      method: "POST",
+      body: JSON.stringify({catalog_entry_ids: Array.from(selectedCatalogEntries).slice(0, 50)}),
+    });
+    renderFormatProbeResults(data.results || []);
+    say(`Format probe completed for ${(data.results || []).length} catalog entr${(data.results || []).length === 1 ? "y" : "ies"}.`);
+  } catch (error) {
+    say(error.message, true);
+  } finally {
+    updateCatalogProbeButton();
+  }
+}
+
 $("connect").onclick = connect;
 $("preflight").onclick = makePreflight;
 $("copy-packet").onclick = copyPacket;
@@ -838,9 +897,11 @@ $("catalog-register").onclick = registerCatalogSource;
 $("catalog-scan").onclick = () => scanCatalog(false);
 $("catalog-resume").onclick = () => scanCatalog(true);
 $("catalog-cancel").onclick = cancelCatalog;
+$("catalog-probe").onclick = runFormatProbe;
 for (const id of ["catalog-filter-status", "catalog-filter-kind", "catalog-filter-extension"]) $(id).addEventListener("change", () => refreshCatalogEntries().catch((error) => say(error.message, true)));
 renderBridge(null);
 restoreBridge();
+updateCatalogProbeButton();
 for (const id of ["project-name", "root", "task", "decision", "permission"]) {
   $(id).addEventListener("input", invalidateRoutePlan);
   $(id).addEventListener("change", invalidateRoutePlan);

@@ -399,6 +399,31 @@ def resolve_evidence_file(root: str | Path, value: str) -> tuple[Path, str]:
     return resolved, resolved.relative_to(root_path).as_posix()
 
 
+def resolve_catalog_entry_file(root: str | Path, value: str) -> tuple[Path, str]:
+    """Resolve a catalog-selected file without traversing a link or junction."""
+    root_path = Path(root).expanduser().resolve(strict=False)
+    raw_value = value.strip()
+    raw = Path(raw_value)
+    if raw.is_absolute() or _windows_absolute_path(raw_value) is not None or raw.drive:
+        raise PolicyError("catalog entry must be project-relative")
+    if any(part == ".." for part in raw.parts):
+        raise PolicyError("catalog entry escapes the source root")
+
+    candidate = root_path
+    for part in raw.parts:
+        if part in {"", "."}:
+            continue
+        candidate /= part
+        if is_link_or_junction(candidate):
+            raise PolicyError("catalog entry traverses a symlink or junction")
+    resolved, _ = resolve_project_path(root_path, raw_value)
+    if resolved == root_path or not candidate.exists() or not candidate.is_file():
+        raise PolicyError("catalog entry must name an existing regular file")
+    if is_link_or_junction(candidate):
+        raise PolicyError("catalog entry traverses a symlink or junction")
+    return resolved, resolved.relative_to(root_path).as_posix()
+
+
 def resolve_safe_evidence_mapping(root: str | Path, value: str) -> tuple[Path, str]:
     """Resolve an explicitly user-mapped evidence path and reject sensitive names."""
     path, relative = resolve_evidence_file(root, value)
