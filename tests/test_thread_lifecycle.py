@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,9 @@ class LifecycleClient:
             "defaultReasoningEffort": "high",
             "supportedReasoningEfforts": [{"reasoningEffort": "high"}],
         }]
+
+    async def installation_metadata(self, schema_dir):
+        return {"codex_version": "test", "schema_sha256": "test-schema"}
 
     async def request(self, method, params):
         self.requests.append((method, params))
@@ -73,6 +77,13 @@ def _gate(tmp_path):
         "defaultReasoningEffort": "high",
         "supportedReasoningEfforts": [{"reasoningEffort": "high"}],
     }])
+    now = datetime.now(timezone.utc)
+    store.save_isolation_result({
+        "status": "SAFE_CAPSULE_ONLY", "checked_at": now.isoformat(),
+        "expires_at": (now + timedelta(days=1)).isoformat(), "codex_version": "test",
+        "schema_sha256": "test-schema", "inside_read_succeeded": True,
+        "outside_read_succeeded": False, "outside_denied_explicitly": True, "reason": None,
+    })
     gate = Gate(store)
     gate.client = LifecycleClient()
     return gate

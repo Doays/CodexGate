@@ -3,8 +3,12 @@ const $ = (id) => document.getElementById(id);
 let catalog = [];
 let currentRun = null;
 let currentPlan = null;
+let currentCapsule = null;
+let isolationStatus = "UNKNOWN";
 let stream = null;
 let planExpiryTimer = null;
+let currentBridge = null;
+let bridgeManualMode = null;
 
 function say(message, isError = false) {
   const node = $("message");
@@ -212,6 +216,7 @@ async function connect() {
     loadModels(data.choices);
     renderAccount(data.account_usage);
     renderCatalog(data.model_catalog);
+    renderIsolation(data.isolation);
     $("connection-dot").classList.add("live");
     $("connection-text").textContent = `${data.choices.length} models connected`;
     $("codex-meta").textContent = `${data.codex_version || "version unavailable"} · ${data.codex_path || "path unavailable"}`;
@@ -236,19 +241,69 @@ async function connect() {
 }
 
 function planIsExecutable() {
-  if (!currentPlan || currentPlan.status !== "PREVIEW" || currentPlan.used) return false;
-  const expires = Date.parse(currentPlan.expires_at);
-  return Number.isFinite(expires) && expires > Date.now() && currentPlan.permission === "read-only";
+  return false;
+}
+
+function renderIsolation(result) {
+  isolationStatus = result?.status || "UNKNOWN";
+  $("isolation-status").textContent = isolationStatus;
+  let outside = "outside read failed or was not confirmed";
+  if (result?.outside_read_succeeded === true) {
+    outside = "outside read succeeded";
+  } else if (result?.outside_denied_explicitly === true) {
+    outside = "outside read was explicitly denied";
+  }
+  const errorCode = result?.error_code ? `; code=${result.error_code}` : "";
+  $("isolation-result").textContent = `${isolationStatus}; ${outside}${errorCode}. Live runs stay locked in this release.`;
+  updateExecuteState();
+}
+
+async function runIsolationProbe() {
+  try {
+    $("run-isolation-probe").disabled = true;
+    say("Testing app-server read isolation without starting a model turn...");
+    const result = await api("/api/isolation/probe", { method: "POST" });
+    renderIsolation(result);
+    say(`Isolation probe recorded: ${result.status}. Live execution remains locked.`, result.status !== "SAFE_CANDIDATE");
+  } catch (error) {
+    say(error.message, true);
+  } finally {
+    $("run-isolation-probe").disabled = false;
+  }
 }
 
 function updateExecuteState() {
   $("execute").disabled = !planIsExecutable();
 }
 
+function resetCapsule() {
+  currentCapsule = null;
+  $("capsule-status").textContent = "NOT CREATED";
+  $("capsule-files").textContent = "0";
+  $("capsule-size").textContent = "0 bytes";
+  $("capsule-ranges").textContent = "None";
+  $("capsule-reasons").textContent = "";
+  $("create-capsule").disabled = !currentPlan;
+}
+
+function renderCapsule(capsule) {
+  currentCapsule = capsule;
+  $("capsule-status").textContent = capsule.status || "UNKNOWN";
+  $("capsule-files").textContent = String(capsule.file_count || 0);
+  $("capsule-size").textContent = `${Number(capsule.total_bytes || 0).toLocaleString()} bytes`;
+  const ranges = capsule.ranges || [];
+  $("capsule-ranges").textContent = ranges.length
+    ? ranges.map((entry) => `${entry.path}:${entry.start_line}-${entry.end_line}`).join(", ")
+    : "None";
+  $("capsule-reasons").textContent = (capsule.hold_reasons || []).join("\n");
+  $("create-capsule").disabled = !currentPlan;
+}
+
 function invalidateRoutePlan() {
   currentPlan = null;
   $("route-plan").classList.add("hidden");
   $("planned-budget").value = "Route Plan 생성 후 표시";
+  resetCapsule();
   updateExecuteState();
 }
 
@@ -271,6 +326,7 @@ function renderRoutePlan(plan) {
   $("plan-validation").textContent =
     `commands=${Boolean(evidence.validation_commands_present)}, local_target=${Boolean(evidence.local_test_target_exists)}`;
   $("plan-reasons").textContent = (plan.hold_reasons || []).join("\n");
+  resetCapsule();
   updateExecuteState();
   if (planExpiryTimer) clearTimeout(planExpiryTimer);
   const delay = Math.max(0, Date.parse(plan.expires_at) - Date.now());
@@ -278,6 +334,23 @@ function renderRoutePlan(plan) {
     updateExecuteState();
     say("Route Plan expired. Create a new plan before execution.", true);
   }, Math.min(delay + 50, 2_147_483_647));
+}
+
+async function createCapsule() {
+  try {
+    if (!currentPlan) {
+      throw new Error("Create a Route Plan before creating an Evidence Capsule.");
+    }
+    say("Creating bounded Evidence Capsule...");
+    const capsule = await api(`/api/route-plans/${encodeURIComponent(currentPlan.plan_id)}/capsule`, { method: "POST" });
+    renderCapsule(capsule);
+    say(
+      capsule.status === "READY" ? "Evidence Capsule created without starting Codex." : "Evidence Capsule is HOLD or INVALID.",
+      capsule.status !== "READY",
+    );
+  } catch (error) {
+    say(error.message, true);
+  }
 }
 
 async function createRoutePlan() {
@@ -297,7 +370,7 @@ async function createRoutePlan() {
     renderRoutePlan(plan);
     renderRoutePreview(plan.route_preview);
     say(
-      plan.status === "PREVIEW" ? "Route Plan created. Read Only execution is ready." : "Route Plan is HOLD.",
+      plan.status === "PREVIEW" ? "Route Plan created. Live execution remains locked in this release." : "Route Plan is HOLD.",
       plan.status !== "PREVIEW",
     );
   } catch (error) {
@@ -443,7 +516,7 @@ function watch(runId) {
 async function execute() {
   try {
     if (!planIsExecutable()) {
-      throw new Error("A current PREVIEW Route Plan is required.");
+      throw new Error("Live execution remains locked in this release.");
     }
     const payload = {
       route_plan_id: currentPlan.plan_id,
@@ -469,13 +542,233 @@ async function interrupt() {
   }
 }
 
+async function startBridge() {
+  try {
+    const bridge = await api("/api/bridge/tasks", {
+      method: "POST",
+      body: JSON.stringify({
+        project_name: $("project-name").value,
+        project_id: projectIdFromName($("project-name").value),
+        root: $("root").value,
+        task: $("task").value,
+        permission: $("permission").value,
+        chat_url: $("bridge-chat-url").value || null,
+      }),
+    });
+    bridgeManualMode = null;
+    renderBridge(bridge);
+    say("Bridge task created. Copy the architecture packet.");
+  } catch (error) {
+    say(error.message, true);
+  }
+}
+
+async function copyBridgePacket() {
+  const packet = await api(`/api/bridge/tasks/${encodeURIComponent(currentBridge.task_id)}/packet`);
+  $("bridge-packet").value = packet.packet;
+  $("bridge-packet-details").classList.remove("hidden");
+  try {
+    await navigator.clipboard.writeText(packet.packet);
+    const bridge = await api(`/api/bridge/tasks/${encodeURIComponent(currentBridge.task_id)}/copied`, { method: "POST" });
+    bridgeManualMode = null;
+    renderBridge(bridge);
+    if (bridge.chat_url) {
+      const tab = window.open(bridge.chat_url, "_blank", "noopener");
+      if (tab) tab.opener = null;
+    }
+    say("Packet copied. The configured Web GPT URL was opened in a new tab.");
+  } catch {
+    bridgeManualMode = "mark-copied";
+    renderBridge(currentBridge);
+    say("Clipboard copy failed. Copy the collapsed packet manually, then confirm.", true);
+  }
+}
+
+async function importBridgeResponse() {
+  let packet;
+  if (bridgeManualMode === "import") {
+    packet = $("bridge-manual-response").value;
+  } else {
+    try {
+      packet = await navigator.clipboard.readText();
+    } catch {
+      bridgeManualMode = "import";
+      renderBridge(currentBridge);
+      say("Clipboard read failed. Paste the response packet into the manual field.", true);
+      return;
+    }
+  }
+  const bridge = await api(`/api/bridge/tasks/${encodeURIComponent(currentBridge.task_id)}/import`, {
+    method: "POST", body: JSON.stringify({ packet }),
+  });
+  $("bridge-manual-response").value = "";
+  bridgeManualMode = null;
+  renderBridge(bridge);
+  say("Web GPT response validated and recorded.");
+}
+
+async function prepareBridgeReview() {
+  const result = JSON.parse($("bridge-result").value);
+  const validation = JSON.parse($("bridge-validation").value);
+  const bridge = await api(`/api/bridge/tasks/${encodeURIComponent(currentBridge.task_id)}/review`, {
+    method: "POST", body: JSON.stringify({ result, validation }),
+  });
+  renderBridge(bridge);
+  say("Review packet is ready to copy.");
+}
+
+async function bridgeAction() {
+  try {
+    if (bridgeManualMode === "mark-copied") {
+      const bridge = await api(`/api/bridge/tasks/${encodeURIComponent(currentBridge.task_id)}/copied`, { method: "POST" });
+      bridgeManualMode = null;
+      renderBridge(bridge);
+      return;
+    }
+    switch (currentBridge.active_action) {
+      case "copy_architect_request":
+      case "copy_review_request":
+        await copyBridgePacket();
+        break;
+      case "import_architect_response":
+      case "import_review_response":
+        await importBridgeResponse();
+        break;
+      case "prepare_review_request":
+        await prepareBridgeReview();
+        break;
+      case "restart":
+        bridgeManualMode = null;
+        renderBridge(await api(`/api/bridge/tasks/${encodeURIComponent(currentBridge.task_id)}/restart`, { method: "POST" }));
+        break;
+      default:
+        throw new Error("Bridge action is unavailable.");
+    }
+  } catch (error) {
+    say(error.message.includes("JSON") ? "Bridge result and validation must be valid JSON." : error.message, true);
+  }
+}
+
+function bridgePresentation(bridge) {
+  const actions = {
+    copy_architect_request: ["Local -> Web GPT", "ARCHITECT_REQUEST", "Copy the architecture packet.", "Import the response.", "send"],
+    import_architect_response: ["Web GPT -> Local", "ARCHITECT_RESPONSE", "Import the architecture response.", "The app validates it locally.", "receive"],
+    prepare_review_request: ["Local -> Local", "REVIEW_REQUEST", "Enter actual result and validation.", "Copy the review packet.", "auto"],
+    processing_response: ["Web GPT -> Local", bridge?.packet_type || "-", "The pasted response is being validated locally.", "Wait for the updated snapshot.", "auto"],
+    prepare_evidence: ["Local -> Local", "EVIDENCE_REQUIRED", "Map each request to an exact project-relative file and collect it.", "A new ARCHITECT_REQUEST is enabled when required evidence is ready.", "auto"],
+    copy_review_request: ["Local -> Web GPT", "REVIEW_REQUEST", "Copy the review packet.", "Import the review response.", "send"],
+    import_review_response: ["Web GPT -> Local", "REVIEW_RESPONSE", "Import the review response.", "The app records the verdict.", "receive"],
+    restart: ["Local -> Web GPT", "ARCHITECT_REQUEST", "Start a new architecture cycle.", "A fresh nonce and Route Plan are required.", bridge.status === "SUCCESS" ? "done" : "hold"],
+    restart_required: ["Local", "v1", "This v1 task cannot be converted.", "Start a new v2 Bridge task.", "hold"],
+  };
+  return actions[bridge?.active_action] || ["Local", "-", "No action is available.", "Start a new Bridge task.", "idle"];
+}
+
+function renderBridgeEvidence(bridge) {
+  const panel = $("bridge-evidence");
+  panel.replaceChildren();
+  const requests = bridge?.evidence_requests || [];
+  panel.classList.toggle("hidden", bridge?.active_action !== "prepare_evidence");
+  for (const request of requests) {
+    const card = document.createElement("article");
+    card.className = "evidence-card";
+    const title = document.createElement("strong");
+    title.textContent = `${request.label} (${request.type}) — ${request.state}`;
+    const why = document.createElement("p");
+    why.textContent = request.reason;
+    const input = document.createElement("input");
+    input.type = "text"; input.placeholder = "Project-relative file path"; input.value = request.mapped_path || "";
+    const map = document.createElement("button");
+    map.type = "button"; map.className = "button ghost"; map.textContent = "Map local file";
+    const collect = document.createElement("button");
+    collect.type = "button"; collect.className = "button"; collect.textContent = "Collect safe summary";
+    map.onclick = async () => {
+      try { renderBridge(await api(`/api/bridge/tasks/${encodeURIComponent(bridge.task_id)}/evidence/${encodeURIComponent(request.request_id)}/map`, {method:"POST", body: JSON.stringify({path: input.value})})); } catch (error) { say(error.message, true); }
+    };
+    collect.disabled = request.state !== "MAPPED" && request.state !== "FAILED";
+    collect.onclick = async () => {
+      try { renderBridge(await api(`/api/bridge/tasks/${encodeURIComponent(bridge.task_id)}/evidence/${encodeURIComponent(request.request_id)}/collect`, {method:"POST"})); } catch (error) { say(error.message, true); }
+    };
+    const status = document.createElement("small");
+    status.textContent = request.error_reason || (request.required ? "Required evidence" : "Optional evidence");
+    card.append(title, why, input, map, collect, status); panel.appendChild(card);
+  }
+}
+
+function renderBridge(bridge) {
+  currentBridge = bridge;
+  const start = $("bridge-start");
+  const action = $("bridge-action");
+  if (!bridge) {
+    $("bridge-status").textContent = "NOT STARTED";
+    $("bridge-status").className = "status bridge-flag idle";
+    $("bridge-phase").textContent = "-";
+    $("bridge-source").textContent = "Local";
+    $("bridge-destination").textContent = "Web GPT";
+    $("bridge-type").textContent = "-";
+    $("bridge-now").textContent = "Start a Bridge task.";
+    $("bridge-next").textContent = "Copy the architecture packet.";
+    $("bridge-message").textContent = "No Bridge task is active.";
+    start.disabled = false; start.classList.remove("hidden"); action.disabled = true; action.classList.add("hidden");
+    $("bridge-review-fields").classList.add("hidden");
+    $("bridge-evidence").classList.add("hidden");
+    return;
+  }
+  const [direction, type, now, next, color] = bridgePresentation(bridge);
+  const [source, destination] = direction.split(" -> ");
+  $("bridge-status").textContent = bridge.status;
+  $("bridge-status").className = `status bridge-flag ${color}`;
+  $("bridge-phase").textContent = bridge.phase || "-";
+  $("bridge-source").textContent = source || "Local";
+  $("bridge-destination").textContent = destination || "Local";
+  $("bridge-type").textContent = type;
+  $("bridge-now").textContent = now;
+  $("bridge-next").textContent = next;
+  $("bridge-message").textContent = bridge.restart_required
+    ? "Protocol v1 is restart-required and was not converted."
+    : bridge.active_action === "processing_response"
+      ? "The pasted response is being validated locally."
+      : bridge.hold_reason || (bridge.requested_evidence?.length ? `Requested evidence: ${bridge.requested_evidence.map((item) => item.label || item).join("; ")}` : "Only the displayed action is enabled.");
+  start.disabled = true; start.classList.add("hidden"); action.classList.remove("hidden");
+  action.disabled = ["prepare_evidence", "restart_required", "processing_response"].includes(bridge.active_action);
+  const labels = {copy_architect_request:"Copy architecture packet", import_architect_response: bridgeManualMode === "import" ? "Import pasted architecture response" : "Read and import architecture response", prepare_review_request:"Create review packet from local result", processing_response:"Processing response", prepare_evidence:"Prepare required evidence below", copy_review_request:"Copy review packet", import_review_response: bridgeManualMode === "import" ? "Import pasted review response" : "Read and import review response", restart:"Start a new architecture cycle", restart_required:"Start a new v2 Bridge task"};
+  action.textContent = bridgeManualMode === "mark-copied" ? "Mark packet copied manually" : labels[bridge.active_action] || "Unavailable";
+  $("bridge-review-fields").classList.toggle("hidden", bridge.active_action !== "prepare_review_request");
+  $("bridge-manual-response").classList.toggle("hidden", bridgeManualMode !== "import");
+  $("bridge-packet-details").classList.toggle("hidden", bridge.active_action === "processing_response");
+  renderBridgeEvidence(bridge);
+}
+
+async function showBridgePacket(taskId) {
+  try {
+    const data = await api(`/api/bridge/tasks/${encodeURIComponent(taskId)}/packet`);
+    $("bridge-packet").value = data.packet;
+    $("bridge-packet-details").classList.remove("hidden");
+  } catch { /* terminal and evidence-required states have no packet preview */ }
+}
+
+async function restoreBridge() {
+  try {
+    const data = await api("/api/bridge/tasks/recent");
+    const tasks = data.tasks || [];
+    $("bridge-recent").textContent = tasks.length ? `Recovered ${tasks.length} active Bridge task(s); latest is shown.` : "No unfinished Bridge task to recover.";
+    if (data.latest) { bridgeManualMode = null; renderBridge(data.latest); await showBridgePacket(data.latest.task_id); }
+  } catch { $("bridge-recent").textContent = "Bridge recovery is unavailable."; }
+}
+
 $("connect").onclick = connect;
 $("preflight").onclick = makePreflight;
 $("copy-packet").onclick = copyPacket;
 $("router-preview").onclick = previewRouter;
 $("create-plan").onclick = createRoutePlan;
+$("create-capsule").onclick = createCapsule;
+$("run-isolation-probe").onclick = runIsolationProbe;
 $("execute").onclick = execute;
 $("interrupt").onclick = interrupt;
+$("bridge-start").onclick = startBridge;
+$("bridge-action").onclick = bridgeAction;
+renderBridge(null);
+restoreBridge();
 for (const id of ["project-name", "root", "task", "decision", "permission"]) {
   $(id).addEventListener("input", invalidateRoutePlan);
   $(id).addEventListener("change", invalidateRoutePlan);

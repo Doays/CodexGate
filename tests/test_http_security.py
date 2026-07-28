@@ -67,3 +67,20 @@ def test_forbidden_root_blocks_preflight_without_scanning(client, monkeypatch):
     )
     assert response.status_code == 400
     assert "blocked" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("root", [r"E:\\", r"E:\.codex"])
+def test_bridge_creation_rejects_forbidden_windows_roots_immediately(client, root):
+    response = client.post(
+        "/api/bridge/tasks",
+        json={
+            "project_name": "Demo",
+            "project_id": "demo",
+            "root": root,
+            "task": "Inspect a bounded local scope",
+            "permission": "read-only",
+            "chat_url": "https://chatgpt.com/",
+        },
+    )
+    assert response.status_code == 400
+    assert "blocked" in response.json()["detail"]

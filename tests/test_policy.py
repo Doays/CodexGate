@@ -3,6 +3,7 @@ import pytest
 from app.policy import (
     Decision,
     PolicyError,
+    bridge_packet_safety_reason,
     model_choices,
     validate_allowed_file_scope,
     validate_selection,
@@ -60,3 +61,9 @@ def test_decision_route_fields_and_validation_evidence_are_structured(tmp_path):
     assert evidence["validation_commands_present"] is True
     assert evidence["local_test_target_exists"] is True
     assert evidence["has_tests"] is True
+
+
+def test_bridge_packet_safety_rejects_secrets_and_absolute_user_paths():
+    assert bridge_packet_safety_reason("token=very-secret-value")
+    assert bridge_packet_safety_reason(r"C:\Users\person\project")
+    assert bridge_packet_safety_reason("bounded local facts") is None

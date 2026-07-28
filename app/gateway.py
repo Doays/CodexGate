@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import subprocess
 import uuid
 from dataclasses import dataclass, field
@@ -9,17 +10,28 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .app_server import AppServerClient
+from .isolation import (
+    ERROR,
+    SAFE_CANDIDATE,
+    SAFE_CAPSULE_ONLY,
+    UNKNOWN,
+    UNSAFE_FULL_DISK_READ,
+    public_result,
+    run_isolation_probe,
+)
 from .policy import (
     Decision,
     PolicyError,
     budget_for_task_class,
     canonical_json,
     collect_git_paths,
+    evidence_source_metadata,
     find_forbidden_root_reference,
     sha256_json,
     sha256_text,
     validate_allowed_file_scope,
     validate_decision_for_run,
+    validate_evidence_scope,
     validate_project_id,
     validate_project_file,
     validate_selection,
@@ -139,11 +151,14 @@ class Approval:
 
 
 class Gate:
-    def __init__(self, store: Store, *, approval_timeout_seconds: float = 120):
+    def __init__(self, store: Store, *, approval_timeout_seconds: float = 120, isolation_client_factory=None):
         self.store = store
         self.runs: dict[str, Run] = {}
         self.approval_timeout_seconds = approval_timeout_seconds
         self.client = AppServerClient(self.handle_event, self.handle_server_request, self.handle_disconnect)
+        self.isolation_client_factory = isolation_client_factory or (
+            lambda: AppServerClient(self.handle_event, self.handle_server_request, self.handle_disconnect)
+        )
 
     async def connect(self) -> list[dict[str, Any]]:
         models = await self.client.connect()
@@ -172,6 +187,7 @@ class Gate:
                 self.store.mark_account_unknown(kind)
 
     def status(self) -> dict[str, Any]:
+        isolation = self.store.isolation_result()
         return {
             "connected": getattr(self.client, "connected", False),
             "models": getattr(self.client, "models", []),
@@ -184,10 +200,50 @@ class Gate:
             "workspace_write_schema_ready": getattr(self.client, "workspace_write_schema_ready", False),
             "account_usage": self.store.account_overview(),
             "model_catalog": self.store.model_catalog(),
+            "isolation": public_result(isolation),
         }
 
+    def _loaded_schema_hash(self) -> str | None:
+        metadata = getattr(self.client, "schema_metadata", None)
+        if not callable(metadata):
+            return None
+        try:
+            return metadata().get("schema_sha256")
+        except Exception:
+            return None
+
+    async def run_isolation_probe(self) -> dict[str, Any]:
+        """Use a throwaway transport so this action cannot use a live thread."""
+        result = await run_isolation_probe(self.store, self.isolation_client_factory())
+        return public_result(result)
+
+    async def _require_safe_isolation(self) -> None:
+        current = self.store.isolation_result()
+        current_status = current.get("status")
+        if current_status in {ERROR, UNSAFE_FULL_DISK_READ, UNKNOWN}:
+            raise PolicyError(f"Live Read Only execution is blocked by the current isolation result: {current_status}")
+        metadata_method = getattr(self.client, "installation_metadata", None)
+        if current_status not in {SAFE_CANDIDATE, SAFE_CAPSULE_ONLY}:
+            raise PolicyError("Live Read Only execution is blocked until a supported isolation result exists")
+        if not callable(metadata_method):
+            raise PolicyError("Live Read Only execution is blocked: current Codex isolation metadata is unavailable")
+        metadata: dict[str, str] | None = None
+        metadata_root = self.store.root / "isolation-metadata" / str(uuid.uuid4())
+        try:
+            metadata = await metadata_method(metadata_root)
+            result = self.store.isolation_result(
+                metadata.get("codex_version") if metadata else None,
+                metadata.get("schema_sha256") if metadata else None,
+            )
+        finally:
+            shutil.rmtree(metadata_root, ignore_errors=True)
+        if current_status == SAFE_CANDIDATE:
+            raise PolicyError("Live Read Only execution remains locked while isolation is only SAFE_CANDIDATE")
+        if result.get("status") != SAFE_CAPSULE_ONLY:
+            raise PolicyError(f"Live Read Only execution is blocked by the current isolation result: {result.get('status')}")
+
     def create_route_plan(self, payload: dict[str, Any], ttl_seconds: int = 600) -> dict[str, Any]:
-        allowed_fields = {"project_name", "project_id", "root", "task", "decision", "permission", "explicit_ultra_approval"}
+        allowed_fields = {"project_name", "project_id", "root", "task", "decision", "permission", "explicit_ultra_approval", "bridge_idempotency_key"}
         unexpected = sorted(set(payload) - allowed_fields)
         if unexpected:
             raise PolicyError(f"Route Plan input has unsupported fields: {', '.join(unexpected)}")
@@ -195,6 +251,12 @@ class Gate:
         root = validate_workspace(payload["root"], payload["permission"], payload["task"])
         decision = Decision.from_json(payload["decision"])
         normalized_files, scope_reasons = validate_allowed_file_scope(root, decision.allowed_files)
+        evidence_files, evidence_ranges, evidence_scope_reasons = validate_evidence_scope(
+            root,
+            decision.evidence_files,
+            decision.evidence_ranges,
+        )
+        evidence_sources, evidence_source_reasons = evidence_source_metadata(root, evidence_files, evidence_ranges)
         evidence = validation_evidence(root, decision.validation_commands)
         account = self.store.account_overview()
         models = self.store.router_models()
@@ -217,6 +279,8 @@ class Gate:
         )
         hold_reasons = list(preview.get("hold_reasons", []))
         hold_reasons.extend(scope_reasons)
+        hold_reasons.extend(evidence_scope_reasons)
+        hold_reasons.extend(evidence_source_reasons)
         forbidden = self._forbidden_reference_reason({"task": payload["task"], "decision": decision.as_dict()})
         if forbidden:
             hold_reasons.append(forbidden)
@@ -245,12 +309,20 @@ class Gate:
             "candidate_ladder": preview.get("candidate_ladder", []),
             "planned_file_count": len(normalized_files),
             "allowed_files": normalized_files,
+            "evidence_files": evidence_files,
+            "evidence_ranges": evidence_ranges,
+            "evidence_sources": evidence_sources,
             "validation_evidence": evidence,
             "permission": payload["permission"],
             "budget_level": budget_level,
             "budget": budget,
             "route_preview": preview,
         }
+        if "bridge_idempotency_key" in payload:
+            key = payload["bridge_idempotency_key"]
+            if not isinstance(key, str) or not key.startswith("bridge:") or len(key) > 200:
+                raise PolicyError("Bridge idempotency key is invalid")
+            record["bridge_idempotency_key"] = key
         return self.store.create_route_plan(record, ttl_seconds=ttl_seconds)
 
     async def start_run(self, payload: dict[str, Any]) -> Run:
@@ -258,6 +330,7 @@ class Gate:
             if payload.get("permission") == "workspace-write":
                 raise PolicyError("Workspace Write is locked; Gate.start_run accepts only route_plan_id")
             raise PolicyError("Gate.start_run accepts only route_plan_id")
+        await self._require_safe_isolation()
         plan = self.store.load_route_plan(payload["route_plan_id"])
         models = await self.connect()
         root = validate_workspace(plan["root"], plan["permission"], plan["task"])

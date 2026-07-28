@@ -4,6 +4,7 @@ import asyncio
 import json
 import sqlite3
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,9 @@ class RouteClient:
         self.connect_calls += 1
         return self.models
 
+    async def installation_metadata(self, schema_dir):
+        return {"codex_version": "test", "schema_sha256": "test-schema"}
+
     async def request(self, method, params):
         self.requests.append((method, params))
         if method == "thread/start":
@@ -82,6 +86,13 @@ def decision(**updates):
 def make_gate(tmp_path: Path):
     store = Store(tmp_path / "data")
     store.save_model_catalog(MODELS)
+    now = datetime.now(timezone.utc)
+    store.save_isolation_result({
+        "status": "SAFE_CAPSULE_ONLY", "checked_at": now.isoformat(),
+        "expires_at": (now + timedelta(days=1)).isoformat(), "codex_version": "test",
+        "schema_sha256": "test-schema", "inside_read_succeeded": True,
+        "outside_read_succeeded": False, "outside_denied_explicitly": True, "reason": None,
+    })
     gate = Gate(store)
     gate.client = RouteClient()
     return gate
@@ -146,8 +157,30 @@ def test_directory_and_absolute_allowed_file_scopes_hold(tmp_path):
 def test_canonical_decision_hash_changes_with_decision(tmp_path):
     first = Decision.from_json(decision()).sha256()
     second = Decision.from_json(decision(risk="high")).sha256()
+    evidence = Decision.from_json(decision(evidence_files=["evidence.py"])).sha256()
     assert first != second
+    assert first != evidence
     assert Decision.from_json({**decision(), "allowed_files": []}).canonical_json().startswith('{"allowed_files"')
+
+
+def test_evidence_scope_is_sealed_separately_from_allowed_files(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "evidence.py").write_text("value = 1\n", encoding="utf-8")
+    gate = make_gate(tmp_path)
+    payload = plan_payload(root)
+    payload["decision"] = decision(
+        allowed_files=["changed.py"],
+        evidence_files=["evidence.py"],
+        evidence_ranges=[{"path": "evidence.py", "start_line": 1, "end_line": 1}],
+    )
+
+    plan = gate.create_route_plan(payload)
+
+    assert plan["allowed_files"] == ["changed.py"]
+    assert plan["evidence_files"] == ["evidence.py"]
+    assert plan["evidence_ranges"] == [{"path": "evidence.py", "start_line": 1, "end_line": 1}]
+    assert plan["evidence_sources"][0]["path"] == "evidence.py"
 
 
 def test_route_plan_rejects_unknown_decision_fields(tmp_path):

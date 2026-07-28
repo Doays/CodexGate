@@ -5,11 +5,48 @@ import json
 import os
 import shutil
 import subprocess
+import hashlib
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 from .protocol import APPROVAL_METHODS, ProtocolSchema, ProtocolValidationError
+
+
+def _read_schema_file(path: Path) -> dict[str, Any]:
+    try:
+        with path.open(encoding="utf-8") as handle:
+            value = json.load(handle)
+    except OSError:
+        # 0.145.0 may emit only the combined v2 document.  Resolve the named
+        # definition from that installed document rather than inventing fields.
+        combined_path = path.parent / "codex_app_server_protocol.v2.schemas.json"
+        try:
+            with combined_path.open(encoding="utf-8") as handle:
+                combined = json.load(handle)
+            definition = combined.get("definitions", {}).get(path.stem)
+            if not isinstance(definition, dict):
+                raise ValueError(path.stem)
+            value = {"$schema": combined.get("$schema", "http://json-schema.org/draft-07/schema#"),
+                     "definitions": combined.get("definitions", {}), **definition}
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise AppServerError(f"Generated schema file is unavailable: {path.name}") from exc
+    except json.JSONDecodeError as exc:
+        raise AppServerError(f"Generated schema file is unavailable: {path.name}") from exc
+    if not isinstance(value, dict):
+        raise AppServerError(f"Generated schema file is invalid: {path.name}")
+    return value
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise AppServerError(f"Generated schema file is unavailable: {path.name}") from exc
+    return digest.hexdigest()
 
 
 class AppServerError(RuntimeError):
@@ -76,9 +113,26 @@ class AppServerClient:
     async def connect(self) -> list[dict[str, Any]]:
         if self.connected:
             return self.models
-        self.command = self._find_command()
-        self.version = await asyncio.to_thread(self._read_version, self.command)
-        await self._generate_schema()
+        await self.connect_for_command_exec()
+        self.models = await self.list_models()
+        return self.models
+
+    async def connect_for_command_exec(self) -> None:
+        """Open only the JSON-RPC transport required for a standalone command.
+
+        In particular, this deliberately does not call ``model/list`` or start a
+        thread/turn.  It is used by the isolation probe.
+        """
+        if self.connected:
+            return
+        if not self.command:
+            self.command = self._find_command()
+        if not self.version:
+            self.version = await asyncio.to_thread(self._read_version, self.command)
+        if not self.protocol:
+            await self._generate_schema()
+        if not self.protocol:
+            raise AppServerError(self.schema_error or "Generated schema is unavailable.")
         try:
             self.process = await asyncio.create_subprocess_exec(
                 self.command,
@@ -96,8 +150,72 @@ class AppServerClient:
             "clientInfo": {"name": "codex_gate", "title": "Codex Gate", "version": "0.2.0"},
         })
         await self.notify("initialized", {})
-        self.models = await self.list_models()
-        return self.models
+
+    async def installation_metadata(self, schema_dir: Path) -> dict[str, str]:
+        """Read the installed CLI version and freshly generated schema identity."""
+        original = (self.command, self.version, self.protocol, self.schema_error, self.schema_dir)
+        try:
+            return await self.prepare_for_command_exec(schema_dir)
+        finally:
+            self.command, self.version, self.protocol, self.schema_error, self.schema_dir = original
+
+    async def prepare_for_command_exec(self, schema_dir: Path) -> dict[str, str]:
+        """Prepare a throwaway, command/exec-only connection using a fresh schema."""
+        self.command = self._find_command()
+        self.version = await asyncio.to_thread(self._read_version, self.command)
+        self.schema_dir = schema_dir
+        await self._generate_schema()
+        if not self.protocol:
+            raise AppServerError(self.schema_error or "Generated schema is unavailable.")
+        return self.schema_metadata()
+
+    def schema_metadata(self) -> dict[str, str]:
+        if not self.version or not self.protocol:
+            raise AppServerError("Codex version or generated schema is unavailable.")
+        return {
+            "codex_version": self.version,
+            "schema_sha256": _sha256_file(self._schema_identity_path()),
+        }
+
+    def read_only_sandbox_policy(self) -> dict[str, Any]:
+        """Derive the read-only policy literal from the generated schema."""
+        if not self.protocol:
+            raise AppServerError("Generated schema is unavailable for command/exec.")
+        data = _read_schema_file(self.protocol.root / "CommandExecParams.json")
+        variants = data.get("definitions", {}).get("SandboxPolicy", {}).get("oneOf", [])
+        for variant in variants:
+            properties = variant.get("properties", {}) if isinstance(variant, dict) else {}
+            type_values = properties.get("type", {}).get("enum", []) if isinstance(properties.get("type"), dict) else []
+            read_only_literal = next(
+                (value for value in type_values if isinstance(value, str) and value.casefold() == "readonly"), None
+            )
+            if read_only_literal:
+                policy: dict[str, Any] = {"type": read_only_literal}
+                if "networkAccess" in properties:
+                    policy["networkAccess"] = False
+                return policy
+        raise AppServerError("Generated schema does not advertise a readOnly sandbox policy.")
+
+    async def command_exec(self, params: dict[str, Any], *, timeout_seconds: float = 10) -> dict[str, Any]:
+        """Run a validated standalone command without creating a Codex turn."""
+        self._validate_command_exec(params)
+        response = await self.request("command/exec", params, timeout_seconds=timeout_seconds)
+        if not isinstance(response, dict):
+            raise AppServerError("command/exec response must be an object")
+        response_schema = _read_schema_file(self.protocol.root / "CommandExecResponse.json") if self.protocol else None
+        if response_schema is None:
+            raise AppServerError("Generated schema is unavailable for command/exec response validation.")
+        from jsonschema import Draft7Validator
+        if list(Draft7Validator(response_schema).iter_errors(response)):
+            raise AppServerError("command/exec response failed generated schema validation.")
+        return response
+
+    def _schema_identity_path(self) -> Path:
+        assert self.protocol
+        path = self.protocol.root / "codex_app_server_protocol.v2.schemas.json"
+        if not path.is_file():
+            raise AppServerError("Generated v2 schema file is unavailable.")
+        return path
 
     def _find_command(self) -> str:
         command = shutil.which("codex.cmd") if os.name == "nt" else shutil.which("codex")
@@ -184,18 +302,18 @@ class AppServerClient:
         self._validate_server_response("usage_response", response)
         return response
 
-    async def request(self, method: str, params: dict[str, Any] | None) -> Any:
+    async def request(self, method: str, params: dict[str, Any] | None, *, timeout_seconds: float = 30) -> Any:
         self._validate_outgoing_request(method, params)
         for retry in range(4):
             try:
-                return await self._request_once(method, params)
+                return await self._request_once(method, params, timeout_seconds=timeout_seconds)
             except AppServerError as exc:
                 if exc.code != -32001 or retry == 3:
                     raise
                 await asyncio.sleep(self.retry_base_seconds * (2 ** retry))
         raise AssertionError("unreachable")
 
-    async def _request_once(self, method: str, params: dict[str, Any] | None) -> Any:
+    async def _request_once(self, method: str, params: dict[str, Any] | None, *, timeout_seconds: float = 30) -> Any:
         if not self.connected or not self.process or not self.process.stdin:
             raise AppServerError("Codex app-server가 연결되어 있지 않습니다.")
         self.request_id += 1
@@ -207,7 +325,7 @@ class AppServerClient:
             payload["params"] = params
         await self._send(payload)
         try:
-            return await asyncio.wait_for(future, timeout=30)
+            return await asyncio.wait_for(future, timeout=timeout_seconds)
         except asyncio.TimeoutError as exc:
             self.pending.pop(request_id, None)
             raise AppServerError(f"{method} 응답 시간이 초과되었습니다.") from exc
@@ -242,6 +360,15 @@ class AppServerClient:
             self.protocol.validate(schema_name, params)
         except ProtocolValidationError as exc:
             raise AppServerError(str(exc)) from exc
+
+    def _validate_command_exec(self, params: dict[str, Any]) -> None:
+        if not self.protocol:
+            raise AppServerError("Generated schema is unavailable for command/exec.")
+        data = _read_schema_file(self.protocol.root / "CommandExecParams.json")
+        from jsonschema import Draft7Validator
+        errors = list(Draft7Validator(data).iter_errors(params))
+        if errors:
+            raise AppServerError(f"command/exec schema validation failed: {errors[0].message}")
 
     def _validate_server_response(self, schema_name: str, response: Any) -> None:
         if not isinstance(response, dict):

@@ -5,9 +5,10 @@ import re
 import hashlib
 import json
 import shlex
+import stat
 import subprocess
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path, PureWindowsPath
 from typing import Any, Sequence
 
@@ -47,6 +48,15 @@ _PROJECT_ID_SLUG = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,78}[a-z0-9])?$")
 _UUID_TEXT = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
+BRIDGE_MAX_PACKET_BYTES = 60 * 1024
+BRIDGE_SCHEMA_VERSION = "2.0"
+_BRIDGE_SECRET_PATTERNS = (
+    re.compile(r"\b(?:sk|rk|pk)_[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----"),
+    re.compile(r"(?i)\b(?:password|passwd|secret|api[_-]?key|token)\s*[:=]\s*\S+"),
+)
+_ABSOLUTE_USER_PATH = re.compile(r"(?i)(?:\b[a-z]:[\\/]|(?:^|\s)/(?:users|home)/)")
+_SENSITIVE_EVIDENCE_NAME = re.compile(r"(?i)(?:^|[\\/])(?:\.env|[^\\/]*\.(?:pem|key|pfx)|credentials(?:\.[^\\/]*)?|service-account[^\\/]*)$")
 
 
 class PolicyError(ValueError):
@@ -63,6 +73,8 @@ class Decision:
     forbidden_files: list[str]
     validation_commands: list[str]
     stop_conditions: list[str]
+    evidence_files: list[str] = field(default_factory=list)
+    evidence_ranges: list[dict[str, int | str]] = field(default_factory=list)
     risk: str = "medium"
     parallel_audit: bool = False
     independent_axes: int = 0
@@ -74,7 +86,7 @@ class Decision:
         known = {
             "decision", "task_class", "recommended_model", "recommended_effort",
             "allowed_files", "forbidden_files", "validation_commands", "stop_conditions",
-            "risk", "parallel_audit", "independent_axes",
+            "evidence_files", "evidence_ranges", "risk", "parallel_audit", "independent_axes",
         }
         unexpected = sorted(set(payload) - known)
         if unexpected:
@@ -84,11 +96,37 @@ class Decision:
         if missing:
             raise PolicyError(f"decision JSON is missing required fields: {', '.join(missing)}")
         lists = {}
-        for field in ("allowed_files", "forbidden_files", "validation_commands", "stop_conditions"):
+        for field in ("allowed_files", "forbidden_files", "validation_commands", "stop_conditions", "evidence_files"):
             value = payload.get(field, [])
             if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
                 raise PolicyError(f"{field} must be a non-empty string list")
             lists[field] = [item.strip() for item in value]
+        evidence_ranges = payload.get("evidence_ranges", [])
+        if not isinstance(evidence_ranges, list):
+            raise PolicyError("evidence_ranges must be a list")
+        normalized_ranges: list[dict[str, int | str]] = []
+        for item in evidence_ranges:
+            if not isinstance(item, dict) or set(item) != {"path", "start_line", "end_line"}:
+                raise PolicyError("evidence_ranges entries must contain path, start_line, and end_line")
+            path = item.get("path")
+            start_line = item.get("start_line")
+            end_line = item.get("end_line")
+            if not isinstance(path, str) or not path.strip():
+                raise PolicyError("evidence_ranges path must be a non-empty string")
+            if (
+                isinstance(start_line, bool)
+                or isinstance(end_line, bool)
+                or not isinstance(start_line, int)
+                or not isinstance(end_line, int)
+                or start_line < 1
+                or end_line < start_line
+            ):
+                raise PolicyError("evidence_ranges line bounds must be positive integers with start_line <= end_line")
+            normalized_ranges.append({
+                "path": path.strip(),
+                "start_line": start_line,
+                "end_line": end_line,
+            })
         if payload["decision"] not in {"execute", "hold", "evidence_only"}:
             raise PolicyError("decision must be execute, hold, or evidence_only")
         risk = payload.get("risk", "medium")
@@ -106,6 +144,7 @@ class Decision:
             recommended_model=payload["recommended_model"].strip(),
             recommended_effort=payload["recommended_effort"].strip(),
             **lists,
+            evidence_ranges=normalized_ranges,
             risk=risk.strip().casefold(),
             parallel_audit=parallel_audit,
             independent_axes=independent_axes,
@@ -131,6 +170,16 @@ def sha256_text(value: str) -> str:
 
 def sha256_json(value: Any) -> str:
     return sha256_text(canonical_json(value))
+
+
+def bridge_packet_safety_reason(value: Any) -> str | None:
+    """Reject data that must never cross the manual Web GPT bridge."""
+    text = canonical_json(value) if not isinstance(value, str) else value
+    if _ABSOLUTE_USER_PATH.search(text):
+        return "Bridge packets cannot contain absolute user paths."
+    if any(pattern.search(text) for pattern in _BRIDGE_SECRET_PATTERNS):
+        return "Bridge packet may contain a secret."
+    return None
 
 
 def canonical_path_text(value: str | Path) -> str:
@@ -279,6 +328,193 @@ def validate_allowed_file_scope(root: str | Path, allowed_files: list[str]) -> t
         seen.add(relative_key)
         normalized.append(relative)
     return normalized, reasons
+
+
+def is_link_or_junction(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if is_junction and is_junction():
+        return True
+    try:
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except OSError:
+        return False
+    reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+    return bool(attributes & reparse_point)
+
+
+def resolve_evidence_file(root: str | Path, value: str) -> tuple[Path, str]:
+    """Resolve one exact evidence file without traversing a link or junction."""
+    root_path = Path(root).expanduser().resolve(strict=False)
+    raw_value = value.strip()
+    if any(character in raw_value for character in "*?[]{}"):
+        raise PolicyError("evidence entry is a glob, not an exact file")
+    if raw_value.endswith(("/", "\\")):
+        raise PolicyError("evidence entry is a directory, not an exact file")
+    raw = Path(raw_value)
+    if raw.is_absolute() or _windows_absolute_path(raw_value) is not None or raw.drive:
+        raise PolicyError("evidence entry must be project-relative")
+    if any(part == ".." for part in raw.parts):
+        raise PolicyError("evidence entry escapes the project root")
+
+    candidate = root_path
+    for part in raw.parts:
+        if part in {"", "."}:
+            continue
+        candidate /= part
+        if is_link_or_junction(candidate):
+            raise PolicyError("evidence entry traverses a symlink or junction")
+    resolved, _ = resolve_project_path(root_path, raw_value)
+    if resolved == root_path or not candidate.exists() or not candidate.is_file():
+        raise PolicyError("evidence entry must name an existing regular file")
+    if is_link_or_junction(candidate):
+        raise PolicyError("evidence entry traverses a symlink or junction")
+    return resolved, resolved.relative_to(root_path).as_posix()
+
+
+def resolve_safe_evidence_mapping(root: str | Path, value: str) -> tuple[Path, str]:
+    """Resolve an explicitly user-mapped evidence path and reject sensitive names."""
+    path, relative = resolve_evidence_file(root, value)
+    if _SENSITIVE_EVIDENCE_NAME.search(relative.replace("/", "\\")):
+        raise PolicyError("Sensitive file names cannot be collected.")
+    return path, relative
+
+
+def merge_evidence_ranges(ranges: Sequence[dict[str, int | str]]) -> list[dict[str, int | str]]:
+    """Sort and merge overlapping ranges without changing the source-file selection."""
+    grouped: dict[str, list[dict[str, int | str]]] = {}
+    display_paths: dict[str, str] = {}
+    for entry in ranges:
+        path = str(entry["path"])
+        key = canonical_path_text(path)
+        display_paths.setdefault(key, path)
+        grouped.setdefault(key, []).append({
+            "path": path,
+            "start_line": int(entry["start_line"]),
+            "end_line": int(entry["end_line"]),
+        })
+
+    merged: list[dict[str, int | str]] = []
+    for key in sorted(grouped):
+        current: dict[str, int | str] | None = None
+        for entry in sorted(grouped[key], key=lambda item: (int(item["start_line"]), int(item["end_line"]))):
+            normalized = {**entry, "path": display_paths[key]}
+            if current is not None and int(normalized["start_line"]) <= int(current["end_line"]):
+                current["end_line"] = max(int(current["end_line"]), int(normalized["end_line"]))
+            else:
+                if current is not None:
+                    merged.append(current)
+                current = normalized
+        if current is not None:
+            merged.append(current)
+    return merged
+
+
+def evidence_fingerprint(
+    task_hash: str,
+    decision_hash: str,
+    evidence_files: Sequence[str],
+    evidence_ranges: Sequence[dict[str, int | str]],
+    evidence_sources: Sequence[dict[str, int | str]],
+) -> str:
+    """Hash sealed evidence without binding it to a Route Plan instance ID."""
+    normalized_files = sorted({canonical_path_text(path) for path in evidence_files})
+    normalized_ranges = sorted(
+        (
+            {
+                "path": canonical_path_text(str(entry["path"])),
+                "start_line": int(entry["start_line"]),
+                "end_line": int(entry["end_line"]),
+            }
+            for entry in evidence_ranges
+        ),
+        key=lambda item: (item["path"], item["start_line"], item["end_line"]),
+    )
+    normalized_sources = sorted(
+        (
+            {
+                "path": canonical_path_text(str(entry["path"])),
+                "sha256": str(entry["sha256"]),
+            }
+            for entry in evidence_sources
+        ),
+        key=lambda item: item["path"],
+    )
+    return sha256_json({
+        "task_hash": task_hash,
+        "decision_hash": decision_hash,
+        "scope": {
+            "evidence_files": normalized_files,
+            "evidence_ranges": normalized_ranges,
+        },
+        "source_sha256": normalized_sources,
+    })
+
+
+def validate_evidence_scope(
+    root: str | Path,
+    evidence_files: Sequence[str],
+    evidence_ranges: Sequence[dict[str, int | str]],
+) -> tuple[list[str], list[dict[str, int | str]], list[str]]:
+    """Validate the bounded read scope separately from the write-oriented allowed_files."""
+    normalized_files: list[str] = []
+    normalized_ranges: list[dict[str, int | str]] = []
+    reasons: list[str] = []
+    seen_files: set[str] = set()
+    for value in evidence_files:
+        try:
+            _, relative = resolve_evidence_file(root, value)
+        except PolicyError as exc:
+            reasons.append(f"evidence_files entry is unresolved: {value} ({exc})")
+            continue
+        key = canonical_path_text(relative)
+        if key not in seen_files:
+            seen_files.add(key)
+            normalized_files.append(relative)
+
+    for entry in evidence_ranges:
+        path = str(entry["path"])
+        try:
+            _, relative = resolve_evidence_file(root, path)
+        except PolicyError as exc:
+            reasons.append(f"evidence_ranges entry is unresolved: {path} ({exc})")
+            continue
+        normalized_ranges.append({
+            "path": relative,
+            "start_line": int(entry["start_line"]),
+            "end_line": int(entry["end_line"]),
+        })
+    return normalized_files, merge_evidence_ranges(normalized_ranges), reasons
+
+
+def evidence_source_metadata(
+    root: str | Path,
+    evidence_files: Sequence[str],
+    evidence_ranges: Sequence[dict[str, int | str]],
+) -> tuple[list[dict[str, int | str]], list[str]]:
+    """Hash only the explicitly selected source files; never enumerate the project tree."""
+    source_paths = [*evidence_files, *(str(entry["path"]) for entry in evidence_ranges)]
+    entries: list[dict[str, int | str]] = []
+    reasons: list[str] = []
+    seen: set[str] = set()
+    for value in source_paths:
+        try:
+            path, relative = resolve_evidence_file(root, value)
+            key = canonical_path_text(relative)
+            if key in seen:
+                continue
+            seen.add(key)
+            digest = hashlib.sha256()
+            size = 0
+            with path.open("rb") as source:
+                while chunk := source.read(64 * 1024):
+                    digest.update(chunk)
+                    size += len(chunk)
+            entries.append({"path": relative, "sha256": digest.hexdigest(), "size": size})
+        except (OSError, PolicyError) as exc:
+            reasons.append(f"evidence source is unavailable: {value} ({exc})")
+    return sorted(entries, key=lambda item: canonical_path_text(str(item["path"]))), reasons
 
 
 def validation_evidence(root: str | Path, validation_commands: list[str]) -> dict[str, Any]:

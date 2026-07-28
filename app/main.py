@@ -14,6 +14,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .capsule import create_evidence_capsule
+from .bridge import BridgeService
 from .gateway import Gate
 from .indexer import preflight
 from .policy import PolicyError, model_choices, validate_project_id, validate_workspace_root
@@ -79,6 +81,44 @@ class UsageThresholdRequest(BaseModel):
     blocked: int = Field(ge=0, le=100)
 
 
+class BridgeStartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_name: str = Field(min_length=1, max_length=120)
+    project_id: str = Field(min_length=1, max_length=80)
+    root: str = Field(min_length=1)
+    task: str = Field(min_length=3, max_length=12_000)
+    permission: str = Field(pattern="^(read-only|workspace-write)$")
+    chat_url: str | None = Field(default=None, max_length=2048)
+
+    @field_validator("project_id")
+    @classmethod
+    def validate_bridge_project_id(cls, value: str) -> str:
+        return validate_project_id(value)
+
+
+class BridgeImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    packet: str = Field(min_length=1, max_length=70_000)
+
+
+class BridgeReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    result: dict[str, Any]
+    validation: dict[str, Any]
+
+
+class EvidenceMapRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=1024)
+    start_line: int | None = Field(default=None, ge=1)
+    end_line: int | None = Field(default=None, ge=1)
+    line: int | None = Field(default=None, ge=1)
+    context_before: int | None = Field(default=None, ge=0)
+    context_after: int | None = Field(default=None, ge=0)
+
+
 def _local_host(value: str | None) -> str | None:
     if not value:
         return None
@@ -120,7 +160,9 @@ def _enforce_local_request(request: Request) -> JSONResponse | None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.gate = Gate(Store(DATA_ROOT))
+    gate_instance = Gate(Store(DATA_ROOT))
+    BridgeService(gate_instance.store, gate_instance.create_route_plan).recover_processing_on_startup()
+    app.state.gate = gate_instance
     yield
     await app.state.gate.client.close()
 
@@ -140,6 +182,11 @@ async def local_request_guard(request: Request, call_next):
 
 def gate(request: Request) -> Gate:
     return request.app.state.gate
+
+
+def bridge(request: Request) -> BridgeService:
+    current_gate = gate(request)
+    return BridgeService(current_gate.store, current_gate.create_route_plan)
 
 
 def as_http_error(error: Exception) -> HTTPException:
@@ -177,9 +224,19 @@ async def connect(request: Request):
                     "workspace_write_schema_ready",
                     "account_usage",
                     "model_catalog",
+                    "isolation",
                 )
             },
         }
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/isolation/probe")
+async def isolation_probe(request: Request):
+    try:
+        # This endpoint opens a throwaway command/exec-only transport; it never starts a turn.
+        return await gate(request).run_isolation_probe()
     except Exception as exc:
         raise as_http_error(exc) from exc
 
@@ -207,6 +264,105 @@ async def start_run(payload: RunRequest, request: Request):
 async def create_route_plan(payload: RoutePlanRequest, request: Request):
     try:
         return gate(request).create_route_plan(payload.model_dump())
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/route-plans/{route_plan_id}/capsule")
+async def create_capsule(route_plan_id: str, request: Request):
+    try:
+        # Capsule creation reads only the Route Plan's sealed evidence scope; it never connects to app-server.
+        result = create_evidence_capsule(gate(request).store, route_plan_id)
+        return {
+            "status": result["status"],
+            "total_bytes": result["total_bytes"],
+            "file_count": result["file_count"],
+            "evidence_fingerprint": result["evidence_fingerprint"],
+            "hold_reasons": result["hold_reasons"],
+        }
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/bridge/tasks")
+async def create_bridge_task(payload: BridgeStartRequest, request: Request):
+    try:
+        # Manual bridge setup is local storage and packet construction only; no app-server request is made.
+        return bridge(request).create(payload.model_dump())
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.get("/api/bridge/tasks/recent")
+async def recent_bridge_tasks(request: Request):
+    try:
+        return {"tasks": bridge(request).recent(), "latest": bridge(request).latest()}
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.get("/api/bridge/tasks/{task_id}")
+async def read_bridge_task(task_id: str, request: Request):
+    try:
+        return bridge(request).get(task_id)
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.get("/api/bridge/tasks/{task_id}/packet")
+async def bridge_packet(task_id: str, request: Request):
+    try:
+        return {"packet": bridge(request).packet(task_id)}
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/bridge/tasks/{task_id}/copied")
+async def bridge_copied(task_id: str, request: Request):
+    try:
+        return bridge(request).copied(task_id)
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/bridge/tasks/{task_id}/import")
+async def bridge_import(task_id: str, payload: BridgeImportRequest, request: Request):
+    try:
+        return bridge(request).import_response(task_id, payload.packet)
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/bridge/tasks/{task_id}/review")
+async def bridge_review(task_id: str, payload: BridgeReviewRequest, request: Request):
+    try:
+        return bridge(request).prepare_review(task_id, payload.result, payload.validation)
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/bridge/tasks/{task_id}/restart")
+async def bridge_restart(task_id: str, request: Request):
+    try:
+        return bridge(request).restart(task_id)
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/bridge/tasks/{task_id}/evidence/{request_id}/map")
+async def map_bridge_evidence(task_id: str, request_id: str, payload: EvidenceMapRequest, request: Request):
+    try:
+        options = {key: value for key, value in payload.model_dump().items() if key != "path" and value is not None}
+        return bridge(request).map_evidence(task_id, request_id, payload.path, options)
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/bridge/tasks/{task_id}/evidence/{request_id}/collect")
+async def collect_bridge_evidence(task_id: str, request_id: str, request: Request):
+    try:
+        # Local bounded collector only: no shell command or app-server RPC is reachable here.
+        return bridge(request).collect_evidence(task_id, request_id)
     except Exception as exc:
         raise as_http_error(exc) from exc
 

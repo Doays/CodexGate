@@ -61,6 +61,12 @@
       </article>
     </section>
 
+    <section class="panel">
+      <div class="panel-title"><span>ISOLATION</span><h2>Read isolation probe</h2><span id="isolation-status" class="status">UNKNOWN</span></div>
+      <p id="isolation-result" class="hint">The probe reports `ERROR`, `UNSAFE_FULL_DISK_READ`, or `SAFE_CANDIDATE`; live execution stays locked in this release.</p>
+      <button id="run-isolation-probe" class="button wide" type="button">Test Read Only isolation (no model turn)</button>
+    </section>
+
     <section class="panel router-preview-panel">
       <div class="panel-title"><span>07</span><h2>자동 하향 라우터 미리보기</h2><span class="status">PREVIEW ONLY</span></div>
       <div class="row preview-controls">
@@ -88,6 +94,30 @@
       </article>
     </section>
 
+    <section id="web-gpt-bridge" class="panel bridge-panel">
+      <div class="panel-title"><span>BRIDGE</span><h2>Manual Web GPT Bridge</h2><span id="bridge-status" class="status bridge-flag idle">NOT STARTED</span></div>
+      <p class="hint">One clear action at a time. The app only copies a packet after your click and only reads the clipboard after your click. It never controls the Web GPT page.</p>
+      <label>Optional ChatGPT conversation URL<input id="bridge-chat-url" type="url" placeholder="https://chatgpt.com/..."></label>
+      <dl class="bridge-details">
+        <div><dt>Current phase</dt><dd id="bridge-phase">—</dd></div>
+        <div><dt>From</dt><dd id="bridge-source">Local</dd></div>
+        <div><dt>To</dt><dd id="bridge-destination">Web GPT</dd></div>
+        <div><dt>Packet type</dt><dd id="bridge-type">—</dd></div>
+        <div><dt>Do now</dt><dd id="bridge-now">Start a bridge task.</dd></div>
+        <div><dt>Next</dt><dd id="bridge-next">Copy the architecture packet.</dd></div>
+      </dl>
+      <details id="bridge-packet-details" class="bridge-packet hidden"><summary>Packet body (collapsed by default)</summary><textarea id="bridge-packet" rows="10" readonly></textarea></details>
+      <textarea id="bridge-manual-response" class="hidden" rows="10" spellcheck="false" placeholder="Paste the Web GPT response packet here only after clipboard read fails."></textarea>
+      <div id="bridge-evidence" class="bridge-evidence hidden" aria-live="polite"></div>
+      <div id="bridge-review-fields" class="hidden">
+        <label>Actual result summary (JSON)<textarea id="bridge-result" rows="4" spellcheck="false" placeholder='{"summary":"local result"}'></textarea></label>
+        <label>Local validation summary (JSON)<textarea id="bridge-validation" rows="4" spellcheck="false" placeholder='{"tests":"not run"}'></textarea></label>
+      </div>
+      <div class="bridge-actions"><button id="bridge-start" class="button bridge-send" type="button">Start architecture bridge</button><button id="bridge-action" class="button wide hidden" type="button"></button></div>
+      <p id="bridge-message" class="hint" aria-live="polite">No Bridge task is active.</p>
+      <p id="bridge-recent" class="hint">Checking for unfinished Bridge tasks…</p>
+    </section>
+
     <section id="route-plan" class="panel route-plan hidden">
       <div class="panel-title"><span>PLAN</span><h2>불변 Route Plan</h2><span id="plan-status" class="status">HOLD</span></div>
       <dl class="plan-details">
@@ -100,6 +130,14 @@
         <div><dt>Validation evidence</dt><dd id="plan-validation">—</dd></div>
       </dl>
       <pre id="plan-reasons" class="plan-reasons"></pre>
+      <div class="panel-title"><span>CAPSULE</span><h2>Evidence Capsule</h2><span id="capsule-status" class="status">NOT CREATED</span></div>
+      <dl class="plan-details">
+        <div><dt>Evidence files</dt><dd id="capsule-files">0</dd></div>
+        <div><dt>Captured size</dt><dd id="capsule-size">0 bytes</dd></div>
+        <div><dt>Line ranges</dt><dd id="capsule-ranges">None</dd></div>
+      </dl>
+      <pre id="capsule-reasons" class="plan-reasons"></pre>
+      <button id="create-capsule" class="button wide" type="button">Create Evidence Capsule</button>
     </section>
 
     <section class="action-bar"><div id="message" role="status">Codex를 연결하고 작업 카드를 작성하세요.</div><button id="execute" class="button accent" disabled>새 Codex 스레드에서 실행</button></section>
