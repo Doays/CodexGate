@@ -10,10 +10,11 @@ import hashlib
 import re
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
+from .isolation_repro import REPRO_RUNS, REPRO_VERSION, SAFE_REPRODUCIBLE
 from .policy import PolicyError, canonical_json, sha256_json, validate_sealed_loopback_base_url
 
 
@@ -37,6 +38,10 @@ BROKER_REQUEST_PATH = "/v1/responses"
 MAX_REQUEST_BYTES = 256 * 1024
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 BROKER_TIMEOUT_SECONDS = 120
+HARNESS_EXPECTED_SECONDS = 30
+MIN_CANARY_RESERVE_SECONDS = 5 * 60
+CANARY_REQUIRED_REMAINING_SECONDS = HARNESS_EXPECTED_SECONDS + MIN_CANARY_RESERVE_SECONDS
+_EMPTY_PROOF_HASH = "0" * 64
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _HEADER = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$")
@@ -60,6 +65,63 @@ def provider_config(base_url: str = SEALED_BASE_URL) -> dict[str, Any]:
         "request_max_retries": 0,
         "stream_max_retries": 0,
     }
+
+
+def expected_repro_key(config_hash: str, tool_fingerprint: str) -> str:
+    """Derive the Repro identity without reusing the Isolation cache key."""
+    for name, value in (("config_hash", config_hash), ("tool_fingerprint", tool_fingerprint)):
+        if not isinstance(value, str) or not _DIGEST.fullmatch(value):
+            raise PolicyError(f"{name} is invalid")
+    return sha256_json({
+        "config_hash": config_hash,
+        "tool_fingerprint": tool_fingerprint,
+        "repro_version": REPRO_VERSION,
+    })
+
+
+def validate_sealed_execution_proof(store, *, now: datetime | None = None) -> tuple[dict[str, str] | None, str | None]:
+    """Validate a fresh Canary and its exact current-environment Repro record."""
+    isolation = store.wsl_isolation_result()
+    if not isinstance(isolation, Mapping) or isolation.get("status") != "SAFE_CANDIDATE":
+        return None, "isolation_not_safe"
+    current = now or datetime.now(timezone.utc)
+    try:
+        expires_at = datetime.fromisoformat(str(isolation.get("expires_at")))
+        if expires_at.tzinfo is None:
+            raise ValueError
+    except (TypeError, ValueError):
+        return None, "isolation_expiry_invalid"
+    if expires_at < current + timedelta(seconds=CANARY_REQUIRED_REMAINING_SECONDS):
+        return None, "isolation_expiring"
+    config_hash = isolation.get("config_hash")
+    tool_fingerprint = isolation.get("tool_fingerprint")
+    try:
+        repro_key = expected_repro_key(config_hash, tool_fingerprint)
+    except PolicyError:
+        return None, "isolation_identity_missing"
+    repro = store.wsl_isolation_repro(repro_key)
+    if not isinstance(repro, Mapping):
+        return None, "repro_missing"
+    if repro.get("status") != SAFE_REPRODUCIBLE:
+        return None, "repro_not_safe"
+    if (
+        repro.get("requested_runs") != REPRO_RUNS
+        or repro.get("completed_runs") != REPRO_RUNS
+        or repro.get("success_count") != REPRO_RUNS
+    ):
+        return None, "repro_incomplete"
+    if repro.get("config_hash") != config_hash or repro.get("tool_fingerprint") != tool_fingerprint:
+        return None, "repro_binding_changed"
+    result_hash = repro.get("result_hash")
+    if not isinstance(result_hash, str) or not _DIGEST.fullmatch(result_hash):
+        return None, "repro_result_invalid"
+    if repro.get("cache_key") != repro_key:
+        return None, "repro_key_invalid"
+    return {
+        "repro_version": REPRO_VERSION,
+        "repro_key": repro_key,
+        "repro_result_hash": result_hash,
+    }, None
 
 
 def canonical_provider_toml(base_url: str = SEALED_BASE_URL) -> bytes:
@@ -194,16 +256,28 @@ def validate_broker_response(status_code: int, body_bytes: int) -> None:
         raise PolicyError("sealed broker response body exceeds its limit")
 
 
-def build_private_contract(*, runtime_fingerprint: str, isolation_cache_key: str, binary_sha256: str,
-                           base_url: str = SEALED_BASE_URL) -> dict[str, Any]:
+def build_private_contract(
+    *,
+    runtime_fingerprint: str,
+    isolation_cache_key: str,
+    binary_sha256: str,
+    repro_version: str = REPRO_VERSION,
+    repro_key: str = _EMPTY_PROOF_HASH,
+    repro_result_hash: str = _EMPTY_PROOF_HASH,
+    base_url: str = SEALED_BASE_URL,
+) -> dict[str, Any]:
     """Construct a deterministic private contract from sealed runtime inputs."""
     for name, value in {
         "runtime fingerprint": runtime_fingerprint,
         "isolation cache key": isolation_cache_key,
         "binary SHA-256": binary_sha256,
+        "Repro key": repro_key,
+        "Repro result SHA-256": repro_result_hash,
     }.items():
         if not isinstance(value, str) or not _DIGEST.fullmatch(value):
             raise PolicyError(f"{name} is invalid")
+    if repro_version != REPRO_VERSION:
+        raise PolicyError("Repro version is invalid")
     config_bytes = canonical_provider_toml(base_url)
     config_hash = provider_config_hash(config_bytes)
     relay = relay_contract(base_url)
@@ -213,6 +287,9 @@ def build_private_contract(*, runtime_fingerprint: str, isolation_cache_key: str
         "runtime_fingerprint": runtime_fingerprint,
         "isolation_cache_key": isolation_cache_key,
         "binary_sha256": binary_sha256,
+        "repro_version": repro_version,
+        "repro_key": repro_key,
+        "repro_result_hash": repro_result_hash,
         "provider_config_hash": config_hash,
         "provider": provider_snapshot(base_url),
         "relay": relay,
@@ -238,8 +315,9 @@ def public_contract_result(result: Mapping[str, Any] | None) -> dict[str, Any]:
 class SealedEgressContractService:
     """Creates and revalidates the no-I/O egress contract."""
 
-    def __init__(self, store):
+    def __init__(self, store, *, proof_required: bool = False):
         self.store = store
+        self.proof_required = proof_required
 
     def create(self) -> dict[str, Any]:
         started = time.monotonic()
@@ -249,10 +327,19 @@ class SealedEgressContractService:
         if problem:
             return self._save_failure(problem, started)
         assert runtime is not None and isolation is not None
+        proof, proof_error = validate_sealed_execution_proof(self.store)
+        if self.proof_required and proof is None:
+            return self._save_failure(proof_error or "repro_missing", started)
+        proof = proof or {
+            "repro_version": REPRO_VERSION,
+            "repro_key": _EMPTY_PROOF_HASH,
+            "repro_result_hash": _EMPTY_PROOF_HASH,
+        }
         preview = build_private_contract(
             runtime_fingerprint=runtime["runtime_fingerprint"],
             isolation_cache_key=isolation["cache_key"],
             binary_sha256=runtime["binary_sha256"],
+            **proof,
         )
         # A creation request seals a freshly materialized instance, not a UI
         # preview object.  Both must produce the same canonical identity.
@@ -260,6 +347,7 @@ class SealedEgressContractService:
             runtime_fingerprint=runtime["runtime_fingerprint"],
             isolation_cache_key=isolation["cache_key"],
             binary_sha256=runtime["binary_sha256"],
+            **proof,
         )
         snapshot = provider_snapshot()
         checked_at = _now()
@@ -273,6 +361,7 @@ class SealedEgressContractService:
             "runtime_fingerprint": runtime["runtime_fingerprint"],
             "isolation_cache_key": isolation["cache_key"],
             "binary_sha256": runtime["binary_sha256"],
+            **proof,
             "provider_config_hash": provider_config_hash(private["config_toml_bytes"]),
             "contract_policy_version": EGRESS_CONTRACT_POLICY_VERSION,
             "endpoint_type": snapshot["endpoint_type"],
@@ -304,7 +393,40 @@ class SealedEgressContractService:
                 "start_allowed": False,
                 "error_code": problem,
             }
+        if self.proof_required:
+            proof, proof_error = validate_sealed_execution_proof(self.store)
+            if proof is None or any(result.get(field) != value for field, value in proof.items()):
+                return {
+                    **result,
+                    "status": BLOCKED,
+                    "start_allowed": False,
+                    "error_code": proof_error or "repro_binding_changed",
+                }
         return result
+
+    def immutable_execution_contract(self) -> tuple[dict[str, Any] | None, str | None]:
+        """Return only a stored immutable instance that still binds to runtime.
+
+        A preview is intentionally never enough to cross the harness boundary.
+        This is read-only validation; it neither upgrades authentication nor
+        changes the contract state.
+        """
+        result = self.current()
+        if not isinstance(result, Mapping):
+            return None, "stored_contract_required"
+        contract_hash = result.get("contract_hash")
+        if not isinstance(contract_hash, str) or result.get("preview_hash") != contract_hash:
+            return None, "stored_contract_required"
+        stored = self.store.egress_contract_instance(contract_hash)
+        if not isinstance(stored, Mapping) or stored.get("contract_id") != result.get("contract_id"):
+            return None, "stored_contract_required"
+        if stored.get("status") != AUTH_UNCONFIGURED:
+            return None, "stored_contract_invalid"
+        if self.proof_required:
+            proof, proof_error = validate_sealed_execution_proof(self.store)
+            if proof is None or any(stored.get(field) != value for field, value in proof.items()):
+                return None, proof_error or "repro_binding_changed"
+        return dict(stored), None
 
     @staticmethod
     def _binding_problem(runtime: Mapping[str, Any] | None, isolation: Mapping[str, Any] | None,

@@ -26,6 +26,18 @@ def test_foreign_host_is_rejected(client):
     assert response.status_code == 403
 
 
+def test_testserver_stays_forbidden_and_local_actual_route_is_fail_closed(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_main, "DATA_ROOT", tmp_path / "host-policy")
+    with TestClient(app_main.app) as default_client:
+        assert default_client.get("/api/status").status_code == 403
+    with TestClient(app_main.app, base_url="http://127.0.0.1:8787") as local_client:
+        response = local_client.post(
+            "/api/isolation/wsl/egress-harness/actual",
+            json={},
+        )
+        assert response.status_code == 409
+
+
 def test_foreign_origin_is_rejected(client):
     response = client.get("/api/status", headers={"origin": "http://evil.example:8787"})
     assert response.status_code == 403

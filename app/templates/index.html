@@ -120,10 +120,16 @@
         <p class="hint">The contract permits one loopback Responses endpoint and one future Unix-socket broker boundary. Authentication remains unconfigured and all starts stay locked.</p>
       </div>
       <div class="wsl-harness-panel">
-        <div class="panel-title"><span>LOCAL HARNESS</span><h2>Phase 2 fake verification</h2><span id="wsl-harness-status" class="status">BLOCKED</span></div>
-        <p id="wsl-harness-result" class="hint">The immutable contract can be checked only by the deterministic fake runner in this phase. No WSL process, socket listener, relay, Codex process, or network request starts from this UI.</p>
+        <div class="panel-title"><span>LOCAL HARNESS</span><h2>Phase 3.1 proof gate</h2><span id="wsl-harness-status" class="status">FAKE BLOCKED</span></div>
+        <p id="wsl-harness-result" class="hint">FAKE results have a separate runner identity and can never serve as actual WSL proof.</p>
         <div class="row wsl-isolation-actions">
           <button id="run-wsl-egress-harness" class="button ghost" type="button" disabled>Run deterministic fake harness</button>
+        </div>
+        <div class="panel-title"><span>ACTUAL RUNNER</span><h2>WSL execution remains disabled</h2><span id="actual-wsl-harness-status" class="status">WSL NOT RUN</span></div>
+        <p id="actual-wsl-harness-result" class="hint">A fresh Canary, matching SAFE_REPRODUCIBLE 10/10/10 result, immutable Contract, exact runner implementation hash, and one-time arm are required. Arm issuance and actual execution are both disabled in this phase.</p>
+        <div class="row wsl-isolation-actions">
+          <button id="arm-actual-wsl-egress-harness" class="button ghost" type="button" disabled>Arm actual WSL (disabled)</button>
+          <button id="run-actual-wsl-egress-harness" class="button" type="button" disabled>Run actual WSL (locked)</button>
         </div>
       </div>
     </section>

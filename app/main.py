@@ -18,11 +18,24 @@ from .capsule import create_evidence_capsule
 from .catalog import CatalogService
 from .bridge import BridgeService
 from .gateway import Gate
-from .isolation_wsl import WSLBubblewrapIsolation, public_result as public_wsl_isolation_result
+from .isolation_wsl import LocalWSLCommandRunner, WSLBubblewrapIsolation, public_result as public_wsl_isolation_result
 from .isolation_repro import IsolationReproService, public_repro_result
 from .wsl_codex_runtime import WSLCodexRuntime, public_runtime_result
 from .egress_contract import SealedEgressContractService, public_contract_result
-from .egress_harness import FakeHarnessRunner, SealedEgressHarnessService, public_harness_result
+from .egress_harness import (
+    ActualWSLHarnessGate,
+    FAKE_RUNNER_IMPLEMENTATION_HASH,
+    FAKE_RUNNER_KIND,
+    FAKE_RUNNER_VERSION,
+    FakeHarnessRunner,
+    SealedEgressHarnessService,
+    public_harness_result,
+)
+from .egress_harness_wsl import (
+    RUNNER_IMPLEMENTATION_HASH,
+    WSLEgressHarnessRunner,
+    WSL_EGRESS_RUNNER_VERSION,
+)
 from .format_probe import FormatProbeService
 from .indexer import preflight
 from .policy import PolicyError, model_choices, validate_project_id, validate_workspace_root
@@ -157,6 +170,12 @@ class WSLCodexRuntimeConfigRequest(BaseModel):
     binary_path: str = Field(min_length=1, max_length=512)
 
 
+class ActualWSLHarnessRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    arm_nonce: str | None = Field(default=None, min_length=32, max_length=128)
+
+
 def _local_host(value: str | None) -> str | None:
     if not value:
         return None
@@ -207,12 +226,20 @@ async def lifespan(app: FastAPI):
     app.state.wsl_isolation_service = WSLBubblewrapIsolation(store)
     app.state.wsl_repro_service = IsolationReproService(store, app.state.wsl_isolation_service)
     app.state.wsl_codex_runtime_service = WSLCodexRuntime(store)
-    app.state.sealed_egress_contract_service = SealedEgressContractService(store)
-    # Phase 2 uses the deterministic in-memory fake runner only.  It starts no
-    # WSL/bwrap process, listener, socket, Codex process, or network request.
+    app.state.sealed_egress_contract_service = SealedEgressContractService(store, proof_required=True)
     app.state.sealed_egress_harness_service = SealedEgressHarnessService(
         store, app.state.sealed_egress_contract_service, FakeHarnessRunner()
     )
+    actual_runner = WSLEgressHarnessRunner(store, LocalWSLCommandRunner())
+    app.state.actual_wsl_egress_harness_service = SealedEgressHarnessService(
+        store, app.state.sealed_egress_contract_service, actual_runner,
+    )
+    # Phase 3.2 exposes sealed routes but keeps arm issuance and execution
+    # disabled. Constructing the runner starts no WSL or other process.
+    app.state.actual_wsl_egress_harness_gate = ActualWSLHarnessGate(
+        store, app.state.actual_wsl_egress_harness_service, enabled=False,
+    )
+    app.state.sealed_egress_harness_runner_version = WSL_EGRESS_RUNNER_VERSION
     BridgeService(store, gate_instance.create_route_plan).recover_processing_on_startup()
     app.state.gate = gate_instance
     yield
@@ -269,6 +296,14 @@ def sealed_egress_harness(request: Request) -> SealedEgressHarnessService:
     return request.app.state.sealed_egress_harness_service
 
 
+def actual_wsl_egress_harness(request: Request) -> SealedEgressHarnessService:
+    return request.app.state.actual_wsl_egress_harness_service
+
+
+def actual_wsl_egress_harness_gate(request: Request) -> ActualWSLHarnessGate:
+    return request.app.state.actual_wsl_egress_harness_gate
+
+
 def as_http_error(error: Exception) -> HTTPException:
     return HTTPException(status_code=400, detail=str(error))
 
@@ -284,8 +319,18 @@ async def status(request: Request):
     state["wsl_isolation"] = public_wsl_isolation_result(gate(request).store.wsl_isolation_result())
     state["wsl_codex_runtime"] = public_runtime_result(gate(request).store.wsl_codex_runtime_result())
     state["sealed_egress_contract"] = public_contract_result(sealed_egress_contract(request).current())
-    current_harness = gate(request).store.egress_harness_result(state["sealed_egress_contract"].get("contract_hash", "")) if state["sealed_egress_contract"].get("contract_hash") else None
+    contract_hash = state["sealed_egress_contract"].get("contract_hash", "")
+    current_harness = gate(request).store.egress_harness_result(
+        contract_hash, FAKE_RUNNER_KIND, FAKE_RUNNER_VERSION, FAKE_RUNNER_IMPLEMENTATION_HASH,
+    ) if contract_hash else None
     state["sealed_egress_harness"] = public_harness_result(current_harness) if current_harness else sealed_egress_harness(request).ready()
+    current_actual = gate(request).store.egress_harness_result(
+        contract_hash, "WSL_SUPERVISOR", WSL_EGRESS_RUNNER_VERSION, RUNNER_IMPLEMENTATION_HASH,
+    ) if contract_hash else None
+    state["actual_wsl_egress_harness"] = (
+        public_harness_result(current_actual) if current_actual else actual_wsl_egress_harness(request).ready()
+    )
+    state["actual_wsl_egress_harness"]["execution_enabled"] = False
     state["choices"] = model_choices(state["models"])
     return state
 
@@ -298,8 +343,18 @@ async def connect(request: Request):
         state["wsl_isolation"] = public_wsl_isolation_result(gate(request).store.wsl_isolation_result())
         state["wsl_codex_runtime"] = public_runtime_result(gate(request).store.wsl_codex_runtime_result())
         state["sealed_egress_contract"] = public_contract_result(sealed_egress_contract(request).current())
-        current_harness = gate(request).store.egress_harness_result(state["sealed_egress_contract"].get("contract_hash", "")) if state["sealed_egress_contract"].get("contract_hash") else None
+        contract_hash = state["sealed_egress_contract"].get("contract_hash", "")
+        current_harness = gate(request).store.egress_harness_result(
+            contract_hash, FAKE_RUNNER_KIND, FAKE_RUNNER_VERSION, FAKE_RUNNER_IMPLEMENTATION_HASH,
+        ) if contract_hash else None
         state["sealed_egress_harness"] = public_harness_result(current_harness) if current_harness else sealed_egress_harness(request).ready()
+        current_actual = gate(request).store.egress_harness_result(
+            contract_hash, "WSL_SUPERVISOR", WSL_EGRESS_RUNNER_VERSION, RUNNER_IMPLEMENTATION_HASH,
+        ) if contract_hash else None
+        state["actual_wsl_egress_harness"] = (
+            public_harness_result(current_actual) if current_actual else actual_wsl_egress_harness(request).ready()
+        )
+        state["actual_wsl_egress_harness"]["execution_enabled"] = False
         return {
             "models": models,
             "choices": model_choices(models),
@@ -319,6 +374,7 @@ async def connect(request: Request):
                     "wsl_codex_runtime",
                     "sealed_egress_contract",
                     "sealed_egress_harness",
+                    "actual_wsl_egress_harness",
                     "token_ledger",
                 )
             },
@@ -392,7 +448,10 @@ async def sealed_egress_harness_status(request: Request):
     try:
         readiness = sealed_egress_harness(request).ready()
         if readiness.get("status") == "READY":
-            current = gate(request).store.egress_harness_result(readiness["contract_hash"])
+            current = gate(request).store.egress_harness_result(
+                readiness["contract_hash"], FAKE_RUNNER_KIND, FAKE_RUNNER_VERSION,
+                FAKE_RUNNER_IMPLEMENTATION_HASH,
+            )
             return public_harness_result(current) if current else readiness
         return readiness
     except Exception as exc:
@@ -402,11 +461,44 @@ async def sealed_egress_harness_status(request: Request):
 @app.post("/api/isolation/wsl/egress-harness")
 async def run_sealed_egress_harness(request: Request):
     try:
-        # The app wires only the in-memory fake runner, so this endpoint cannot
-        # launch WSL, bwrap, a socket, Codex, or a model request in Phase 2.
+        # This legacy endpoint remains the deterministic fake identity only.
         return await sealed_egress_harness(request).run()
     except Exception as exc:
         raise as_http_error(exc) from exc
+
+
+@app.get("/api/isolation/wsl/egress-harness/actual")
+async def actual_wsl_egress_harness_status(request: Request):
+    try:
+        readiness = actual_wsl_egress_harness(request).ready()
+        if readiness.get("status") == "READY":
+            current = gate(request).store.egress_harness_result(
+                readiness["contract_hash"], "WSL_SUPERVISOR", WSL_EGRESS_RUNNER_VERSION,
+                RUNNER_IMPLEMENTATION_HASH,
+            )
+            result = public_harness_result(current) if current else readiness
+        else:
+            result = readiness
+        return {**result, "execution_enabled": False}
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/isolation/wsl/egress-harness/actual/arm")
+async def arm_actual_wsl_egress_harness(request: Request):
+    try:
+        # Phase 3.2 keeps the gate disabled, so this route fails before issue.
+        return actual_wsl_egress_harness_gate(request).arm()
+    except PolicyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/isolation/wsl/egress-harness/actual")
+async def run_actual_wsl_egress_harness(payload: ActualWSLHarnessRequest, request: Request):
+    try:
+        return await actual_wsl_egress_harness_gate(request).run(payload.arm_nonce)
+    except PolicyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/isolation/wsl/probe")

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import secrets
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -409,19 +411,34 @@ class Store:
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     payload TEXT NOT NULL,
-                    integrity_hash TEXT NOT NULL,
-                    UNIQUE(runtime_fingerprint, isolation_cache_key, binary_sha256, provider_config_hash, policy_version)
+                    integrity_hash TEXT NOT NULL
                 )"""
             )
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS egress_harness_runs (
                     harness_id TEXT PRIMARY KEY,
-                    contract_hash TEXT NOT NULL UNIQUE,
+                    contract_hash TEXT NOT NULL,
+                    runner_kind TEXT NOT NULL,
+                    runner_version TEXT NOT NULL,
+                    runner_implementation_hash TEXT NOT NULL,
                     status TEXT NOT NULL,
                     started_at TEXT NOT NULL,
                     finished_at TEXT,
                     payload TEXT NOT NULL,
-                    integrity_hash TEXT NOT NULL
+                    integrity_hash TEXT NOT NULL,
+                    UNIQUE(contract_hash, runner_kind, runner_version, runner_implementation_hash)
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS egress_harness_arms (
+                    nonce_hash TEXT PRIMARY KEY,
+                    contract_hash TEXT NOT NULL,
+                    runner_kind TEXT NOT NULL,
+                    runner_version TEXT NOT NULL,
+                    runner_implementation_hash TEXT NOT NULL,
+                    issued_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    consumed_at TEXT
                 )"""
             )
             conn.execute(
@@ -584,6 +601,9 @@ class Store:
             self._migrate_bridge_nonces(conn)
             self._migrate_format_probes(conn)
             self._migrate_wsl_isolation_probe_results(conn)
+            self._migrate_sealed_egress_contract_instances(conn)
+            self._migrate_egress_harness_runs(conn)
+            self._migrate_egress_harness_arms(conn)
 
     def _connection(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db_path)
@@ -1081,6 +1101,130 @@ class Store:
                 ),
             )
         conn.execute("DROP TABLE format_probes_legacy")
+
+    @staticmethod
+    def _migrate_sealed_egress_contract_instances(conn: sqlite3.Connection) -> None:
+        """Remove the pre-Repro identity constraint without changing sealed rows."""
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='sealed_egress_contract_instances'"
+        ).fetchone()
+        definition = re.sub(r"\s+", "", row[0].casefold()) if row and isinstance(row[0], str) else ""
+        old_unique = "unique(runtime_fingerprint,isolation_cache_key,binary_sha256,provider_config_hash,policy_version)"
+        if old_unique not in definition:
+            return
+        conn.execute("ALTER TABLE sealed_egress_contract_instances RENAME TO sealed_egress_contract_instances_legacy")
+        conn.execute(
+            """CREATE TABLE sealed_egress_contract_instances (
+                contract_id TEXT PRIMARY KEY,
+                contract_hash TEXT NOT NULL UNIQUE,
+                preview_hash TEXT NOT NULL,
+                runtime_fingerprint TEXT NOT NULL,
+                isolation_cache_key TEXT NOT NULL,
+                binary_sha256 TEXT NOT NULL,
+                provider_config_hash TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                integrity_hash TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """INSERT INTO sealed_egress_contract_instances
+               (contract_id, contract_hash, preview_hash, runtime_fingerprint, isolation_cache_key,
+                binary_sha256, provider_config_hash, policy_version, status, created_at, payload, integrity_hash)
+               SELECT contract_id, contract_hash, preview_hash, runtime_fingerprint, isolation_cache_key,
+                      binary_sha256, provider_config_hash, policy_version, status, created_at, payload, integrity_hash
+               FROM sealed_egress_contract_instances_legacy"""
+        )
+        conn.execute("DROP TABLE sealed_egress_contract_instances_legacy")
+
+    @staticmethod
+    def _migrate_egress_harness_runs(conn: sqlite3.Connection) -> None:
+        """Split fake and actual WSL results into independent cache identities."""
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(egress_harness_runs)")}
+        schema_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='egress_harness_runs'"
+        ).fetchone()
+        schema = re.sub(r"\s+", "", schema_row[0].casefold()) if schema_row and isinstance(schema_row[0], str) else ""
+        expected_unique = "unique(contract_hash,runner_kind,runner_version,runner_implementation_hash)"
+        if {"runner_kind", "runner_version", "runner_implementation_hash"}.issubset(columns) and expected_unique in schema:
+            conn.execute("CREATE INDEX IF NOT EXISTS egress_harness_runs_status ON egress_harness_runs(status)")
+            return
+        if not columns:
+            return
+        conn.execute("ALTER TABLE egress_harness_runs RENAME TO egress_harness_runs_legacy")
+        conn.execute(
+            """CREATE TABLE egress_harness_runs (
+                harness_id TEXT PRIMARY KEY,
+                contract_hash TEXT NOT NULL,
+                runner_kind TEXT NOT NULL,
+                runner_version TEXT NOT NULL,
+                runner_implementation_hash TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                payload TEXT NOT NULL,
+                integrity_hash TEXT NOT NULL,
+                UNIQUE(contract_hash, runner_kind, runner_version, runner_implementation_hash)
+            )"""
+        )
+        rows = conn.execute(
+            """SELECT harness_id, contract_hash, status, started_at, finished_at, payload
+               FROM egress_harness_runs_legacy"""
+        ).fetchall()
+        for harness_id, contract_hash, status, started_at, finished_at, payload_json in rows:
+            try:
+                record = json.loads(payload_json)
+            except json.JSONDecodeError:
+                record = {}
+            record = dict(record) if isinstance(record, dict) else {}
+            runner_kind = record.get("runner_kind") if record.get("runner_kind") in {"FAKE", "WSL_SUPERVISOR"} else "FAKE"
+            default_version = (
+                "sealed-egress-wsl-runner-v1"
+                if runner_kind == "WSL_SUPERVISOR"
+                else "sealed-egress-fake-runner-v1"
+            )
+            runner_version = record.get("runner_version")
+            if not isinstance(runner_version, str) or not re.fullmatch(r"[a-z0-9._-]{1,80}", runner_version):
+                runner_version = default_version
+            runner_implementation_hash = record.get("runner_implementation_hash")
+            if not isinstance(runner_implementation_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", runner_implementation_hash):
+                runner_implementation_hash = (
+                    hashlib.sha256(b"sealed-egress-fake-runner-v1").hexdigest()
+                    if runner_kind == "FAKE"
+                    else "0" * 64
+                )
+            record.update({
+                "runner_kind": runner_kind,
+                "runner_version": runner_version,
+                "runner_implementation_hash": runner_implementation_hash,
+            })
+            conn.execute(
+                """INSERT INTO egress_harness_runs
+                   (harness_id, contract_hash, runner_kind, runner_version, runner_implementation_hash, status, started_at,
+                    finished_at, payload, integrity_hash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    harness_id, contract_hash, runner_kind, runner_version, runner_implementation_hash,
+                    status, started_at,
+                    finished_at,
+                    json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    sha256_json(record),
+                ),
+            )
+        conn.execute("DROP TABLE egress_harness_runs_legacy")
+        conn.execute("CREATE INDEX IF NOT EXISTS egress_harness_runs_status ON egress_harness_runs(status)")
+
+    @staticmethod
+    def _migrate_egress_harness_arms(conn: sqlite3.Connection) -> None:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(egress_harness_arms)")}
+        if columns and "runner_implementation_hash" not in columns:
+            conn.execute(
+                """ALTER TABLE egress_harness_arms
+                   ADD COLUMN runner_implementation_hash TEXT NOT NULL
+                   DEFAULT '0000000000000000000000000000000000000000000000000000000000000000'"""
+            )
 
     @staticmethod
     def _migrate_route_plan_uses(conn: sqlite3.Connection) -> None:
@@ -1857,7 +2001,8 @@ class Store:
             "contract_policy_version", "endpoint_type", "provider_snapshot", "relay_status", "broker_status",
             "auth_status", "start_allowed", "error_code", "local_duration_ms",
         }
-        if set(value) != required:
+        proof_fields = {"repro_version", "repro_key", "repro_result_hash"}
+        if not required <= set(value) or set(value) - required not in (set(), proof_fields):
             raise PolicyError("sealed egress contract instance fields are invalid")
         try:
             uuid.UUID(str(value["contract_id"]))
@@ -1870,6 +2015,12 @@ class Store:
         for field in ("preview_hash", "contract_hash", "runtime_fingerprint", "isolation_cache_key", "binary_sha256", "provider_config_hash"):
             if not isinstance(value.get(field), str) or not re.fullmatch(r"[0-9a-f]{64}", value[field]):
                 raise PolicyError("sealed egress contract instance digest is invalid")
+        if proof_fields <= set(value):
+            if value["repro_version"] != "wsl2-bwrap-repro-v1":
+                raise PolicyError("sealed egress Repro version is invalid")
+            for field in ("repro_key", "repro_result_hash"):
+                if not isinstance(value.get(field), str) or not re.fullmatch(r"[0-9a-f]{64}", value[field]):
+                    raise PolicyError("sealed egress Repro digest is invalid")
         if value["preview_hash"] != value["contract_hash"]:
             raise PolicyError("sealed egress contract preview hash does not match")
         if value["contract_policy_version"] != "sealed-egress-contract-v1":
@@ -1901,19 +2052,14 @@ class Store:
     def create_sealed_egress_contract_instance(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Atomically preserve a user-created immutable contract, or return its exact twin."""
         record = self._validate_sealed_egress_contract_instance(payload)
-        identity = (
-            record["runtime_fingerprint"], record["isolation_cache_key"], record["binary_sha256"],
-            record["provider_config_hash"], record["contract_policy_version"],
-        )
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """SELECT contract_id, contract_hash, preview_hash, runtime_fingerprint, isolation_cache_key,
                           binary_sha256, provider_config_hash, policy_version, status, created_at, payload, integrity_hash
                    FROM sealed_egress_contract_instances
-                   WHERE runtime_fingerprint=? AND isolation_cache_key=? AND binary_sha256=?
-                         AND provider_config_hash=? AND policy_version=?""",
-                identity,
+                   WHERE contract_hash=?""",
+                (record["contract_hash"],),
             ).fetchone()
             if row:
                 existing = self._decode_sealed_egress_contract_instance(row)
@@ -1967,13 +2113,23 @@ class Store:
     @staticmethod
     def _validate_egress_harness_record(record: Mapping[str, Any], *, final: bool) -> dict[str, Any]:
         value = dict(record)
+        value.setdefault("runner_kind", "FAKE")
+        value.setdefault("runner_version", "sealed-egress-fake-runner-v1")
+        value.setdefault(
+            "runner_implementation_hash",
+            hashlib.sha256(b"sealed-egress-fake-runner-v1").hexdigest()
+            if value["runner_kind"] == "FAKE"
+            else "0" * 64,
+        )
         required = {
             "harness_id", "contract_hash", "status", "started_at", "finished_at", "error_code",
             "request_bytes", "response_bytes", "response_hash", "status_code", "relay_connections",
             "broker_connections", "relay_requests", "broker_requests", "local_duration_ms",
-            "resources_cleaned", "start_allowed",
+            "resources_cleaned", "start_allowed", "runner_kind", "runner_version",
+            "runner_implementation_hash",
         }
-        if set(value) != required:
+        optional = {"request_hash", "local_processes"}
+        if not required <= set(value) or set(value) - required - optional:
             raise PolicyError("sealed egress harness fields are invalid")
         try:
             uuid.UUID(str(value["harness_id"]))
@@ -1981,7 +2137,7 @@ class Store:
             raise PolicyError("sealed egress harness id is invalid") from exc
         if not isinstance(value["contract_hash"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["contract_hash"]):
             raise PolicyError("sealed egress harness contract hash is invalid")
-        allowed_statuses = {"RUNNING", "PASSED", "BLOCKED", "ERROR"}
+        allowed_statuses = {"RUNNING", "PASSED", "BLOCKED", "ERROR", "POLICY_VIOLATION"}
         if value["status"] not in allowed_statuses or (not final and value["status"] != "RUNNING") or (final and value["status"] == "RUNNING"):
             raise PolicyError("sealed egress harness state is invalid")
         if not isinstance(value["started_at"], str) or not value["started_at"]:
@@ -1993,10 +2149,20 @@ class Store:
                 raise PolicyError("sealed egress harness counter is invalid")
         if value["response_hash"] is not None and (not isinstance(value["response_hash"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["response_hash"])):
             raise PolicyError("sealed egress harness response hash is invalid")
+        if "request_hash" in value and value["request_hash"] is not None and (not isinstance(value["request_hash"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["request_hash"])):
+            raise PolicyError("sealed egress harness request hash is invalid")
         if value["status_code"] is not None and (not isinstance(value["status_code"], int) or not 100 <= value["status_code"] <= 599):
             raise PolicyError("sealed egress harness response status is invalid")
         if not isinstance(value["resources_cleaned"], bool) or value["start_allowed"] is not False:
             raise PolicyError("sealed egress harness lock state is invalid")
+        if "local_processes" in value and (not isinstance(value["local_processes"], int) or isinstance(value["local_processes"], bool) or value["local_processes"] < 0):
+            raise PolicyError("sealed egress harness local process count is invalid")
+        if value["runner_kind"] not in {"FAKE", "WSL_SUPERVISOR"}:
+            raise PolicyError("sealed egress harness runner kind is invalid")
+        if not isinstance(value["runner_version"], str) or not re.fullmatch(r"[a-z0-9._-]{1,80}", value["runner_version"]):
+            raise PolicyError("sealed egress harness runner version is invalid")
+        if not isinstance(value["runner_implementation_hash"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["runner_implementation_hash"]):
+            raise PolicyError("sealed egress harness implementation hash is invalid")
         if value["error_code"] is not None and (not isinstance(value["error_code"], str) or not re.fullmatch(r"[a-z0-9_]{1,80}", value["error_code"])):
             raise PolicyError("sealed egress harness error code is invalid")
         serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -2012,12 +2178,16 @@ class Store:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """INSERT INTO egress_harness_runs
-                   (harness_id, contract_hash, status, started_at, finished_at, payload, integrity_hash)
-                   VALUES (?, ?, 'RUNNING', ?, NULL, ?, ?)
-                   ON CONFLICT(contract_hash) DO UPDATE SET harness_id=excluded.harness_id, status='RUNNING',
+                   (harness_id, contract_hash, runner_kind, runner_version, runner_implementation_hash,
+                    status, started_at, finished_at, payload, integrity_hash)
+                   VALUES (?, ?, ?, ?, ?, 'RUNNING', ?, NULL, ?, ?)
+                   ON CONFLICT(contract_hash, runner_kind, runner_version, runner_implementation_hash)
+                   DO UPDATE SET harness_id=excluded.harness_id, status='RUNNING',
                      started_at=excluded.started_at, finished_at=NULL, payload=excluded.payload,
                      integrity_hash=excluded.integrity_hash""",
-                (record["harness_id"], record["contract_hash"], record["started_at"],
+                (
+                    record["harness_id"], record["contract_hash"], record["runner_kind"],
+                    record["runner_version"], record["runner_implementation_hash"], record["started_at"],
                  json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")), digest),
             )
         return {**record, "integrity_hash": digest}
@@ -2030,45 +2200,78 @@ class Store:
             cursor = conn.execute(
                 """UPDATE egress_harness_runs
                    SET status=?, finished_at=?, payload=?, integrity_hash=?
-                   WHERE contract_hash=? AND harness_id=? AND status='RUNNING'""",
+                   WHERE contract_hash=? AND runner_kind=? AND runner_version=?
+                         AND runner_implementation_hash=?
+                         AND harness_id=? AND status='RUNNING'""",
                 (record["status"], record["finished_at"], json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-                 digest, record["contract_hash"], record["harness_id"]),
+                 digest, record["contract_hash"], record["runner_kind"], record["runner_version"],
+                 record["runner_implementation_hash"], record["harness_id"]),
             )
         if cursor.rowcount != 1:
             raise PolicyError("sealed egress harness could not finish")
         return {**record, "integrity_hash": digest}
 
-    def egress_harness_result(self, contract_hash: str) -> dict[str, Any] | None:
+    def egress_harness_result(
+        self,
+        contract_hash: str,
+        runner_kind: str | None = None,
+        runner_version: str | None = None,
+        runner_implementation_hash: str | None = None,
+    ) -> dict[str, Any] | None:
         if not isinstance(contract_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", contract_hash):
             raise PolicyError("sealed egress harness contract hash is invalid")
+        supplied = (runner_kind, runner_version, runner_implementation_hash)
+        if any(value is None for value in supplied) and any(value is not None for value in supplied):
+            raise PolicyError("sealed egress harness runner identity is incomplete")
         with self._connection() as conn:
-            row = conn.execute(
-                """SELECT harness_id, contract_hash, status, started_at, finished_at, payload, integrity_hash
-                   FROM egress_harness_runs WHERE contract_hash=?""", (contract_hash,)
-            ).fetchone()
+            if runner_kind is None:
+                row = conn.execute(
+                    """SELECT harness_id, contract_hash, runner_kind, runner_version,
+                              runner_implementation_hash, status,
+                              started_at, finished_at, payload, integrity_hash
+                       FROM egress_harness_runs WHERE contract_hash=?
+                       ORDER BY CASE runner_kind WHEN 'FAKE' THEN 0 ELSE 1 END, started_at DESC LIMIT 1""",
+                    (contract_hash,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """SELECT harness_id, contract_hash, runner_kind, runner_version,
+                              runner_implementation_hash, status,
+                              started_at, finished_at, payload, integrity_hash
+                       FROM egress_harness_runs
+                       WHERE contract_hash=? AND runner_kind=? AND runner_version=?
+                             AND runner_implementation_hash=?""",
+                    (contract_hash, runner_kind, runner_version, runner_implementation_hash),
+                ).fetchone()
         if not row:
             return None
         try:
-            record = json.loads(row[5])
+            record = json.loads(row[8])
         except json.JSONDecodeError as exc:
             raise PolicyError("sealed egress harness payload was modified") from exc
-        expected = {"harness_id": row[0], "contract_hash": row[1], "status": row[2], "started_at": row[3], "finished_at": row[4]}
+        expected = {
+            "harness_id": row[0], "contract_hash": row[1], "runner_kind": row[2],
+            "runner_version": row[3], "runner_implementation_hash": row[4],
+            "status": row[5], "started_at": row[6], "finished_at": row[7],
+        }
         if not isinstance(record, dict) or any(record.get(key) != value for key, value in expected.items()):
             raise PolicyError("sealed egress harness metadata was modified")
-        self._validate_egress_harness_record(record, final=row[2] != "RUNNING")
-        if sha256_json(record) != row[6]:
+        self._validate_egress_harness_record(record, final=row[5] != "RUNNING")
+        if sha256_json(record) != row[9]:
             raise PolicyError("sealed egress harness integrity check failed")
-        return {**record, "integrity_hash": row[6]}
+        return {**record, "integrity_hash": row[9]}
 
     def recover_interrupted_egress_harnesses(self) -> int:
         now = _now()
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
-                "SELECT harness_id, contract_hash, payload FROM egress_harness_runs WHERE status='RUNNING'"
+                """SELECT harness_id, contract_hash, runner_kind, runner_version,
+                          runner_implementation_hash, payload
+                   FROM egress_harness_runs WHERE status='RUNNING'"""
             ).fetchall()
             count = 0
-            for harness_id, contract_hash, payload in rows:
+            for harness_id, contract_hash, runner_kind, runner_version, runner_implementation_hash, payload in rows:
                 try:
                     record = json.loads(payload)
                 except json.JSONDecodeError:
@@ -2079,20 +2282,142 @@ class Store:
                 digest = sha256_json(record)
                 cursor = conn.execute(
                     """UPDATE egress_harness_runs SET status='ERROR', finished_at=?, payload=?, integrity_hash=?
-                       WHERE harness_id=? AND contract_hash=? AND status='RUNNING'""",
-                    (now, json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")), digest, harness_id, contract_hash),
+                       WHERE harness_id=? AND contract_hash=? AND runner_kind=? AND runner_version=?
+                             AND runner_implementation_hash=?
+                             AND status='RUNNING'""",
+                    (
+                        now, json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                        digest, harness_id, contract_hash, runner_kind, runner_version,
+                        runner_implementation_hash,
+                    ),
                 )
                 count += int(cursor.rowcount)
         return count
+
+    def issue_egress_harness_arm(
+        self,
+        contract_hash: str,
+        runner_kind: str,
+        runner_version: str,
+        runner_implementation_hash: str,
+        *,
+        ttl_seconds: int = 300,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Issue a short-lived one-time capability without storing its plaintext."""
+        if not isinstance(contract_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", contract_hash):
+            raise PolicyError("arm_contract_invalid")
+        if runner_kind != "WSL_SUPERVISOR" or not isinstance(runner_version, str) or not re.fullmatch(r"[a-z0-9._-]{1,80}", runner_version):
+            raise PolicyError("arm_runner_invalid")
+        if not isinstance(runner_implementation_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", runner_implementation_hash):
+            raise PolicyError("arm_runner_invalid")
+        if not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool) or not 1 <= ttl_seconds <= 300:
+            raise PolicyError("arm_ttl_invalid")
+        issued = now or datetime.now(timezone.utc)
+        if issued.tzinfo is None:
+            raise PolicyError("arm_time_invalid")
+        expires = issued + timedelta(seconds=ttl_seconds)
+        nonce = secrets.token_urlsafe(32)
+        nonce_hash = hashlib.sha256(nonce.encode("ascii")).hexdigest()
+        with self._connection() as conn:
+            conn.execute(
+                """INSERT INTO egress_harness_arms
+                   (nonce_hash, contract_hash, runner_kind, runner_version, runner_implementation_hash,
+                    issued_at, expires_at, consumed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, NULL)""",
+                (
+                    nonce_hash, contract_hash, runner_kind, runner_version, runner_implementation_hash,
+                    issued.isoformat(), expires.isoformat(),
+                ),
+            )
+        return {
+            "arm_nonce": nonce,
+            "contract_hash": contract_hash,
+            "runner_kind": runner_kind,
+            "runner_version": runner_version,
+            "runner_implementation_hash": runner_implementation_hash,
+            "issued_at": issued.isoformat(),
+            "expires_at": expires.isoformat(),
+            "consumed": False,
+        }
+
+    def consume_egress_harness_arm(
+        self,
+        arm_nonce: str,
+        contract_hash: str,
+        runner_kind: str,
+        runner_version: str,
+        runner_implementation_hash: str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Atomically consume a capability bound to one actual runner identity."""
+        if not isinstance(arm_nonce, str) or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", arm_nonce):
+            raise PolicyError("arm_required")
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            raise PolicyError("arm_time_invalid")
+        nonce_hash = hashlib.sha256(arm_nonce.encode("ascii")).hexdigest()
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """SELECT contract_hash, runner_kind, runner_version, runner_implementation_hash,
+                          issued_at, expires_at, consumed_at
+                   FROM egress_harness_arms WHERE nonce_hash=?""",
+                (nonce_hash,),
+            ).fetchone()
+            if not row:
+                raise PolicyError("arm_invalid")
+            if (
+                row[0] != contract_hash
+                or row[1] != runner_kind
+                or row[2] != runner_version
+                or row[3] != runner_implementation_hash
+            ):
+                raise PolicyError("arm_binding_changed")
+            if row[6] is not None:
+                raise PolicyError("arm_reused")
+            try:
+                expires_at = datetime.fromisoformat(row[5])
+            except (TypeError, ValueError) as exc:
+                raise PolicyError("arm_invalid") from exc
+            if expires_at.tzinfo is None or expires_at <= current:
+                raise PolicyError("arm_expired")
+            consumed_at = current.isoformat()
+            cursor = conn.execute(
+                """UPDATE egress_harness_arms SET consumed_at=?
+                   WHERE nonce_hash=? AND consumed_at IS NULL""",
+                (consumed_at, nonce_hash),
+            )
+            if cursor.rowcount != 1:
+                raise PolicyError("arm_reused")
+        return {
+            "contract_hash": contract_hash,
+            "runner_kind": runner_kind,
+            "runner_version": runner_version,
+            "runner_implementation_hash": runner_implementation_hash,
+            "issued_at": row[4],
+            "expires_at": row[5],
+            "consumed_at": consumed_at,
+            "consumed": True,
+        }
 
     def record_egress_harness_ledger(self, result: Mapping[str, Any]) -> dict[str, Any]:
         checked_at = result.get("finished_at") if isinstance(result.get("finished_at"), str) else _now()
         contract_hash = result.get("contract_hash") if isinstance(result.get("contract_hash"), str) else "unknown"
         record = {
-            "source_event_id": f"sealed-egress-harness:{contract_hash}:{result.get('harness_id', 'unknown')}",
+            "source_event_id": (
+                f"sealed-egress-harness:{contract_hash}:{result.get('runner_kind', 'FAKE')}:"
+                f"{result.get('runner_version', 'unknown')}:"
+                f"{result.get('runner_implementation_hash', 'unknown')}:{result.get('harness_id', 'unknown')}"
+            ),
             "source": "LOCAL_ESTIMATE", "quality": "OBSERVED", "event_type": "SEALED_EGRESS_HARNESS",
             "status": result.get("status") if isinstance(result.get("status"), str) else "ERROR",
             "contract_hash": contract_hash, "local_executions": 1,
+            "runner_kind": result.get("runner_kind", "FAKE"),
+            "runner_version": result.get("runner_version", "unknown"),
+            "runner_implementation_hash": result.get("runner_implementation_hash", "unknown"),
+            "local_processes": int(result.get("local_processes") or 0),
             "local_duration_ms": int(result.get("local_duration_ms") or 0),
             "tokens": 0, "app_server_rpc_calls": 0, "occurred_at": checked_at,
         }
@@ -2989,6 +3314,7 @@ class Store:
         harness_events = [event for event in usage_events if event.get("event_type") == "SEALED_EGRESS_HARNESS"]
         report["sealed_egress_harness"] = {
             "executions": sum(int(event.get("local_executions") or 0) for event in harness_events),
+            "local_processes": sum(int(event.get("local_processes") or 0) for event in harness_events),
             "local_duration_ms": sum(int(event.get("local_duration_ms") or 0) for event in harness_events),
             "tokens": 0,
             "app_server_rpc_calls": 0,

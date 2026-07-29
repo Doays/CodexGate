@@ -65,6 +65,12 @@ def deterministic_response_metadata() -> dict[str, Any]:
     }
 
 
+def deterministic_request_metadata() -> dict[str, Any]:
+    """Return only the digest and size of the fixed synthetic request."""
+    body = fixed_client_request()[3]
+    return {"request_bytes": len(body), "request_hash": hashlib.sha256(body).hexdigest()}
+
+
 @dataclass
 class BrokerResult:
     status_code: int

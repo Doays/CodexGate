@@ -51,6 +51,18 @@ def build_relay_launch_spec(contract: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def validate_relay_loopback_boundary(spec: Mapping[str, Any]) -> None:
+    """Reject a relay description that expands the sealed local boundary."""
+    if not isinstance(spec, Mapping):
+        raise PolicyError("sealed relay launch spec is invalid")
+    if spec.get("listen") != {"host": LOOPBACK_HOST, "port": LOOPBACK_PORT}:
+        raise PolicyError("sealed relay loopback boundary is invalid")
+    if spec.get("broker_socket") != "CONTRACT_SOCKET_ONLY":
+        raise PolicyError("sealed relay socket boundary is invalid")
+    if spec.get("network") not in {"sandbox_loopback_only", "unshare_all_loopback_only"}:
+        raise PolicyError("sealed relay network boundary is invalid")
+
+
 @dataclass
 class RelayResult:
     status_code: int

@@ -81,6 +81,7 @@ def test_fake_relay_broker_path_is_deterministic_and_contract_remains_auth_uncon
         runtime.start()
     ledger = store.token_ledger_report()["sealed_egress_harness"]
     assert ledger["executions"] == 1
+    assert ledger["local_processes"] == 0
     assert ledger["tokens"] == ledger["app_server_rpc_calls"] == 0
 
 

@@ -9,6 +9,8 @@ let wslIsolationStatus = "UNCONFIGURED";
 let wslRuntimeStatus = "UNCONFIGURED";
 let wslEgressStatus = "UNCONFIGURED";
 let wslHarnessStatus = "BLOCKED";
+let actualWSLHarnessStatus = "NOT RUN";
+let actualWSLHarnessArm = null;
 let stream = null;
 let planExpiryTimer = null;
 let currentBridge = null;
@@ -227,6 +229,7 @@ async function connect() {
     renderWSLCodexRuntime(data.wsl_codex_runtime);
     renderSealedEgressContract(data.sealed_egress_contract);
     renderSealedEgressHarness(data.sealed_egress_harness);
+    renderActualWSLEgressHarness(data.actual_wsl_egress_harness);
     renderTokenLedger(data.token_ledger || {});
     $("connection-dot").classList.add("live");
     $("connection-text").textContent = `${data.choices.length} models connected`;
@@ -324,13 +327,29 @@ function renderSealedEgressHarness(result) {
   const statusNode = $("wsl-harness-status");
   const detailNode = $("wsl-harness-result");
   if (!statusNode || !detailNode) return;
-  statusNode.textContent = wslHarnessStatus;
+  statusNode.textContent = `FAKE ${wslHarnessStatus}`;
   const hash = result?.contract_hash ? "immutable contract matched" : "no runnable contract";
   const resultHash = result?.response_hash ? "deterministic response recorded" : "no response body stored";
   const code = result?.error_code ? ` Code: ${result.error_code}.` : "";
-  detailNode.textContent = `Harness ${wslHarnessStatus}; ${hash}; ${resultHash}. Fake-runner verification only: all live starts remain locked.${code}`;
+  detailNode.textContent = `FAKE ${wslHarnessStatus}; ${hash}; ${resultHash}. This result is never reused as WSL proof.${code}`;
   const button = $("run-wsl-egress-harness");
   if (button) button.disabled = wslHarnessStatus !== "READY";
+}
+
+function renderActualWSLEgressHarness(result) {
+  actualWSLHarnessStatus = result?.status === "PASSED" ? "PASSED" : "NOT RUN";
+  const statusNode = $("actual-wsl-harness-status");
+  const detailNode = $("actual-wsl-harness-result");
+  if (!statusNode || !detailNode) return;
+  statusNode.textContent = `WSL ${actualWSLHarnessStatus}`;
+  const proof = result?.status === "READY" ? "current Canary and Repro proof matched" : "proof or contract not ready";
+  const implementation = result?.runner_implementation_hash ? "runner implementation sealed" : "runner implementation unavailable";
+  const code = result?.error_code ? ` Code: ${result.error_code}.` : "";
+  detailNode.textContent = `Actual WSL: ${actualWSLHarnessStatus}; ${proof}; ${implementation}.${code} Arm issuance, execution, and every live start remain locked.`;
+  const armButton = $("arm-actual-wsl-egress-harness");
+  const runButton = $("run-actual-wsl-egress-harness");
+  if (armButton) armButton.disabled = result?.status !== "READY" || result?.execution_enabled !== true;
+  if (runButton) runButton.disabled = result?.execution_enabled !== true || !actualWSLHarnessArm;
 }
 
 async function runIsolationProbe() {
@@ -424,6 +443,7 @@ async function createSealedEgressContract() {
     const result = await api("/api/isolation/wsl/egress-contract", { method: "POST" });
     renderSealedEgressContract(result);
     renderSealedEgressHarness(await api("/api/isolation/wsl/egress-harness"));
+    renderActualWSLEgressHarness(await api("/api/isolation/wsl/egress-harness/actual"));
     say(`Sealed egress contract: ${result.status}. Authentication and all starts remain locked.`, result.status !== "AUTH_UNCONFIGURED");
   } catch (error) {
     say(error.message, true);
@@ -432,11 +452,36 @@ async function createSealedEgressContract() {
   }
 }
 
+async function armActualWSLEgressHarness() {
+  try {
+    actualWSLHarnessArm = await api("/api/isolation/wsl/egress-harness/actual/arm", { method: "POST" });
+    renderActualWSLEgressHarness(await api("/api/isolation/wsl/egress-harness/actual"));
+    say("One-time actual WSL arm created locally. Execution remains disabled in Phase 3.1.");
+  } catch (error) {
+    actualWSLHarnessArm = null;
+    say(error.message, true);
+  }
+}
+
+async function runActualWSLEgressHarness() {
+  if (!actualWSLHarnessArm) return;
+  try {
+    const result = await api("/api/isolation/wsl/egress-harness/actual", {
+      method: "POST",
+      body: JSON.stringify({ arm_nonce: actualWSLHarnessArm.arm_nonce }),
+    });
+    actualWSLHarnessArm = null;
+    renderActualWSLEgressHarness(result);
+  } catch (error) {
+    say(error.message, true);
+  }
+}
+
 async function runSealedEgressHarness() {
   const button = $("run-wsl-egress-harness");
   try {
     button.disabled = true;
-    say("Running the deterministic in-memory harness only; no WSL, socket, network, Codex, or model process starts...");
+    say("Running the deterministic in-memory harness only; the Phase 3 WSL runner is not selected, so no WSL, socket, network, Codex, or model process starts...");
     const result = await api("/api/isolation/wsl/egress-harness", { method: "POST" });
     renderSealedEgressHarness(result);
     say(`Sealed egress fake harness: ${result.status}. Authentication and every live start remain locked.`, result.status !== "PASSED");
@@ -1156,6 +1201,8 @@ $("save-wsl-runtime-config").onclick = saveWSLCodexRuntimeConfig;
 $("run-wsl-runtime-preflight").onclick = runWSLCodexRuntimePreflight;
 $("create-wsl-egress-contract").onclick = createSealedEgressContract;
 $("run-wsl-egress-harness").onclick = runSealedEgressHarness;
+$("arm-actual-wsl-egress-harness").onclick = armActualWSLEgressHarness;
+$("run-actual-wsl-egress-harness").onclick = runActualWSLEgressHarness;
 for (const id of ["catalog-filter-status", "catalog-filter-kind", "catalog-filter-extension"]) $(id).addEventListener("change", () => refreshCatalogEntries().catch((error) => say(error.message, true)));
 renderBridge(null);
 restoreBridge();

@@ -67,6 +67,17 @@ class WSLCommandRunner(Protocol):
     async def run(self, args: list[str], *, timeout_seconds: float) -> ProcessResult: ...
 
 
+def separate_stream_byte_count(result: ProcessResult) -> tuple[int, int]:
+    """Return strict stdout/stderr sizes without ever combining their bytes.
+
+    The WSL isolation probe and sealed egress supervisor share this helper so
+    a diagnostic stream can never become part of a marker/frame protocol.
+    """
+    stdout = result.stdout_bytes if isinstance(result.stdout_bytes, bytes) else result.stdout.encode("utf-8", "strict")
+    stderr = result.stderr_bytes if isinstance(result.stderr_bytes, bytes) else result.stderr.encode("utf-8", "strict")
+    return len(stdout), len(stderr)
+
+
 class LocalWSLCommandRunner:
     """Direct exec-only runner.  It never starts a shell or accepts shell text."""
 
