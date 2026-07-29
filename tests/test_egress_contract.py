@@ -221,6 +221,30 @@ def test_contract_cannot_be_created_without_a_current_sealed_runtime(tmp_path):
     assert result["start_allowed"] is False
 
 
+def test_contract_blocks_legacy_runtime_identity_until_official_preflight_refresh(tmp_path):
+    store, runtime, runner = _ready(tmp_path)
+    with store._connection() as conn:
+        row = conn.execute("SELECT payload FROM wsl_codex_runtime_results WHERE singleton=1").fetchone()
+        payload = json.loads(row[0])
+        for field in ("binary_sha256", "identity_version", "identity_complete", "isolation_cache_key"):
+            payload.pop(field, None)
+        from app.policy import sha256_json
+        payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        conn.execute(
+            "UPDATE wsl_codex_runtime_results SET identity_version=NULL, payload=?, integrity_hash=? WHERE singleton=1",
+            (payload_json, sha256_json(payload)),
+        )
+    service = SealedEgressContractService(store)
+    blocked = service.create()
+    assert blocked["status"] == BLOCKED
+    assert blocked["error_code"] == "runtime_identity_incomplete"
+    refreshed = asyncio.run(runtime.preflight())
+    assert refreshed["identity_complete"] is True
+    assert len(runner.calls) == 2
+    ready = service.create()
+    assert ready["status"] == AUTH_UNCONFIGURED
+
+
 def test_preview_and_generated_instance_hash_mismatch_holds_before_immutable_save(tmp_path, monkeypatch):
     store, _, _ = _ready(tmp_path)
     original = egress_contract.build_private_contract

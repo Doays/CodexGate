@@ -23,6 +23,7 @@ from app.wsl_codex_runtime import (
     WSLCodexRuntime,
     build_sealed_launch_spec,
     public_runtime_result,
+    RUNTIME_IDENTITY_VERSION,
 )
 
 
@@ -231,3 +232,70 @@ def test_result_integrity_detects_tampering(tmp_path):
         conn.execute("UPDATE wsl_codex_runtime_results SET integrity_hash=? WHERE singleton=1", ("0" * 64,))
     with pytest.raises(PolicyError, match="integrity"):
         store.wsl_codex_runtime_result()
+
+
+def test_legacy_success_row_without_binary_sha_is_read_only_blocked(tmp_path):
+    store, service, _ = _service(tmp_path)
+    store.save_wsl_codex_runtime_config("/usr/local/bin/codex")
+    asyncio.run(service.preflight())
+    with store._connection() as conn:
+        row = conn.execute("SELECT payload FROM wsl_codex_runtime_results WHERE singleton=1").fetchone()
+        payload = json.loads(row[0])
+        for field in ("binary_sha256", "identity_version", "identity_complete", "isolation_cache_key"):
+            payload.pop(field, None)
+        payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        from app.policy import sha256_json
+        before = payload_json
+        conn.execute(
+            "UPDATE wsl_codex_runtime_results SET identity_version=NULL, payload=?, integrity_hash=? WHERE singleton=1",
+            (payload_json, sha256_json(payload)),
+        )
+    result = store.wsl_codex_runtime_result()
+    assert result["status"] == BLOCKED
+    assert result["error_code"] == "runtime_identity_incomplete"
+    assert result["identity_complete"] is False
+    with store._connection() as conn:
+        after = conn.execute("SELECT payload FROM wsl_codex_runtime_results WHERE singleton=1").fetchone()[0]
+    assert after == before
+
+
+def test_runtime_identity_version_and_binary_sha_are_required_for_success_write(tmp_path):
+    store, service, _ = _service(tmp_path)
+    store.save_wsl_codex_runtime_config("/usr/local/bin/codex")
+    complete = asyncio.run(service.preflight())
+    assert complete["identity_version"] == RUNTIME_IDENTITY_VERSION
+    assert complete["identity_complete"] is True
+    assert complete["isolation_cache_key"] == "c" * 64
+    missing = dict(complete)
+    missing.pop("binary_sha256")
+    missing.pop("integrity_hash", None)
+    with pytest.raises(PolicyError, match="identity"):
+        store.save_wsl_codex_runtime_result(missing)
+    for bad_sha in ("z" * 64, "a" * 63, "a" * 65):
+        invalid = dict(complete, binary_sha256=bad_sha)
+        invalid.pop("integrity_hash", None)
+        with pytest.raises(PolicyError, match="digest"):
+            store.save_wsl_codex_runtime_result(invalid)
+
+
+def test_identity_migration_is_repeatable_without_legacy_backfill(tmp_path):
+    store, service, _ = _service(tmp_path)
+    store.save_wsl_codex_runtime_config("/usr/local/bin/codex")
+    asyncio.run(service.preflight())
+    with store._connection() as conn:
+        row = conn.execute("SELECT payload FROM wsl_codex_runtime_results WHERE singleton=1").fetchone()
+        payload = json.loads(row[0])
+        for field in ("binary_sha256", "identity_version", "identity_complete", "isolation_cache_key"):
+            payload.pop(field, None)
+        from app.policy import sha256_json
+        payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        conn.execute(
+            "UPDATE wsl_codex_runtime_results SET identity_version=NULL, payload=?, integrity_hash=? WHERE singleton=1",
+            (payload_json, sha256_json(payload)),
+        )
+    Store(tmp_path / "data")
+    Store(tmp_path / "data")
+    with store._connection() as conn:
+        persisted = json.loads(conn.execute("SELECT payload FROM wsl_codex_runtime_results WHERE singleton=1").fetchone()[0])
+    assert "binary_sha256" not in persisted
+    assert "identity_version" not in persisted

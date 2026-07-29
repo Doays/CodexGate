@@ -27,6 +27,7 @@ from .token_ledger import build_report, normalize_baseline_payload, normalize_ru
 
 DEFAULT_USAGE_THRESHOLDS = {"conserve": 70, "critical": 90, "blocked": 100}
 MODEL_STATUSES = frozenset({"AVAILABLE", "LIMITED", "DEPLETED", "UNKNOWN", "DISABLED"})
+RUNTIME_IDENTITY_VERSION = "runtime-identity-v1"
 
 
 def _now() -> str:
@@ -626,12 +627,25 @@ class Store:
             self._migrate_bridge_nonces(conn)
             self._migrate_format_probes(conn)
             self._migrate_wsl_isolation_probe_results(conn)
+            self._migrate_wsl_codex_runtime_results(conn)
             self._migrate_sealed_egress_contract_instances(conn)
             self._migrate_egress_harness_runs(conn)
             self._migrate_egress_harness_arms(conn)
 
     def _connection(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db_path)
+
+    @staticmethod
+    def _migrate_wsl_codex_runtime_results(conn: sqlite3.Connection) -> None:
+        """Add identity metadata without backfilling legacy rows.
+
+        A missing value is deliberately retained as an incomplete legacy
+        identity.  Only a subsequent official preflight may write the current
+        identity version and binary digest.
+        """
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(wsl_codex_runtime_results)")}
+        if "identity_version" not in columns:
+            conn.execute("ALTER TABLE wsl_codex_runtime_results ADD COLUMN identity_version TEXT")
 
     # Asset Catalog storage deliberately keeps the source root private.  These
     # methods return aliases and project-relative paths only.
@@ -1824,7 +1838,8 @@ class Store:
         required = {
             "status", "checked_at", "config_hash", "runtime_fingerprint", "launch_spec_hash",
             "binary_configured", "version_match", "isolation_match", "egress_blocked",
-            "start_allowed", "error_code", "local_duration_ms",
+            "start_allowed", "error_code", "local_duration_ms", "identity_version",
+            "identity_complete", "isolation_cache_key",
         }
         missing = required - record.keys()
         if missing:
@@ -1838,10 +1853,19 @@ class Store:
         }
         if record["status"] not in statuses:
             raise PolicyError("WSL Codex runtime status is invalid")
+        if record["identity_version"] != RUNTIME_IDENTITY_VERSION:
+            raise PolicyError("WSL Codex runtime identity version is invalid")
+        if not isinstance(record["identity_complete"], bool):
+            raise PolicyError("WSL Codex runtime identity completeness is invalid")
         for field in ("config_hash", "runtime_fingerprint", "launch_spec_hash", "binary_sha256"):
             value = record.get(field)
             if value is not None and (not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)):
                 raise PolicyError("WSL Codex runtime digest is invalid")
+        if record["isolation_cache_key"] is not None and (
+            not isinstance(record["isolation_cache_key"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", record["isolation_cache_key"])
+        ):
+            raise PolicyError("WSL Codex runtime isolation identity is invalid")
         for field in ("binary_configured", "version_match", "isolation_match", "egress_blocked", "start_allowed"):
             if not isinstance(record[field], bool):
                 raise PolicyError("WSL Codex runtime flags are invalid")
@@ -1864,6 +1888,17 @@ class Store:
             raise PolicyError("WSL Codex runtime binary size is invalid")
         if record.get("binary_sha256") is not None and not record.get("binary_configured"):
             raise PolicyError("WSL Codex runtime binary digest requires a configured binary")
+        if record["status"] == "EGRESS_UNCONFIGURED":
+            complete_fields = (
+                "runtime_fingerprint", "launch_spec_hash", "binary_sha256", "isolation_cache_key",
+            )
+            if not record["identity_complete"] or any(
+                not isinstance(record.get(field), str) or not re.fullmatch(r"[0-9a-f]{64}", record[field])
+                for field in complete_fields
+            ) or not record["isolation_match"] or record["egress_blocked"] is not True or record["start_allowed"] is not False:
+                raise PolicyError("WSL Codex runtime identity is incomplete")
+        elif record["identity_complete"]:
+            raise PolicyError("non-success WSL Codex runtime cannot have a complete identity")
         forbidden = ("path", "argv", "environment", "auth", "token", "stdout", "stderr", "command", "secret")
         if any(any(fragment in key.casefold() for fragment in forbidden) for key in record):
             raise PolicyError("WSL Codex runtime result includes sensitive data")
@@ -1871,16 +1906,18 @@ class Store:
         with self._connection() as conn:
             conn.execute(
                 """INSERT INTO wsl_codex_runtime_results
-                   (singleton, status, checked_at, config_hash, runtime_fingerprint, launch_spec_hash, payload, integrity_hash)
-                   VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                   (singleton, status, checked_at, config_hash, runtime_fingerprint, launch_spec_hash,
+                    identity_version, payload, integrity_hash)
+                   VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(singleton) DO UPDATE SET
                        status=excluded.status, checked_at=excluded.checked_at,
                        config_hash=excluded.config_hash, runtime_fingerprint=excluded.runtime_fingerprint,
-                       launch_spec_hash=excluded.launch_spec_hash, payload=excluded.payload,
+                       launch_spec_hash=excluded.launch_spec_hash, identity_version=excluded.identity_version,
+                       payload=excluded.payload,
                        integrity_hash=excluded.integrity_hash""",
                 (
                     record["status"], record["checked_at"], record["config_hash"],
-                    record["runtime_fingerprint"], record["launch_spec_hash"],
+                    record["runtime_fingerprint"], record["launch_spec_hash"], record["identity_version"],
                     json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")), integrity_hash,
                 ),
             )
@@ -1889,24 +1926,42 @@ class Store:
     def wsl_codex_runtime_result(self) -> dict[str, Any] | None:
         with self._connection() as conn:
             row = conn.execute(
-                """SELECT status, checked_at, config_hash, runtime_fingerprint, launch_spec_hash, payload, integrity_hash
+                """SELECT status, checked_at, config_hash, runtime_fingerprint, launch_spec_hash,
+                          identity_version, payload, integrity_hash
                    FROM wsl_codex_runtime_results WHERE singleton=1"""
             ).fetchone()
         if not row:
             return None
         try:
-            record = json.loads(row[5])
+            record = json.loads(row[6])
         except json.JSONDecodeError as exc:
             raise PolicyError("WSL Codex runtime result payload was modified") from exc
         expected = {
             "status": row[0], "checked_at": row[1], "config_hash": row[2],
-            "runtime_fingerprint": row[3], "launch_spec_hash": row[4],
+            "runtime_fingerprint": row[3], "launch_spec_hash": row[4], "identity_version": row[5],
         }
         if not isinstance(record, dict) or any(record.get(key) != value for key, value in expected.items()):
             raise PolicyError("WSL Codex runtime result metadata was modified")
-        if sha256_json(record) != row[6]:
+        if sha256_json(record) != row[7]:
             raise PolicyError("WSL Codex runtime result integrity check failed")
-        return {**record, "integrity_hash": row[6]}
+        complete_fields = ("runtime_fingerprint", "launch_spec_hash", "binary_sha256", "isolation_cache_key")
+        identity_complete = (
+            record.get("identity_version") == RUNTIME_IDENTITY_VERSION
+            and record.get("identity_complete") is True
+            and all(isinstance(record.get(field), str) and re.fullmatch(r"[0-9a-f]{64}", record[field]) for field in complete_fields)
+            and record.get("isolation_match") is True
+            and record.get("egress_blocked") is True
+            and record.get("start_allowed") is False
+        )
+        if record.get("status") == "EGRESS_UNCONFIGURED" and not identity_complete:
+            return {
+                **record,
+                "identity_complete": False,
+                "status": "BLOCKED",
+                "error_code": "runtime_identity_incomplete",
+                "integrity_hash": row[7],
+            }
+        return {**record, "identity_complete": identity_complete, "integrity_hash": row[7]}
 
     def save_sealed_egress_contract(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Store a closed, redacted egress contract and never config TOML or auth."""

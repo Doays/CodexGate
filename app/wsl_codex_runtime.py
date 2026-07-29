@@ -21,6 +21,7 @@ from .isolation_wsl import (
     WSLCommandRunner,
 )
 from .policy import PolicyError, sha256_json, validate_wsl_codex_binary_path, validate_wsl_distro
+from .storage import RUNTIME_IDENTITY_VERSION
 
 
 UNCONFIGURED = "UNCONFIGURED"
@@ -160,7 +161,8 @@ def public_runtime_result(result: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(result, dict):
         return {"status": UNCONFIGURED, "binary_configured": False, "start_allowed": False, "egress_blocked": True}
     fields = ("status", "checked_at", "config_hash", "runtime_fingerprint", "launch_spec_hash",
-              "binary_configured", "version_match", "isolation_match", "egress_blocked", "start_allowed", "error_code")
+              "binary_configured", "version_match", "isolation_match", "egress_blocked", "start_allowed", "error_code",
+              "identity_version", "identity_complete")
     return {field: result.get(field) for field in fields if field in result}
 
 
@@ -223,6 +225,9 @@ class WSLCodexRuntime:
             # This digest is sealed local metadata.  It is needed to bind a
             # later egress contract, but public API results still omit it.
             ready["binary_sha256"] = binary_sha
+            ready["isolation_cache_key"] = isolation_key
+            ready["identity_version"] = RUNTIME_IDENTITY_VERSION
+            ready["identity_complete"] = True
             return self._save(ready)
 
     def start(self) -> None:
@@ -284,6 +289,8 @@ class WSLCodexRuntime:
             "binary_configured": binary_configured, "version_match": version_match,
             "isolation_match": isolation_match, "egress_blocked": True,
             "start_allowed": False, "error_code": error_code, "local_duration_ms": duration,
+            "identity_version": RUNTIME_IDENTITY_VERSION, "identity_complete": False,
+            "isolation_cache_key": None,
         }
 
     def _save(self, record: dict[str, Any]) -> dict[str, Any]:

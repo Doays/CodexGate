@@ -431,6 +431,8 @@ class SealedEgressContractService:
     @staticmethod
     def _binding_problem(runtime: Mapping[str, Any] | None, isolation: Mapping[str, Any] | None,
                          result: Mapping[str, Any] | None = None) -> str | None:
+        if isinstance(runtime, Mapping) and runtime.get("error_code") == "runtime_identity_incomplete":
+            return "runtime_identity_incomplete"
         if not isinstance(runtime, Mapping) or runtime.get("status") != "EGRESS_UNCONFIGURED":
             return "runtime_not_ready"
         if runtime.get("egress_blocked") is not True or runtime.get("start_allowed") is not False:
