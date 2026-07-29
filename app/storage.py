@@ -385,6 +385,18 @@ class Store:
                 )"""
             )
             conn.execute(
+                """CREATE TABLE IF NOT EXISTS sealed_egress_contracts (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    status TEXT NOT NULL,
+                    checked_at TEXT NOT NULL,
+                    contract_hash TEXT,
+                    runtime_fingerprint TEXT,
+                    isolation_cache_key TEXT,
+                    payload TEXT NOT NULL,
+                    integrity_hash TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
                 """CREATE TABLE IF NOT EXISTS wsl_isolation_probe_results (
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                     backend TEXT NOT NULL,
@@ -1617,7 +1629,7 @@ class Store:
         missing = required - record.keys()
         if missing:
             raise PolicyError(f"WSL Codex runtime result is missing fields: {', '.join(sorted(missing))}")
-        allowed = required | {"preflight_status", "binary_size"}
+        allowed = required | {"preflight_status", "binary_size", "binary_sha256"}
         if set(record) - allowed:
             raise PolicyError("WSL Codex runtime result contains unsupported fields")
         statuses = {
@@ -1626,8 +1638,8 @@ class Store:
         }
         if record["status"] not in statuses:
             raise PolicyError("WSL Codex runtime status is invalid")
-        for field in ("config_hash", "runtime_fingerprint", "launch_spec_hash"):
-            value = record[field]
+        for field in ("config_hash", "runtime_fingerprint", "launch_spec_hash", "binary_sha256"):
+            value = record.get(field)
             if value is not None and (not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)):
                 raise PolicyError("WSL Codex runtime digest is invalid")
         for field in ("binary_configured", "version_match", "isolation_match", "egress_blocked", "start_allowed"):
@@ -1650,6 +1662,8 @@ class Store:
             not isinstance(record["binary_size"], int) or record["binary_size"] < 0
         ):
             raise PolicyError("WSL Codex runtime binary size is invalid")
+        if record.get("binary_sha256") is not None and not record.get("binary_configured"):
+            raise PolicyError("WSL Codex runtime binary digest requires a configured binary")
         forbidden = ("path", "argv", "environment", "auth", "token", "stdout", "stderr", "command", "secret")
         if any(any(fragment in key.casefold() for fragment in forbidden) for key in record):
             raise PolicyError("WSL Codex runtime result includes sensitive data")
@@ -1693,6 +1707,148 @@ class Store:
         if sha256_json(record) != row[6]:
             raise PolicyError("WSL Codex runtime result integrity check failed")
         return {**record, "integrity_hash": row[6]}
+
+    def save_sealed_egress_contract(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Store a closed, redacted egress contract and never config TOML or auth."""
+        record = dict(payload)
+        required = {
+            "status", "checked_at", "contract_hash", "runtime_fingerprint", "isolation_cache_key",
+            "binary_sha256", "provider_config_hash", "contract_policy_version", "endpoint_type",
+            "provider_snapshot", "relay_status", "broker_status", "auth_status", "start_allowed",
+            "error_code", "local_duration_ms",
+        }
+        if set(record) != required:
+            raise PolicyError("sealed egress contract fields are invalid")
+        statuses = {
+            "UNCONFIGURED", "CONTRACT_READY", "RELAY_MISSING", "BROKER_MISSING",
+            "AUTH_UNCONFIGURED", "READY_CANDIDATE", "BLOCKED", "ERROR",
+        }
+        if record["status"] not in statuses:
+            raise PolicyError("sealed egress contract status is invalid")
+        for field in ("contract_hash", "runtime_fingerprint", "isolation_cache_key", "binary_sha256", "provider_config_hash"):
+            value = record[field]
+            if value is not None and (not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)):
+                raise PolicyError("sealed egress contract digest is invalid")
+        if record["contract_policy_version"] != "sealed-egress-contract-v1":
+            raise PolicyError("sealed egress contract policy version is invalid")
+        if record["endpoint_type"] not in {"UNCONFIGURED", "LOOPBACK_HTTP_V1"}:
+            raise PolicyError("sealed egress endpoint type is invalid")
+        if record["relay_status"] not in {"CONTRACT_READY", "RELAY_MISSING", "BLOCKED", "ERROR"}:
+            raise PolicyError("sealed egress relay state is invalid")
+        if record["broker_status"] not in {"CONTRACT_READY", "BROKER_MISSING", "BLOCKED", "ERROR"}:
+            raise PolicyError("sealed egress broker state is invalid")
+        if record["auth_status"] not in {"AUTH_UNCONFIGURED", "READY_CANDIDATE", "BLOCKED", "ERROR"}:
+            raise PolicyError("sealed egress auth state is invalid")
+        if record["start_allowed"] is not False:
+            raise PolicyError("sealed egress contract must remain start-blocked")
+        if not isinstance(record["checked_at"], str) or not record["checked_at"]:
+            raise PolicyError("sealed egress contract timestamp is invalid")
+        if record["error_code"] is not None and (
+            not isinstance(record["error_code"], str) or not re.fullmatch(r"[a-z0-9_]{1,80}", record["error_code"])
+        ):
+            raise PolicyError("sealed egress contract error code is invalid")
+        if not isinstance(record["local_duration_ms"], int) or record["local_duration_ms"] < 0:
+            raise PolicyError("sealed egress contract duration is invalid")
+        snapshot = record["provider_snapshot"]
+        expected_snapshot = {
+            "provider_id", "endpoint_type", "wire_api", "requires_openai_auth", "env_key_name",
+            "supports_websockets", "request_max_retries", "stream_max_retries",
+        }
+        if snapshot is not None and (not isinstance(snapshot, dict) or set(snapshot) != expected_snapshot):
+            raise PolicyError("sealed egress provider snapshot is invalid")
+        if snapshot is not None and (
+            snapshot.get("provider_id") != "codexgate-sealed"
+            or snapshot.get("endpoint_type") != "LOOPBACK_HTTP_V1"
+            or snapshot.get("wire_api") != "responses"
+            or snapshot.get("requires_openai_auth") is not False
+            or snapshot.get("env_key_name") != "CODEXGATE_EPHEMERAL_TOKEN"
+            or snapshot.get("supports_websockets") is not False
+            or snapshot.get("request_max_retries") != 0
+            or snapshot.get("stream_max_retries") != 0
+        ):
+            raise PolicyError("sealed egress provider snapshot is not closed")
+        serialized = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        forbidden = ("authorization", "cookie", "proxy-", "config_toml", "credential", "api_key", "secret")
+        if any(value in serialized.casefold() for value in forbidden):
+            raise PolicyError("sealed egress contract includes sensitive material")
+        integrity_hash = sha256_json(record)
+        with self._connection() as conn:
+            conn.execute(
+                """INSERT INTO sealed_egress_contracts
+                   (singleton, status, checked_at, contract_hash, runtime_fingerprint, isolation_cache_key, payload, integrity_hash)
+                   VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(singleton) DO UPDATE SET
+                       status=excluded.status, checked_at=excluded.checked_at, contract_hash=excluded.contract_hash,
+                       runtime_fingerprint=excluded.runtime_fingerprint, isolation_cache_key=excluded.isolation_cache_key,
+                       payload=excluded.payload, integrity_hash=excluded.integrity_hash""",
+                (
+                    record["status"], record["checked_at"], record["contract_hash"],
+                    record["runtime_fingerprint"], record["isolation_cache_key"], serialized, integrity_hash,
+                ),
+            )
+        return {**record, "integrity_hash": integrity_hash}
+
+    def sealed_egress_contract(self) -> dict[str, Any] | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT status, checked_at, contract_hash, runtime_fingerprint, isolation_cache_key, payload, integrity_hash
+                   FROM sealed_egress_contracts WHERE singleton=1"""
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            record = json.loads(row[5])
+        except json.JSONDecodeError as exc:
+            raise PolicyError("sealed egress contract payload was modified") from exc
+        metadata = {
+            "status": row[0], "checked_at": row[1], "contract_hash": row[2],
+            "runtime_fingerprint": row[3], "isolation_cache_key": row[4],
+        }
+        if not isinstance(record, dict) or any(record.get(key) != value for key, value in metadata.items()):
+            raise PolicyError("sealed egress contract metadata was modified")
+        if sha256_json(record) != row[6]:
+            raise PolicyError("sealed egress contract integrity check failed")
+        return {**record, "integrity_hash": row[6]}
+
+    def record_sealed_egress_contract_ledger(self, result: Mapping[str, Any]) -> dict[str, Any]:
+        """Account for local contract construction only; tokens and RPCs stay zero."""
+        checked_at = result.get("checked_at") if isinstance(result.get("checked_at"), str) else _now()
+        contract_hash = result.get("contract_hash") if isinstance(result.get("contract_hash"), str) else "unconfigured"
+        record = {
+            "source_event_id": f"sealed-egress-contract:{contract_hash}:{checked_at}",
+            "source": "LOCAL_ESTIMATE", "quality": "OBSERVED", "event_type": "SEALED_EGRESS_CONTRACT",
+            "status": result.get("status") if isinstance(result.get("status"), str) else "ERROR",
+            "contract_hash": contract_hash,
+            "contract_executions": 1,
+            "contract_duration_ms": int(result.get("local_duration_ms") or 0),
+            "tokens": 0, "app_server_rpc_calls": 0, "occurred_at": checked_at,
+        }
+        digest = sha256_json(record)
+        with self._connection() as conn:
+            existing = conn.execute(
+                "SELECT payload, integrity_hash FROM ledger_usage_events WHERE source_event_id=?", (record["source_event_id"],)
+            ).fetchone()
+            if existing:
+                if existing[1] != digest:
+                    raise PolicyError("sealed egress contract ledger event id was reused with different content")
+                return {**json.loads(existing[0]), "integrity_hash": existing[1]}
+            conn.execute(
+                """INSERT INTO ledger_usage_events (
+                    event_id, source_event_id, source, quality, event_type, run_id, task_id, route_plan_id,
+                    comparison_key, success_criteria_hash, task_class, planned_model, actual_model, effort, status,
+                    input_tokens, cached_input_tokens, output_tokens, reasoning_tokens, provider_total_tokens,
+                    codex_context_bytes, web_packet_bytes, evidence_bytes, source_bytes, catalog_source_bytes,
+                    probe_bytes, model_turns, high_model_turns, retries, reroutes, compactions, subagent_count,
+                    occurred_at, payload, integrity_hash
+                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL, NULL,
+                    NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, ?, ?, ?)""",
+                (
+                    str(uuid.uuid4()), record["source_event_id"], record["source"], record["quality"], record["event_type"],
+                    record["status"], record["occurred_at"],
+                    json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")), digest,
+                ),
+            )
+        return {**record, "integrity_hash": digest}
 
     def record_wsl_codex_runtime_preflight_ledger(self, result: Mapping[str, Any]) -> dict[str, Any]:
         """Account for local metadata work only; it cannot consume a model token or RPC."""
@@ -2518,6 +2674,13 @@ class Store:
         report["wsl_codex_runtime_preflight"] = {
             "executions": sum(int(event.get("runtime_preflight_executions") or 0) for event in runtime_events),
             "local_duration_ms": sum(int(event.get("runtime_preflight_duration_ms") or 0) for event in runtime_events),
+            "tokens": 0,
+            "app_server_rpc_calls": 0,
+        }
+        contract_events = [event for event in usage_events if event.get("event_type") == "SEALED_EGRESS_CONTRACT"]
+        report["sealed_egress_contract"] = {
+            "executions": sum(int(event.get("contract_executions") or 0) for event in contract_events),
+            "local_duration_ms": sum(int(event.get("contract_duration_ms") or 0) for event in contract_events),
             "tokens": 0,
             "app_server_rpc_calls": 0,
         }

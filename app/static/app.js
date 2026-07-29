@@ -7,6 +7,7 @@ let currentCapsule = null;
 let isolationStatus = "UNKNOWN";
 let wslIsolationStatus = "UNCONFIGURED";
 let wslRuntimeStatus = "UNCONFIGURED";
+let wslEgressStatus = "UNCONFIGURED";
 let stream = null;
 let planExpiryTimer = null;
 let currentBridge = null;
@@ -223,6 +224,7 @@ async function connect() {
     renderIsolation(data.isolation);
     renderWSLIsolation(data.wsl_isolation);
     renderWSLCodexRuntime(data.wsl_codex_runtime);
+    renderSealedEgressContract(data.sealed_egress_contract);
     renderTokenLedger(data.token_ledger || {});
     $("connection-dot").classList.add("live");
     $("connection-text").textContent = `${data.choices.length} models connected`;
@@ -298,6 +300,21 @@ function renderWSLCodexRuntime(result) {
   const fingerprint = result?.runtime_fingerprint ? "recorded" : "not available";
   const code = result?.error_code ? ` Code: ${result.error_code}.` : "";
   detailNode.textContent = `Binary ${configured}; version ${version}; runtime fingerprint ${fingerprint}; ${isolation}; egress remains blocked.${code} Codex start stays locked.`;
+}
+
+function renderSealedEgressContract(result) {
+  wslEgressStatus = result?.status || "UNCONFIGURED";
+  const statusNode = $("wsl-egress-status");
+  const detailNode = $("wsl-egress-result");
+  if (!statusNode || !detailNode) return;
+  statusNode.textContent = wslEgressStatus;
+  const endpoint = result?.endpoint_type || "UNCONFIGURED";
+  const contract = result?.contract_hash ? "recorded" : "not recorded";
+  const relay = result?.relay_status || "RELAY_MISSING";
+  const broker = result?.broker_status || "BROKER_MISSING";
+  const auth = result?.auth_status || "AUTH_UNCONFIGURED";
+  const code = result?.error_code ? ` Code: ${result.error_code}.` : "";
+  detailNode.textContent = `Endpoint ${endpoint}; contract hash ${contract}; relay ${relay}; broker ${broker}; auth ${auth}.${code} Network and Codex start remain locked.`;
 }
 
 async function runIsolationProbe() {
@@ -380,6 +397,21 @@ async function runWSLCodexRuntimePreflight() {
     say(error.message, true);
   } finally {
     $("run-wsl-runtime-preflight").disabled = false;
+  }
+}
+
+async function createSealedEgressContract() {
+  const button = $("create-wsl-egress-contract");
+  try {
+    button.disabled = true;
+    say("Creating the sealed local egress contract without starting a relay or Codex...");
+    const result = await api("/api/isolation/wsl/egress-contract", { method: "POST" });
+    renderSealedEgressContract(result);
+    say(`Sealed egress contract: ${result.status}. Authentication and all starts remain locked.`, result.status !== "AUTH_UNCONFIGURED");
+  } catch (error) {
+    say(error.message, true);
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -1090,6 +1122,7 @@ $("run-wsl-isolation-probe").onclick = runWSLIsolationProbe;
 $("run-wsl-isolation-repro").onclick = runWSLIsolationRepro;
 $("save-wsl-runtime-config").onclick = saveWSLCodexRuntimeConfig;
 $("run-wsl-runtime-preflight").onclick = runWSLCodexRuntimePreflight;
+$("create-wsl-egress-contract").onclick = createSealedEgressContract;
 for (const id of ["catalog-filter-status", "catalog-filter-kind", "catalog-filter-extension"]) $(id).addEventListener("change", () => refreshCatalogEntries().catch((error) => say(error.message, true)));
 renderBridge(null);
 restoreBridge();

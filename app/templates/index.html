@@ -111,6 +111,14 @@
         </div>
         <p class="hint">Shown: configured state, version match, runtime fingerprint, isolation match, and egress blocking only. Paths, argv, environment values, and credentials are never displayed.</p>
       </div>
+      <div class="wsl-egress-panel">
+        <div class="panel-title"><span>SEALED EGRESS</span><h2>Contract Phase 1</h2><span id="wsl-egress-status" class="status">UNCONFIGURED</span></div>
+        <p id="wsl-egress-result" class="hint">Create only the immutable custom-provider and broker contract. No relay, socket, network, authentication, or Codex process starts in this phase.</p>
+        <div class="row wsl-isolation-actions">
+          <button id="create-wsl-egress-contract" class="button ghost" type="button">Create sealed egress contract</button>
+        </div>
+        <p class="hint">The contract permits one loopback Responses endpoint and one future Unix-socket broker boundary. Authentication remains unconfigured and all starts stay locked.</p>
+      </div>
     </section>
 
     <section class="panel router-preview-panel">

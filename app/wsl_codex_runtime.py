@@ -220,11 +220,19 @@ class WSLCodexRuntime:
                                version_match=True, isolation_match=True, binary_configured=True)
             ready["preflight_status"] = READY_CANDIDATE
             ready["binary_size"] = result["size"]
+            # This digest is sealed local metadata.  It is needed to bind a
+            # later egress contract, but public API results still omit it.
+            ready["binary_sha256"] = binary_sha
             return self._save(ready)
 
     def start(self) -> None:
-        """Phase 0 has no egress/auth implementation and can never start Codex."""
-        raise PolicyError("WSL Codex runtime start is blocked: egress is unconfigured")
+        """The sealed contract never unlocks startup before broker auth exists."""
+        contract = self.store.sealed_egress_contract()
+        if not contract:
+            raise PolicyError("WSL Codex runtime start is blocked: egress contract is unconfigured")
+        if contract.get("status") == "AUTH_UNCONFIGURED":
+            raise PolicyError("WSL Codex runtime start is blocked: egress authentication is unconfigured")
+        raise PolicyError("WSL Codex runtime start is blocked: sealed egress is not ready")
 
     async def _inspect_binary(self, distro: str, binary_path: str) -> dict[str, Any]:
         wsl = self.runner.find_wsl()

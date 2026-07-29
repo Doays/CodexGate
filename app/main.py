@@ -21,6 +21,7 @@ from .gateway import Gate
 from .isolation_wsl import WSLBubblewrapIsolation, public_result as public_wsl_isolation_result
 from .isolation_repro import IsolationReproService, public_repro_result
 from .wsl_codex_runtime import WSLCodexRuntime, public_runtime_result
+from .egress_contract import SealedEgressContractService, public_contract_result
 from .format_probe import FormatProbeService
 from .indexer import preflight
 from .policy import PolicyError, model_choices, validate_project_id, validate_workspace_root
@@ -204,6 +205,7 @@ async def lifespan(app: FastAPI):
     app.state.wsl_isolation_service = WSLBubblewrapIsolation(store)
     app.state.wsl_repro_service = IsolationReproService(store, app.state.wsl_isolation_service)
     app.state.wsl_codex_runtime_service = WSLCodexRuntime(store)
+    app.state.sealed_egress_contract_service = SealedEgressContractService(store)
     BridgeService(store, gate_instance.create_route_plan).recover_processing_on_startup()
     app.state.gate = gate_instance
     yield
@@ -252,6 +254,10 @@ def wsl_codex_runtime(request: Request) -> WSLCodexRuntime:
     return request.app.state.wsl_codex_runtime_service
 
 
+def sealed_egress_contract(request: Request) -> SealedEgressContractService:
+    return request.app.state.sealed_egress_contract_service
+
+
 def as_http_error(error: Exception) -> HTTPException:
     return HTTPException(status_code=400, detail=str(error))
 
@@ -266,6 +272,7 @@ async def status(request: Request):
     state = gate(request).status()
     state["wsl_isolation"] = public_wsl_isolation_result(gate(request).store.wsl_isolation_result())
     state["wsl_codex_runtime"] = public_runtime_result(gate(request).store.wsl_codex_runtime_result())
+    state["sealed_egress_contract"] = public_contract_result(sealed_egress_contract(request).current())
     state["choices"] = model_choices(state["models"])
     return state
 
@@ -277,6 +284,7 @@ async def connect(request: Request):
         state = gate(request).status()
         state["wsl_isolation"] = public_wsl_isolation_result(gate(request).store.wsl_isolation_result())
         state["wsl_codex_runtime"] = public_runtime_result(gate(request).store.wsl_codex_runtime_result())
+        state["sealed_egress_contract"] = public_contract_result(sealed_egress_contract(request).current())
         return {
             "models": models,
             "choices": model_choices(models),
@@ -294,6 +302,7 @@ async def connect(request: Request):
                     "isolation",
                     "wsl_isolation",
                     "wsl_codex_runtime",
+                    "sealed_egress_contract",
                     "token_ledger",
                 )
             },
@@ -340,6 +349,24 @@ async def wsl_codex_runtime_preflight(request: Request):
     try:
         # Fixed WSL argv performs binary metadata and --version only; it does not start Codex.
         return public_runtime_result(await wsl_codex_runtime(request).preflight())
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.get("/api/isolation/wsl/egress-contract")
+async def sealed_egress_contract_status(request: Request):
+    try:
+        return public_contract_result(sealed_egress_contract(request).current())
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/isolation/wsl/egress-contract")
+async def create_sealed_egress_contract(request: Request):
+    try:
+        # Contract construction is pure local serialization and SQLite storage;
+        # it starts neither a relay nor a Codex process.
+        return public_contract_result(sealed_egress_contract(request).create())
     except Exception as exc:
         raise as_http_error(exc) from exc
 

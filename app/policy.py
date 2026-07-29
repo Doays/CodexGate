@@ -11,6 +11,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path, PureWindowsPath
 from typing import Any, Sequence
+from urllib.parse import urlsplit
 
 
 BUDGETS = {
@@ -61,6 +62,7 @@ _WSL_DISTRO_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _WSL_CODEX_BINARY = re.compile(
     r"^/(?:usr/local/bin/codex|home/[A-Za-z0-9][A-Za-z0-9_-]{0,31}/\.local/bin/codex)$"
 )
+_SEALED_EGRESS_BASE_URL = re.compile(r"^http://127\.0\.0\.1:8788/v1$")
 
 
 class PolicyError(ValueError):
@@ -757,6 +759,25 @@ def validate_workspace(
     if permission == "workspace-write" and any(term in lowered for term in HIGH_RISK_TERMS):
         raise PolicyError("high-risk workspace-write tasks are blocked in the first release")
     return path
+
+
+def validate_sealed_loopback_base_url(value: str) -> str:
+    """Permit only the fixed local relay endpoint used by the sealed contract."""
+    if not isinstance(value, str) or not _SEALED_EGRESS_BASE_URL.fullmatch(value):
+        raise PolicyError("sealed egress base URL must be the fixed loopback /v1 endpoint")
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "127.0.0.1"
+        or parsed.port != 8788
+        or parsed.path != "/v1"
+        or parsed.query
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise PolicyError("sealed egress base URL is invalid")
+    return value
 
 
 def validate_decision_for_run(decision: Decision, permission: str) -> None:

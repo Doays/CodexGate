@@ -114,6 +114,14 @@ For a future execution, the app computes an immutable private bubblewrap launch 
 
 Because Phase 0 deliberately has no sealed authentication or model egress design, a binary that passes validation is recorded as `EGRESS_UNCONFIGURED` with an internal `READY_CANDIDATE` preflight signal. Its only permitted Codex invocation is the fixed `--version` metadata check; it never starts `app-server`, login, account, or a model turn, and it does not unlock the Windows app-server path, Workspace Write, Ultra, or live runs. Local runtime-preflight count and duration are the only Token Ledger values; tokens and app-server RPC calls remain zero.
 
+### Sealed Egress Contract Phase 1
+
+Phase 1 creates an immutable, local-only future-egress contract; it does not start a relay, broker, socket listener, Codex process, DNS lookup, or network request. The only provider is `codexgate-sealed`, configured in ephemeral `CODEX_HOME/config.toml` bytes with `wire_api = "responses"`, `requires_openai_auth = false`, `env_key = "CODEXGATE_EPHEMERAL_TOKEN"`, no WebSockets, and zero request or stream retries. The config bytes are not stored: SQLite retains only their SHA-256 and a closed snapshot of the permitted fields. Built-in `openai`, `openai_base_url`, and proxy environment variables are not part of this path.
+
+The contract permits exactly `http://127.0.0.1:8788/v1` inside the sandbox and one future Unix-socket boundary at the broker. That relay has no DNS, internet, or alternative socket output. The future broker permits only `POST /v1/responses`, enforces 256 KB request and 2 MB response caps with a 120-second timeout, rejects CONNECT, redirects, absolute-form targets, and arbitrary `Host` values, and strips caller `Authorization`, `Cookie`, and `Proxy-*` headers. A future broker may inject authentication outside this contract; no token, credential, raw request, or raw response is stored or logged here.
+
+The contract hash binds the runtime fingerprint, WSL isolation cache key, binary SHA-256, provider-config SHA-256, and contract policy version. Any binding change makes it unusable. With relay, broker, and authentication intentionally absent, the persisted final state is `AUTH_UNCONFIGURED`; runtime start, live execution, Workspace Write, and Ultra all remain locked. Token Ledger records only local contract construction count and duration, with zero tokens and zero app-server RPC calls.
+
 - Only `127.0.0.1` and `localhost` are accepted as `Host`
 - If `Origin` is present, it must match the same local origin
 - `project_id` must be a safe slug or UUID
