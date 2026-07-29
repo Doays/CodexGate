@@ -344,12 +344,16 @@ function renderActualWSLEgressHarness(result) {
   statusNode.textContent = `WSL ${actualWSLHarnessStatus}`;
   const proof = result?.status === "READY" ? "current Canary and Repro proof matched" : "proof or contract not ready";
   const implementation = result?.runner_implementation_hash ? "runner implementation sealed" : "runner implementation unavailable";
+  const window = result?.execution_window || { status: "DISABLED", remaining_seconds: 0 };
+  const windowState = window.status || "DISABLED";
+  const remaining = windowState === "ARMED" ? ` ${window.remaining_seconds || 0}s remaining.` : "";
+  const binding = window.binding_hash ? ` Binding ${window.binding_hash.slice(0, 16)}…` : "";
   const code = result?.error_code ? ` Code: ${result.error_code}.` : "";
-  detailNode.textContent = `Actual WSL: ${actualWSLHarnessStatus}; ${proof}; ${implementation}.${code} Arm issuance, execution, and every live start remain locked.`;
+  detailNode.textContent = `Actual WSL: ${actualWSLHarnessStatus}; ${proof}; ${implementation}. Window ${windowState}.${remaining}${binding}${code} The window authorizes one harness request only; Runtime and live execution stay locked.`;
   const armButton = $("arm-actual-wsl-egress-harness");
   const runButton = $("run-actual-wsl-egress-harness");
-  if (armButton) armButton.disabled = result?.status !== "READY" || result?.execution_enabled !== true;
-  if (runButton) runButton.disabled = result?.execution_enabled !== true || !actualWSLHarnessArm;
+  if (armButton) armButton.disabled = result?.status !== "READY" || windowState === "ARMED";
+  if (runButton) runButton.disabled = windowState !== "ARMED" || !actualWSLHarnessArm;
 }
 
 async function runIsolationProbe() {
@@ -456,7 +460,7 @@ async function armActualWSLEgressHarness() {
   try {
     actualWSLHarnessArm = await api("/api/isolation/wsl/egress-harness/actual/arm", { method: "POST" });
     renderActualWSLEgressHarness(await api("/api/isolation/wsl/egress-harness/actual"));
-    say("One-time actual WSL arm created locally. Execution remains disabled in Phase 3.1.");
+    say("A two-minute, one-time WSL harness window is armed locally. The next actual harness request consumes both capabilities.");
   } catch (error) {
     actualWSLHarnessArm = null;
     say(error.message, true);
@@ -468,12 +472,19 @@ async function runActualWSLEgressHarness() {
   try {
     const result = await api("/api/isolation/wsl/egress-harness/actual", {
       method: "POST",
-      body: JSON.stringify({ arm_nonce: actualWSLHarnessArm.arm_nonce }),
+      body: JSON.stringify({
+        window_nonce: actualWSLHarnessArm.window_nonce,
+        arm_nonce: actualWSLHarnessArm.arm_nonce,
+      }),
     });
     actualWSLHarnessArm = null;
     renderActualWSLEgressHarness(result);
   } catch (error) {
+    // The server consumes a valid pair before execution validation, so never
+    // keep a browser-side capability after any attempted actual request.
+    actualWSLHarnessArm = null;
     say(error.message, true);
+    renderActualWSLEgressHarness(await api("/api/isolation/wsl/egress-harness/actual"));
   }
 }
 

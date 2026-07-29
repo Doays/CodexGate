@@ -125,11 +125,11 @@
         <div class="row wsl-isolation-actions">
           <button id="run-wsl-egress-harness" class="button ghost" type="button" disabled>Run deterministic fake harness</button>
         </div>
-        <div class="panel-title"><span>ACTUAL RUNNER</span><h2>WSL execution remains disabled</h2><span id="actual-wsl-harness-status" class="status">WSL NOT RUN</span></div>
-        <p id="actual-wsl-harness-result" class="hint">A fresh Canary, matching SAFE_REPRODUCIBLE 10/10/10 result, immutable Contract, exact runner implementation hash, and one-time arm are required. Arm issuance and actual execution are both disabled in this phase.</p>
+        <div class="panel-title"><span>ACTUAL RUNNER</span><h2>One-time WSL execution window</h2><span id="actual-wsl-harness-status" class="status">WSL NOT RUN</span></div>
+        <p id="actual-wsl-harness-result" class="hint">A local IPv4 loopback click can create one two-minute window only after fresh Canary, matching SAFE_REPRODUCIBLE 10/10/10, immutable Contract, and exact runner hash validation. The next request consumes both nonces; Runtime and live execution remain locked.</p>
         <div class="row wsl-isolation-actions">
-          <button id="arm-actual-wsl-egress-harness" class="button ghost" type="button" disabled>Arm actual WSL (disabled)</button>
-          <button id="run-actual-wsl-egress-harness" class="button" type="button" disabled>Run actual WSL (locked)</button>
+          <button id="arm-actual-wsl-egress-harness" class="button ghost" type="button" disabled>Open one-time WSL window</button>
+          <button id="run-actual-wsl-egress-harness" class="button window-run" type="button" disabled>Run actual WSL once</button>
         </div>
       </div>
     </section>

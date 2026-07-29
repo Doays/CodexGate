@@ -26,7 +26,7 @@ from app.egress_harness import (
     FakeHarnessRunner,
     SealedEgressHarnessService,
 )
-from app.egress_harness_wsl import RUNNER_IMPLEMENTATION_HASH, WSL_EGRESS_RUNNER_VERSION
+from app.egress_harness_wsl import RUNNER_IMPLEMENTATION_HASH, WSLEgressHarnessRunner, WSL_EGRESS_RUNNER_VERSION
 from app.isolation_repro import REPRO_RUNS, REPRO_VERSION, SAFE_REPRODUCIBLE
 from app.isolation_wsl import ProcessResult, SAFE_CANDIDATE
 from app.policy import PolicyError
@@ -55,13 +55,13 @@ class FakeRuntimeRunner:
         )
 
 
-class InMemoryWSLRunner(FakeHarnessRunner):
-    runner_kind = WSL_RUNNER_KIND
-    runner_version = WSL_EGRESS_RUNNER_VERSION
-    runner_implementation_hash = RUNNER_IMPLEMENTATION_HASH
+class InMemoryWSLRunner(WSLEgressHarnessRunner):
+    def __init__(self):
+        self.calls = 0
 
     async def run(self, contract, launch_spec):
-        result = await super().run(contract, launch_spec)
+        self.calls += 1
+        result = await FakeHarnessRunner().run(contract, launch_spec)
         return replace(
             result,
             socket_counts={},
@@ -290,30 +290,26 @@ def test_arm_nonce_is_expiring_one_time_and_binding_specific(tmp_path):
 
 def test_actual_gate_requires_arm_and_never_accepts_fake_runner(tmp_path):
     store, contracts, _ = ready_store(tmp_path)
-    with pytest.raises(PolicyError, match="actual harness requires"):
-        ActualWSLHarnessGate(
-            store, SealedEgressHarnessService(store, contracts, FakeHarnessRunner()), enabled=True,
-        )
+    fake_gate = ActualWSLHarnessGate(store, SealedEgressHarnessService(store, contracts, FakeHarnessRunner()))
+    with pytest.raises(PolicyError, match="actual_runner_policy_violation"):
+        fake_gate.arm()
 
     runner = InMemoryWSLRunner()
     service = SealedEgressHarnessService(store, contracts, runner)
-    gate = ActualWSLHarnessGate(store, service, enabled=True)
-    with pytest.raises(PolicyError, match="arm_required"):
-        asyncio.run(gate.run(None))
+    gate = ActualWSLHarnessGate(store, service)
+    with pytest.raises(PolicyError, match="execution_window_required"):
+        asyncio.run(gate.run(None, None))
     arm = gate.arm()
-    result = asyncio.run(gate.run(arm["arm_nonce"]))
+    result = asyncio.run(gate.run(arm["window_nonce"], arm["arm_nonce"]))
     assert result["status"] == PASSED
     assert runner.calls == 1
 
 
-def test_production_gate_blocks_arm_and_run(tmp_path):
+def test_execution_window_defaults_disabled_and_invalid_run_does_not_start(tmp_path):
     store, contracts, _ = ready_store(tmp_path)
     runner = InMemoryWSLRunner()
-    gate = ActualWSLHarnessGate(
-        store, SealedEgressHarnessService(store, contracts, runner), enabled=False,
-    )
-    with pytest.raises(PolicyError, match="actual_wsl_harness_disabled"):
-        gate.arm()
-    with pytest.raises(PolicyError, match="actual_wsl_harness_disabled"):
-        asyncio.run(gate.run(None))
+    gate = ActualWSLHarnessGate(store, SealedEgressHarnessService(store, contracts, runner))
+    assert gate.window_status()["status"] == "DISABLED"
+    with pytest.raises(PolicyError, match="execution_window_required"):
+        asyncio.run(gate.run(None, None))
     assert runner.calls == 0

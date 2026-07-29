@@ -173,6 +173,7 @@ class WSLCodexRuntimeConfigRequest(BaseModel):
 class ActualWSLHarnessRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    window_nonce: str | None = Field(default=None, min_length=32, max_length=128)
     arm_nonce: str | None = Field(default=None, min_length=32, max_length=128)
 
 
@@ -215,6 +216,16 @@ def _enforce_local_request(request: Request) -> JSONResponse | None:
     return None
 
 
+def _enforce_execution_window_arm_request(request: Request) -> JSONResponse | None:
+    """Arming is stricter than ordinary local API access: IPv4 loopback + Origin."""
+    if _local_host(request.headers.get("host")) != "127.0.0.1":
+        return _reject_local_request("Execution window arming requires Host 127.0.0.1.")
+    origin = request.headers.get("origin")
+    if not origin or not _same_local_origin(request, origin):
+        return _reject_local_request("Execution window arming requires the matching local Origin.")
+    return None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     store = Store(DATA_ROOT)
@@ -222,6 +233,7 @@ async def lifespan(app: FastAPI):
     store.recover_interrupted_wsl_isolation_probes()
     store.recover_interrupted_wsl_isolation_repros()
     store.recover_interrupted_egress_harnesses()
+    store.recover_armed_egress_execution_windows()
     gate_instance = Gate(store)
     app.state.wsl_isolation_service = WSLBubblewrapIsolation(store)
     app.state.wsl_repro_service = IsolationReproService(store, app.state.wsl_isolation_service)
@@ -234,10 +246,10 @@ async def lifespan(app: FastAPI):
     app.state.actual_wsl_egress_harness_service = SealedEgressHarnessService(
         store, app.state.sealed_egress_contract_service, actual_runner,
     )
-    # Phase 3.2 exposes sealed routes but keeps arm issuance and execution
-    # disabled. Constructing the runner starts no WSL or other process.
+    # Constructing the runner starts no WSL or other process.  Phase 3.3 only
+    # permits it behind an explicit, non-persistent execution window.
     app.state.actual_wsl_egress_harness_gate = ActualWSLHarnessGate(
-        store, app.state.actual_wsl_egress_harness_service, enabled=False,
+        store, app.state.actual_wsl_egress_harness_service,
     )
     app.state.sealed_egress_harness_runner_version = WSL_EGRESS_RUNNER_VERSION
     BridgeService(store, gate_instance.create_route_plan).recover_processing_on_startup()
@@ -330,7 +342,10 @@ async def status(request: Request):
     state["actual_wsl_egress_harness"] = (
         public_harness_result(current_actual) if current_actual else actual_wsl_egress_harness(request).ready()
     )
-    state["actual_wsl_egress_harness"]["execution_enabled"] = False
+    state["actual_wsl_egress_harness"]["execution_window"] = actual_wsl_egress_harness_gate(request).window_status()
+    state["actual_wsl_egress_harness"]["execution_enabled"] = (
+        state["actual_wsl_egress_harness"]["execution_window"].get("status") == "ARMED"
+    )
     state["choices"] = model_choices(state["models"])
     return state
 
@@ -354,7 +369,10 @@ async def connect(request: Request):
         state["actual_wsl_egress_harness"] = (
             public_harness_result(current_actual) if current_actual else actual_wsl_egress_harness(request).ready()
         )
-        state["actual_wsl_egress_harness"]["execution_enabled"] = False
+        state["actual_wsl_egress_harness"]["execution_window"] = actual_wsl_egress_harness_gate(request).window_status()
+        state["actual_wsl_egress_harness"]["execution_enabled"] = (
+            state["actual_wsl_egress_harness"]["execution_window"].get("status") == "ARMED"
+        )
         return {
             "models": models,
             "choices": model_choices(models),
@@ -479,15 +497,24 @@ async def actual_wsl_egress_harness_status(request: Request):
             result = public_harness_result(current) if current else readiness
         else:
             result = readiness
-        return {**result, "execution_enabled": False}
+        window = actual_wsl_egress_harness_gate(request).window_status()
+        return {
+            **result,
+            "execution_window": window,
+            "execution_enabled": window.get("status") == "ARMED",
+        }
     except Exception as exc:
         raise as_http_error(exc) from exc
 
 
 @app.post("/api/isolation/wsl/egress-harness/actual/arm")
 async def arm_actual_wsl_egress_harness(request: Request):
+    rejection = _enforce_execution_window_arm_request(request)
+    if rejection is not None:
+        return rejection
     try:
-        # Phase 3.2 keeps the gate disabled, so this route fails before issue.
+        # A local click creates both one-time nonces; neither is stored in
+        # plaintext and an app restart expires the window.
         return actual_wsl_egress_harness_gate(request).arm()
     except PolicyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -496,7 +523,7 @@ async def arm_actual_wsl_egress_harness(request: Request):
 @app.post("/api/isolation/wsl/egress-harness/actual")
 async def run_actual_wsl_egress_harness(payload: ActualWSLHarnessRequest, request: Request):
     try:
-        return await actual_wsl_egress_harness_gate(request).run(payload.arm_nonce)
+        return await actual_wsl_egress_harness_gate(request).run(payload.window_nonce, payload.arm_nonce)
     except PolicyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 

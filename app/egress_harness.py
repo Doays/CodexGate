@@ -12,6 +12,7 @@ import hashlib
 import shutil
 import tempfile
 import time
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -19,7 +20,7 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 from .egress_broker import FakeUnixBroker, fixed_client_request
-from .egress_contract import AUTH_UNCONFIGURED
+from .egress_contract import AUTH_UNCONFIGURED, validate_sealed_execution_proof
 from .egress_relay import (
     HARNESS_TOTAL_TIMEOUT_SECONDS,
     PROCESS_OUTPUT_LIMIT_BYTES,
@@ -28,7 +29,7 @@ from .egress_relay import (
     FakeLoopbackRelay,
     build_relay_launch_spec,
 )
-from .policy import PolicyError
+from .policy import PolicyError, sha256_json
 
 
 READY = "READY"
@@ -348,45 +349,82 @@ class SealedEgressHarnessService:
 
 
 class ActualWSLHarnessGate:
-    """One-time local authorization in front of the actual WSL runner.
+    """Fail-closed, one-time execution window for the actual WSL runner.
 
-    Production keeps ``enabled`` false in Phase 3.1.  Tests may enable the
-    gate with an injected non-process runner to exercise the capability
-    lifecycle without starting WSL.
+    There is no durable enable switch.  A local UI action can only mint a
+    two-minute pair of capabilities after all sealed proof checks pass.
     """
 
-    def __init__(self, store, service: SealedEgressHarnessService, *, enabled: bool = False):
+    WINDOW_TTL_SECONDS = 120
+
+    def __init__(self, store, service: SealedEgressHarnessService):
         self.store = store
         self.service = service
-        self.enabled = bool(enabled)
-        if service.runner_kind != WSL_RUNNER_KIND:
-            raise PolicyError("actual harness requires the WSL runner")
+        self._arm_lock = threading.Lock()
+
+    def _require_actual_runner(self) -> None:
+        # Import lazily to avoid the module-level cycle: the concrete WSL
+        # runner imports HarnessExecution from this module.
+        from .egress_harness_wsl import WSLEgressHarnessRunner
+
+        if self.service.runner_kind != WSL_RUNNER_KIND or not isinstance(self.service.runner, WSLEgressHarnessRunner):
+            raise PolicyError("actual_runner_policy_violation")
+
+    def _sealed_binding(self) -> dict[str, str]:
+        self._require_actual_runner()
+        readiness = self.service.ready()
+        if readiness.get("status") != READY:
+            raise PolicyError(str(readiness.get("error_code") or "actual_harness_not_ready"))
+        contract, error_code = self.service.contract_service.immutable_execution_contract()
+        if contract is None:
+            raise PolicyError(error_code or "stored_contract_required")
+        proof, proof_error = validate_sealed_execution_proof(self.store)
+        if proof is None:
+            raise PolicyError(proof_error or "repro_missing")
+        isolation = self.store.wsl_isolation_result()
+        if not isinstance(isolation, Mapping):
+            raise PolicyError("isolation_identity_missing")
+        fields = {
+            "contract_id": contract.get("contract_id"),
+            "contract_hash": contract.get("contract_hash"),
+            "runner_kind": self.service.runner_kind,
+            "runner_version": self.service.runner_version,
+            "runner_implementation_hash": self.service.runner_implementation_hash,
+            "isolation_config_hash": isolation.get("config_hash"),
+            "tool_fingerprint": isolation.get("tool_fingerprint"),
+            "isolation_cache_key": isolation.get("cache_key"),
+            **proof,
+        }
+        if not all(isinstance(value, str) and value for value in fields.values()):
+            raise PolicyError("execution_window_binding_invalid")
+        return {"binding_hash": sha256_json(fields), **fields}
 
     def arm(self) -> dict[str, Any]:
-        if not self.enabled:
-            raise PolicyError("actual_wsl_harness_disabled")
-        readiness = self.service.ready()
-        if readiness.get("status") != READY:
-            raise PolicyError(str(readiness.get("error_code") or "actual_harness_not_ready"))
-        return self.store.issue_egress_harness_arm(
-            readiness["contract_hash"],
-            self.service.runner_kind,
-            self.service.runner_version,
-            self.service.runner_implementation_hash,
-            ttl_seconds=300,
-        )
+        if not self._arm_lock.acquire(blocking=False):
+            raise PolicyError("execution_window_arm_in_progress")
+        try:
+            binding = self._sealed_binding()
+            window = self.store.issue_egress_execution_window(binding, ttl_seconds=self.WINDOW_TTL_SECONDS)
+            self.store.record_egress_execution_window_ledger(window, "ARM")
+            return window
+        finally:
+            self._arm_lock.release()
 
-    async def run(self, arm_nonce: str | None) -> dict[str, Any]:
-        if not self.enabled:
-            raise PolicyError("actual_wsl_harness_disabled")
-        readiness = self.service.ready()
-        if readiness.get("status") != READY:
-            raise PolicyError(str(readiness.get("error_code") or "actual_harness_not_ready"))
-        self.store.consume_egress_harness_arm(
-            arm_nonce or "",
-            readiness["contract_hash"],
-            self.service.runner_kind,
-            self.service.runner_version,
-            self.service.runner_implementation_hash,
-        )
+    async def run(self, window_nonce: str | None, arm_nonce: str | None) -> dict[str, Any]:
+        self._require_actual_runner()
+        # Both capabilities are claimed before revalidating current state, so
+        # a failed attempt cannot leave either nonce reusable.
+        claimed = self.store.consume_egress_execution_window(window_nonce or "", arm_nonce or "")
+        self.store.record_egress_execution_window_ledger(claimed, "CONSUME")
+        try:
+            current = self._sealed_binding()
+        except PolicyError as exc:
+            self.store.mark_egress_execution_window_blocked(claimed["window_id"], "execution_window_binding_changed")
+            raise PolicyError("execution_window_binding_changed") from exc
+        if current["binding_hash"] != claimed["binding_hash"]:
+            self.store.mark_egress_execution_window_blocked(claimed["window_id"], "execution_window_binding_changed")
+            raise PolicyError("execution_window_binding_changed")
         return await self.service.run()
+
+    def window_status(self) -> dict[str, Any]:
+        return self.store.egress_execution_window()

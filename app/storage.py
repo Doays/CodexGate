@@ -432,6 +432,7 @@ class Store:
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS egress_harness_arms (
                     nonce_hash TEXT PRIMARY KEY,
+                    execution_window_id TEXT,
                     contract_hash TEXT NOT NULL,
                     runner_kind TEXT NOT NULL,
                     runner_version TEXT NOT NULL,
@@ -439,6 +440,29 @@ class Store:
                     issued_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
                     consumed_at TEXT
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS egress_execution_windows (
+                    window_id TEXT PRIMARY KEY,
+                    nonce_hash TEXT NOT NULL UNIQUE,
+                    binding_hash TEXT NOT NULL,
+                    contract_id TEXT NOT NULL,
+                    contract_hash TEXT NOT NULL,
+                    runner_kind TEXT NOT NULL,
+                    runner_version TEXT NOT NULL,
+                    runner_implementation_hash TEXT NOT NULL,
+                    isolation_config_hash TEXT NOT NULL,
+                    tool_fingerprint TEXT NOT NULL,
+                    isolation_cache_key TEXT NOT NULL,
+                    repro_version TEXT NOT NULL,
+                    repro_key TEXT NOT NULL,
+                    repro_result_hash TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('ARMED', 'CONSUMED', 'EXPIRED')),
+                    issued_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    consumed_at TEXT,
+                    error_code TEXT
                 )"""
             )
             conn.execute(
@@ -596,6 +620,7 @@ class Store:
             conn.execute("CREATE INDEX IF NOT EXISTS catalog_scans_source_status ON catalog_scans(source_id, status)")
             conn.execute("CREATE INDEX IF NOT EXISTS format_probes_entry_status ON format_probes(entry_id, status)")
             conn.execute("CREATE INDEX IF NOT EXISTS egress_harness_runs_status ON egress_harness_runs(status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS egress_execution_windows_status ON egress_execution_windows(status)")
             self._migrate_route_plan_uses(conn)
             self._migrate_route_plans(conn)
             self._migrate_bridge_nonces(conn)
@@ -1225,6 +1250,8 @@ class Store:
                    ADD COLUMN runner_implementation_hash TEXT NOT NULL
                    DEFAULT '0000000000000000000000000000000000000000000000000000000000000000'"""
             )
+        if columns and "execution_window_id" not in columns:
+            conn.execute("ALTER TABLE egress_harness_arms ADD COLUMN execution_window_id TEXT")
 
     @staticmethod
     def _migrate_route_plan_uses(conn: sqlite3.Connection) -> None:
@@ -2401,6 +2428,277 @@ class Store:
             "consumed_at": consumed_at,
             "consumed": True,
         }
+
+    @staticmethod
+    def _execution_window_binding(binding: Mapping[str, Any]) -> dict[str, str]:
+        fields = (
+            "binding_hash", "contract_id", "contract_hash", "runner_kind", "runner_version",
+            "runner_implementation_hash", "isolation_config_hash", "tool_fingerprint",
+            "isolation_cache_key", "repro_version", "repro_key", "repro_result_hash",
+        )
+        record = dict(binding)
+        if set(record) != set(fields):
+            raise PolicyError("execution_window_binding_invalid")
+        for field in fields:
+            value = record.get(field)
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+                if field in {"contract_id", "runner_kind", "runner_version", "repro_version"}:
+                    if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,128}", value):
+                        continue
+                raise PolicyError("execution_window_binding_invalid")
+        if record["runner_kind"] != "WSL_SUPERVISOR":
+            raise PolicyError("execution_window_binding_invalid")
+        expected_hash = sha256_json({field: record[field] for field in fields if field != "binding_hash"})
+        if record["binding_hash"] != expected_hash:
+            raise PolicyError("execution_window_binding_invalid")
+        return {field: record[field] for field in fields}
+
+    @staticmethod
+    def _execution_window_public(record: Mapping[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
+        current = now or datetime.now(timezone.utc)
+        status = record["status"]
+        try:
+            expires_at = datetime.fromisoformat(record["expires_at"])
+        except (TypeError, ValueError) as exc:
+            raise PolicyError("execution_window_invalid") from exc
+        if expires_at.tzinfo is None:
+            raise PolicyError("execution_window_invalid")
+        if status == "ARMED" and expires_at <= current:
+            status = "EXPIRED"
+        remaining = max(0, int((expires_at - current).total_seconds())) if status == "ARMED" else 0
+        return {
+            "window_id": record["window_id"],
+            "status": status,
+            "binding_hash": record["binding_hash"],
+            "runner_kind": record["runner_kind"],
+            "runner_version": record["runner_version"],
+            "runner_implementation_hash": record["runner_implementation_hash"],
+            "issued_at": record["issued_at"],
+            "expires_at": record["expires_at"],
+            "remaining_seconds": remaining,
+            "error_code": record.get("error_code"),
+        }
+
+    def issue_egress_execution_window(
+        self,
+        binding: Mapping[str, Any],
+        *,
+        ttl_seconds: int = 120,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Atomically issue the window and legacy arm capability for one run.
+
+        Only SHA-256 nonce digests reach SQLite.  An active window is never
+        extended or refreshed; a new explicit arm is needed after expiry.
+        """
+        sealed = self._execution_window_binding(binding)
+        if ttl_seconds != 120:
+            raise PolicyError("execution_window_ttl_invalid")
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            raise PolicyError("execution_window_time_invalid")
+        expires = current + timedelta(seconds=ttl_seconds)
+        window_nonce = secrets.token_urlsafe(32)
+        arm_nonce = secrets.token_urlsafe(32)
+        window_hash = hashlib.sha256(window_nonce.encode("ascii")).hexdigest()
+        arm_hash = hashlib.sha256(arm_nonce.encode("ascii")).hexdigest()
+        window_id = str(uuid.uuid4())
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """UPDATE egress_execution_windows
+                   SET status='EXPIRED', error_code=COALESCE(error_code, 'execution_window_expired')
+                   WHERE status='ARMED' AND expires_at<=?""",
+                (current.isoformat(),),
+            )
+            active = conn.execute(
+                "SELECT 1 FROM egress_execution_windows WHERE status='ARMED' LIMIT 1"
+            ).fetchone()
+            if active:
+                raise PolicyError("execution_window_already_armed")
+            conn.execute(
+                """INSERT INTO egress_execution_windows
+                   (window_id, nonce_hash, binding_hash, contract_id, contract_hash, runner_kind, runner_version,
+                    runner_implementation_hash, isolation_config_hash, tool_fingerprint, isolation_cache_key,
+                    repro_version, repro_key, repro_result_hash, status, issued_at, expires_at, consumed_at, error_code)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ARMED', ?, ?, NULL, NULL)""",
+                (
+                    window_id, window_hash, sealed["binding_hash"], sealed["contract_id"], sealed["contract_hash"],
+                    sealed["runner_kind"], sealed["runner_version"], sealed["runner_implementation_hash"],
+                    sealed["isolation_config_hash"], sealed["tool_fingerprint"], sealed["isolation_cache_key"],
+                    sealed["repro_version"], sealed["repro_key"], sealed["repro_result_hash"],
+                    current.isoformat(), expires.isoformat(),
+                ),
+            )
+            conn.execute(
+                """INSERT INTO egress_harness_arms
+                   (nonce_hash, execution_window_id, contract_hash, runner_kind, runner_version, runner_implementation_hash,
+                    issued_at, expires_at, consumed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
+                (
+                    arm_hash, window_id, sealed["contract_hash"], sealed["runner_kind"], sealed["runner_version"],
+                    sealed["runner_implementation_hash"], current.isoformat(), expires.isoformat(),
+                ),
+            )
+        public = self._execution_window_public({
+            "window_id": window_id, "status": "ARMED", "binding_hash": sealed["binding_hash"],
+            "runner_kind": sealed["runner_kind"], "runner_version": sealed["runner_version"],
+            "runner_implementation_hash": sealed["runner_implementation_hash"],
+            "issued_at": current.isoformat(), "expires_at": expires.isoformat(), "error_code": None,
+        }, now=current)
+        return {**public, "window_nonce": window_nonce, "arm_nonce": arm_nonce}
+
+    def consume_egress_execution_window(
+        self,
+        window_nonce: str,
+        arm_nonce: str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Claim both one-time nonces before any actual runner validation."""
+        if not isinstance(window_nonce, str) or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", window_nonce):
+            raise PolicyError("execution_window_required")
+        if not isinstance(arm_nonce, str) or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", arm_nonce):
+            raise PolicyError("arm_required")
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            raise PolicyError("execution_window_time_invalid")
+        window_hash = hashlib.sha256(window_nonce.encode("ascii")).hexdigest()
+        arm_hash = hashlib.sha256(arm_nonce.encode("ascii")).hexdigest()
+        failure: str | None = None
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            window = conn.execute(
+                """SELECT window_id, binding_hash, contract_id, contract_hash, runner_kind, runner_version,
+                          runner_implementation_hash, isolation_config_hash, tool_fingerprint, isolation_cache_key,
+                          repro_version, repro_key, repro_result_hash, status, issued_at, expires_at, consumed_at, error_code
+                   FROM egress_execution_windows WHERE nonce_hash=?""",
+                (window_hash,),
+            ).fetchone()
+            arm = conn.execute(
+                """SELECT execution_window_id, contract_hash, runner_kind, runner_version, runner_implementation_hash,
+                          issued_at, expires_at, consumed_at
+                   FROM egress_harness_arms WHERE nonce_hash=?""",
+                (arm_hash,),
+            ).fetchone()
+            if not window:
+                raise PolicyError("execution_window_invalid")
+            if not arm:
+                raise PolicyError("arm_invalid")
+            fields = (
+                "window_id", "binding_hash", "contract_id", "contract_hash", "runner_kind", "runner_version",
+                "runner_implementation_hash", "isolation_config_hash", "tool_fingerprint", "isolation_cache_key",
+                "repro_version", "repro_key", "repro_result_hash", "status", "issued_at", "expires_at", "consumed_at", "error_code",
+            )
+            record = dict(zip(fields, window))
+            if arm[0] != record["window_id"] or tuple(arm[1:5]) != (
+                record["contract_hash"], record["runner_kind"], record["runner_version"],
+                record["runner_implementation_hash"],
+            ):
+                raise PolicyError("execution_window_arm_binding_changed")
+            try:
+                expires_at = datetime.fromisoformat(record["expires_at"])
+                arm_expires_at = datetime.fromisoformat(arm[6])
+            except (TypeError, ValueError) as exc:
+                raise PolicyError("execution_window_invalid") from exc
+            if record["status"] != "ARMED" or record["consumed_at"] is not None:
+                raise PolicyError("execution_window_reused")
+            if arm[7] is not None:
+                raise PolicyError("arm_reused")
+            consumed_at = current.isoformat()
+            if expires_at.tzinfo is None or expires_at <= current:
+                failure = "execution_window_expired"
+                next_status = "EXPIRED"
+            elif arm_expires_at.tzinfo is None or arm_expires_at <= current:
+                failure = "arm_expired"
+                next_status = "CONSUMED"
+            else:
+                next_status = "CONSUMED"
+            conn.execute(
+                """UPDATE egress_execution_windows
+                   SET status=?, consumed_at=?, error_code=?
+                   WHERE nonce_hash=? AND status='ARMED' AND consumed_at IS NULL""",
+                (next_status, consumed_at, failure, window_hash),
+            )
+            conn.execute(
+                "UPDATE egress_harness_arms SET consumed_at=? WHERE nonce_hash=? AND consumed_at IS NULL",
+                (consumed_at, arm_hash),
+            )
+            record.update({"status": next_status, "consumed_at": consumed_at, "error_code": failure})
+        if failure:
+            raise PolicyError(failure)
+        return record
+
+    def mark_egress_execution_window_blocked(self, window_id: str, error_code: str) -> None:
+        if not isinstance(window_id, str) or not re.fullmatch(r"[0-9a-f-]{36}", window_id):
+            raise PolicyError("execution_window_invalid")
+        if not isinstance(error_code, str) or not re.fullmatch(r"[a-z0-9_]{1,80}", error_code):
+            raise PolicyError("execution_window_invalid")
+        with self._connection() as conn:
+            conn.execute(
+                """UPDATE egress_execution_windows SET error_code=?
+                   WHERE window_id=? AND status='CONSUMED'""",
+                (error_code, window_id),
+            )
+
+    def egress_execution_window(self) -> dict[str, Any]:
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT window_id, binding_hash, contract_id, contract_hash, runner_kind, runner_version,
+                          runner_implementation_hash, isolation_config_hash, tool_fingerprint, isolation_cache_key,
+                          repro_version, repro_key, repro_result_hash, status, issued_at, expires_at, consumed_at, error_code
+                   FROM egress_execution_windows ORDER BY issued_at DESC LIMIT 1"""
+            ).fetchone()
+        if not row:
+            return {"status": "DISABLED", "remaining_seconds": 0, "binding_hash": None, "error_code": None}
+        fields = (
+            "window_id", "binding_hash", "contract_id", "contract_hash", "runner_kind", "runner_version",
+            "runner_implementation_hash", "isolation_config_hash", "tool_fingerprint", "isolation_cache_key",
+            "repro_version", "repro_key", "repro_result_hash", "status", "issued_at", "expires_at", "consumed_at", "error_code",
+        )
+        return self._execution_window_public(dict(zip(fields, row)))
+
+    def recover_armed_egress_execution_windows(self) -> int:
+        """A process restart never preserves authorization to start the runner."""
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """UPDATE egress_execution_windows
+                   SET status='EXPIRED', error_code=COALESCE(error_code, 'execution_window_restart_expired')
+                   WHERE status='ARMED'"""
+            )
+        return int(cursor.rowcount)
+
+    def record_egress_execution_window_ledger(self, window: Mapping[str, Any], action: str) -> dict[str, Any]:
+        if action not in {"ARM", "CONSUME"}:
+            raise PolicyError("execution_window_ledger_invalid")
+        window_id = window.get("window_id") if isinstance(window.get("window_id"), str) else "unknown"
+        occurred_at = window.get("consumed_at") if action == "CONSUME" else window.get("issued_at")
+        if not isinstance(occurred_at, str):
+            occurred_at = _now()
+        record = {
+            "source_event_id": f"egress-execution-window:{window_id}:{action}",
+            "source": "LOCAL_ESTIMATE", "quality": "OBSERVED", "event_type": "WSL_EGRESS_EXECUTION_WINDOW",
+            "status": window.get("status") if isinstance(window.get("status"), str) else "ERROR",
+            "action": action, "binding_hash": window.get("binding_hash"),
+            "window_arms": 1 if action == "ARM" else 0,
+            "window_consumes": 1 if action == "CONSUME" else 0,
+            "tokens": 0, "app_server_rpc_calls": 0, "occurred_at": occurred_at,
+        }
+        digest = sha256_json(record)
+        with self._connection() as conn:
+            existing = conn.execute("SELECT payload, integrity_hash FROM ledger_usage_events WHERE source_event_id=?", (record["source_event_id"],)).fetchone()
+            if existing:
+                if existing[1] != digest:
+                    raise PolicyError("execution window ledger event was reused with different content")
+                return {**json.loads(existing[0]), "integrity_hash": existing[1]}
+            conn.execute(
+                """INSERT INTO ledger_usage_events
+                   (event_id, source_event_id, source, quality, event_type, status, payload, integrity_hash, occurred_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str(uuid.uuid4()), record["source_event_id"], record["source"], record["quality"], record["event_type"],
+                 record["status"], json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")), digest, occurred_at),
+            )
+        return {**record, "integrity_hash": digest}
 
     def record_egress_harness_ledger(self, result: Mapping[str, Any]) -> dict[str, Any]:
         checked_at = result.get("finished_at") if isinstance(result.get("finished_at"), str) else _now()

@@ -430,6 +430,9 @@ class WSLEgressHarnessRunner:
     """Dormant actual runner with strict implementation and proof binding."""
 
     runner_kind = WSL_RUNNER_KIND
+    # The gate uses this sealed identity rather than any generic/fake runner.
+    # It does not alter the child-code/argv implementation hash.
+    is_actual_wsl_runner = True
     runner_implementation_hash = RUNNER_IMPLEMENTATION_HASH
     runner_version = WSL_EGRESS_RUNNER_VERSION
 
