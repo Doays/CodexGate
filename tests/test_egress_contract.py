@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import tomllib
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -12,6 +13,7 @@ import app.egress_contract as egress_contract
 from app.egress_contract import (
     AUTH_UNCONFIGURED,
     BLOCKED,
+    CONTRACT_READY,
     BROKER_SOCKET_PATH,
     BROKER_TIMEOUT_SECONDS,
     CUSTOM_PROVIDER_ID,
@@ -243,6 +245,72 @@ def test_contract_blocks_legacy_runtime_identity_until_official_preflight_refres
     assert len(runner.calls) == 2
     ready = service.create()
     assert ready["status"] == AUTH_UNCONFIGURED
+
+
+def test_old_blocked_snapshot_does_not_mask_a_fresh_runtime_preview(tmp_path):
+    store, runtime, _ = _ready(tmp_path)
+    service = SealedEgressContractService(store)
+    blocked = service._save_failure("runtime_identity_missing", time.monotonic())
+    assert blocked["status"] == BLOCKED
+    preview = service.preview()
+    assert preview["status"] == CONTRACT_READY
+    assert preview["preview_hash"] and preview["current_binding_hash"]
+    assert service.current()["status"] == CONTRACT_READY
+    assert service.current()["error_code"] == "auth_unconfigured"
+    with store._connection() as conn:
+        row = conn.execute("SELECT status, payload FROM sealed_egress_contracts WHERE singleton=1").fetchone()
+    assert row[0] == BLOCKED
+    assert json.loads(row[1])["error_code"] == "runtime_identity_missing"
+    service._save_failure("contract_binding_changed", time.monotonic())
+    preview = service.preview()
+    assert preview["status"] == CONTRACT_READY
+    assert preview["error_code"] == "auth_unconfigured"
+    assert service.current()["preview_hash"] == preview["preview_hash"]
+
+
+def test_read_only_preview_does_not_change_database(tmp_path):
+    store, _, _ = _ready(tmp_path)
+    service = SealedEgressContractService(store)
+    with store._connection() as conn:
+        before = conn.execute("SELECT status, payload, integrity_hash FROM sealed_egress_contracts WHERE singleton=1").fetchone()
+    preview = service.preview()
+    with store._connection() as conn:
+        after = conn.execute("SELECT status, payload, integrity_hash FROM sealed_egress_contracts WHERE singleton=1").fetchone()
+    assert preview["status"] == CONTRACT_READY
+    assert before == after
+
+
+def test_stale_preview_hash_is_rejected_and_latest_preview_is_idempotent(tmp_path):
+    store, runtime, runner = _ready(tmp_path)
+    service = SealedEgressContractService(store)
+    old_hash = service.preview()["preview_hash"]
+    runner.sha256 = "d" * 64
+    asyncio.run(runtime.preflight())
+    stale = service.create(old_hash)
+    assert stale["status"] == BLOCKED
+    assert stale["error_code"] == "preview_stale"
+    latest = service.preview()
+    created = service.create(latest["preview_hash"])
+    assert created["status"] == AUTH_UNCONFIGURED
+    reused = service.create(latest["preview_hash"])
+    assert reused["reused"] is True
+    assert reused["contract_hash"] == created["contract_hash"]
+
+
+def test_binding_changes_require_a_new_preview_and_do_not_modify_old_instance(tmp_path):
+    store, runtime, runner = _ready(tmp_path)
+    service = SealedEgressContractService(store)
+    first_preview = service.preview()
+    first = service.create(first_preview["preview_hash"])
+    runner.sha256 = "e" * 64
+    asyncio.run(runtime.preflight())
+    second_preview = service.preview()
+    assert second_preview["status"] == CONTRACT_READY
+    assert second_preview["preview_hash"] != first_preview["preview_hash"]
+    old = store.egress_contract_instance(first["contract_hash"])
+    assert old["contract_hash"] == first["contract_hash"]
+    assert service.current()["status"] == BLOCKED
+    assert service.current()["error_code"] == "contract_binding_changed"
 
 
 def test_preview_and_generated_instance_hash_mismatch_holds_before_immutable_save(tmp_path, monkeypatch):

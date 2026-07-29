@@ -226,4 +226,23 @@ Token Savings Ledger Phase 1 records observed, imported, and estimated usage sig
 
 It tracks ledger runs, usage events, and manually imported baselines, then exports a JSON or Markdown summary through the `/api/token-ledger/*` endpoints.
 
+## Contract preview and immutable instances
+
+The egress-contract preview is a pure read operation. It recomputes a
+`current_binding_hash` and `preview_hash` from the complete runtime identity
+(identity version, runtime and launch-spec digests, binary digest), current
+Isolation identity, Repro proof, provider configuration, and policy version.
+It never grants Runtime or Harness permission and never writes a database row.
+
+The older singleton table is retained as an audit trail for blocked outcomes,
+but a blocked snapshot is never returned as the current preview after the
+environment changes. Immutable instances live in their separate instance table
+and remain bound to the identity with which they were created. A creation
+request must provide the current `expected_preview_hash`; the transaction
+recomputes the binding and rejects stale values with `preview_stale`. Matching
+identity and hash requests are idempotent and return the existing instance.
+The HTTP API exposes `GET /api/isolation/wsl/egress-contract/preview` and
+requires the hash in the POST body. Authentication remains unconfigured and
+all starts remain locked.
+
 If no successful live run has been recorded, the report shows `실제 토큰 절감 미측정`.

@@ -2045,14 +2045,9 @@ class Store:
 
     def sealed_egress_contract(self) -> dict[str, Any] | None:
         """Return the latest immutable instance, falling back only for Phase 1 rows."""
-        with self._connection() as conn:
-            instance = conn.execute(
-                """SELECT contract_id, contract_hash, preview_hash, runtime_fingerprint, isolation_cache_key,
-                          binary_sha256, provider_config_hash, policy_version, status, created_at, payload, integrity_hash
-                   FROM sealed_egress_contract_instances ORDER BY created_at DESC, contract_id DESC LIMIT 1"""
-            ).fetchone()
+        instance = self.latest_sealed_egress_contract_instance()
         if instance:
-            return self._decode_sealed_egress_contract_instance(instance)
+            return instance
         with self._connection() as conn:
             row = conn.execute(
                 """SELECT status, checked_at, contract_hash, runtime_fingerprint, isolation_cache_key, payload, integrity_hash
@@ -2074,6 +2069,16 @@ class Store:
             raise PolicyError("sealed egress contract integrity check failed")
         return {**record, "integrity_hash": row[6]}
 
+    def latest_sealed_egress_contract_instance(self) -> dict[str, Any] | None:
+        """Return only an immutable instance; never fall back to a BLOCKED snapshot."""
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT contract_id, contract_hash, preview_hash, runtime_fingerprint, isolation_cache_key,
+                          binary_sha256, provider_config_hash, policy_version, status, created_at, payload, integrity_hash
+                   FROM sealed_egress_contract_instances ORDER BY created_at DESC, contract_id DESC LIMIT 1"""
+            ).fetchone()
+        return self._decode_sealed_egress_contract_instance(row) if row else None
+
     @staticmethod
     def _validate_sealed_egress_contract_instance(record: Mapping[str, Any]) -> dict[str, Any]:
         value = dict(record)
@@ -2084,7 +2089,9 @@ class Store:
             "auth_status", "start_allowed", "error_code", "local_duration_ms",
         }
         proof_fields = {"repro_version", "repro_key", "repro_result_hash"}
-        if not required <= set(value) or set(value) - required not in (set(), proof_fields):
+        binding_fields = {"current_binding_hash", "runtime_identity_version", "launch_spec_hash", "isolation_config_hash", "isolation_tool_fingerprint"}
+        allowed_optional = set(), proof_fields, binding_fields, proof_fields | binding_fields
+        if not required <= set(value) or set(value) - required not in allowed_optional:
             raise PolicyError("sealed egress contract instance fields are invalid")
         try:
             uuid.UUID(str(value["contract_id"]))
@@ -2105,6 +2112,11 @@ class Store:
                     raise PolicyError("sealed egress Repro digest is invalid")
         if value["preview_hash"] != value["contract_hash"]:
             raise PolicyError("sealed egress contract preview hash does not match")
+        for field in ("current_binding_hash", "launch_spec_hash", "isolation_config_hash", "isolation_tool_fingerprint"):
+            if field in value and (not isinstance(value[field], str) or not re.fullmatch(r"[0-9a-f]{64}", value[field])):
+                raise PolicyError("sealed egress immutable binding digest is invalid")
+        if "runtime_identity_version" in value and value["runtime_identity_version"] != RUNTIME_IDENTITY_VERSION:
+            raise PolicyError("sealed egress runtime identity version is invalid")
         if value["contract_policy_version"] != "sealed-egress-contract-v1":
             raise PolicyError("sealed egress contract policy version is invalid")
         if value["endpoint_type"] != "LOOPBACK_HTTP_V1" or value["relay_status"] != "RELAY_MISSING" or value["broker_status"] != "BROKER_MISSING":
@@ -2134,6 +2146,8 @@ class Store:
     def create_sealed_egress_contract_instance(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Atomically preserve a user-created immutable contract, or return its exact twin."""
         record = self._validate_sealed_egress_contract_instance(payload)
+        if not isinstance(record.get("current_binding_hash"), str) or not re.fullmatch(r"[0-9a-f]{64}", record["current_binding_hash"]):
+            raise PolicyError("sealed egress immutable instance requires current binding hash")
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(

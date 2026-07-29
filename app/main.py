@@ -21,7 +21,7 @@ from .gateway import Gate
 from .isolation_wsl import LocalWSLCommandRunner, WSLBubblewrapIsolation, public_result as public_wsl_isolation_result
 from .isolation_repro import IsolationReproService, public_repro_result
 from .wsl_codex_runtime import WSLCodexRuntime, public_runtime_result
-from .egress_contract import SealedEgressContractService, public_contract_result
+from .egress_contract import SealedEgressContractService, public_contract_preview, public_contract_result
 from .egress_harness import (
     ActualWSLHarnessGate,
     FAKE_RUNNER_IMPLEMENTATION_HASH,
@@ -168,6 +168,12 @@ class WSLCodexRuntimeConfigRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     binary_path: str = Field(min_length=1, max_length=512)
+
+
+class EgressContractCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_preview_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class ActualWSLHarnessRequest(BaseModel):
@@ -446,17 +452,26 @@ async def wsl_codex_runtime_preflight(request: Request):
 @app.get("/api/isolation/wsl/egress-contract")
 async def sealed_egress_contract_status(request: Request):
     try:
-        return public_contract_result(sealed_egress_contract(request).current())
+        current = sealed_egress_contract(request).current()
+        return public_contract_preview(current) if isinstance(current, dict) and current.get("preview_only") else public_contract_result(current)
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.get("/api/isolation/wsl/egress-contract/preview")
+async def sealed_egress_contract_preview(request: Request):
+    try:
+        return public_contract_preview(sealed_egress_contract(request).preview())
     except Exception as exc:
         raise as_http_error(exc) from exc
 
 
 @app.post("/api/isolation/wsl/egress-contract")
-async def create_sealed_egress_contract(request: Request):
+async def create_sealed_egress_contract(payload: EgressContractCreateRequest, request: Request):
     try:
         # Contract construction is pure local serialization and SQLite storage;
         # it starts neither a relay nor a Codex process.
-        return public_contract_result(sealed_egress_contract(request).create())
+        return public_contract_result(sealed_egress_contract(request).create(payload.expected_preview_hash))
     except Exception as exc:
         raise as_http_error(exc) from exc
 

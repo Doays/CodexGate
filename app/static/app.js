@@ -443,8 +443,13 @@ async function createSealedEgressContract() {
   const button = $("create-wsl-egress-contract");
   try {
     button.disabled = true;
-    say("Creating the sealed local egress contract without starting a relay or Codex...");
-    const result = await api("/api/isolation/wsl/egress-contract", { method: "POST" });
+    say("Refreshing the sealed contract preview before creating an immutable instance...");
+    const preview = await api("/api/isolation/wsl/egress-contract/preview");
+    if (!preview.preview_hash) throw new Error(preview.error_code || "contract preview is not ready");
+    const result = await api("/api/isolation/wsl/egress-contract", {
+      method: "POST",
+      body: JSON.stringify({ expected_preview_hash: preview.preview_hash }),
+    });
     renderSealedEgressContract(result);
     renderSealedEgressHarness(await api("/api/isolation/wsl/egress-harness"));
     renderActualWSLEgressHarness(await api("/api/isolation/wsl/egress-harness/actual"));
