@@ -230,6 +230,8 @@ class WSLCodexRuntime:
         contract = self.store.sealed_egress_contract()
         if not contract:
             raise PolicyError("WSL Codex runtime start is blocked: egress contract is unconfigured")
+        if contract.get("preview_hash") is not None and contract.get("preview_hash") != contract.get("contract_hash"):
+            raise PolicyError("WSL Codex runtime start is blocked: egress contract hash mismatch")
         if contract.get("status") == "AUTH_UNCONFIGURED":
             raise PolicyError("WSL Codex runtime start is blocked: egress authentication is unconfigured")
         raise PolicyError("WSL Codex runtime start is blocked: sealed egress is not ready")

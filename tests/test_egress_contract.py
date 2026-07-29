@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import app.egress_contract as egress_contract
+
 from app.egress_contract import (
     AUTH_UNCONFIGURED,
     BLOCKED,
@@ -206,7 +208,7 @@ def test_saved_and_public_contracts_never_include_toml_token_credentials_or_user
     assert "CODEXGATE_EPHEMERAL_TOKEN" in serialized
     assert "not-a-real-token" not in serialized
     assert set(public) == {
-        "status", "checked_at", "contract_hash", "endpoint_type", "relay_status",
+        "contract_id", "preview_hash", "status", "checked_at", "contract_hash", "endpoint_type", "relay_status",
         "broker_status", "auth_status", "start_allowed", "error_code",
     }
 
@@ -217,3 +219,23 @@ def test_contract_cannot_be_created_without_a_current_sealed_runtime(tmp_path):
     assert result["status"] == BLOCKED
     assert result["error_code"] == "runtime_not_ready"
     assert result["start_allowed"] is False
+
+
+def test_preview_and_generated_instance_hash_mismatch_holds_before_immutable_save(tmp_path, monkeypatch):
+    store, _, _ = _ready(tmp_path)
+    original = egress_contract.build_private_contract
+    calls = 0
+
+    def mismatching_instance(**kwargs):
+        nonlocal calls
+        calls += 1
+        result = original(**kwargs)
+        if calls == 2:
+            result = {**result, "contract_hash": "d" * 64}
+        return result
+
+    monkeypatch.setattr(egress_contract, "build_private_contract", mismatching_instance)
+    result = SealedEgressContractService(store).create()
+    assert result["status"] == BLOCKED
+    assert result["error_code"] == "preview_hash_mismatch"
+    assert store.egress_contract_instance("d" * 64) is None

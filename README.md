@@ -122,6 +122,14 @@ The contract permits exactly `http://127.0.0.1:8788/v1` inside the sandbox and o
 
 The contract hash binds the runtime fingerprint, WSL isolation cache key, binary SHA-256, provider-config SHA-256, and contract policy version. Any binding change makes it unusable. With relay, broker, and authentication intentionally absent, the persisted final state is `AUTH_UNCONFIGURED`; runtime start, live execution, Workspace Write, and Ultra all remain locked. Token Ledger records only local contract construction count and duration, with zero tokens and zero app-server RPC calls.
 
+### Sealed Egress Local Harness Phase 2
+
+An explicit contract creation stores one immutable SQLite instance. Its preview hash must equal the stored contract hash, and an identical runtime, isolation, binary, provider, and policy identity returns the same instance rather than creating a duplicate. The harness is bound to that instance and is `READY` only while the current runtime fingerprint, isolation key, and contract hash still match.
+
+Phase 2 supplies a deterministic **fake runner only**. It models a bubblewrap-local `127.0.0.1:8788` relay forwarding exactly one `POST /v1/responses` request to one AF_UNIX broker boundary. The broker strips `Authorization`, `Cookie`, and `Proxy-*`, rejects CONNECT, absolute-form targets, redirects, other hosts/methods/paths, and enforces the sealed 256 KB request, 2 MB response, and 120-second contract limits. Its fake Responses-shaped result has a canonical deterministic hash. It never opens an actual Unix socket, loopback listener, WSL process, bwrap process, Codex process, DNS lookup, or external connection.
+
+The modeled launch policy clears the environment, allows only fixed `PATH`, `HOME`, `TMPDIR`, and `LANG`, uses an execution-private socket-directory placeholder only, and never binds `/mnt`, a Windows path, a Source Root, or the data root. Harness summaries retain only status, request/response sizes, response hash, counters, duration, and sanitized errors; they retain no body, credential, argv, socket path, or raw output. Startup converts orphaned `RUNNING` summaries to `ERROR/harness_interrupted`; matching concurrent requests are single-flight. A passing fake harness does not alter `AUTH_UNCONFIGURED`: Runtime start, ordinary live runs, Workspace Write, and Ultra remain locked.
+
 - Only `127.0.0.1` and `localhost` are accepted as `Host`
 - If `Origin` is present, it must match the same local origin
 - `project_id` must be a safe slug or UUID

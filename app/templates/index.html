@@ -119,6 +119,13 @@
         </div>
         <p class="hint">The contract permits one loopback Responses endpoint and one future Unix-socket broker boundary. Authentication remains unconfigured and all starts stay locked.</p>
       </div>
+      <div class="wsl-harness-panel">
+        <div class="panel-title"><span>LOCAL HARNESS</span><h2>Phase 2 fake verification</h2><span id="wsl-harness-status" class="status">BLOCKED</span></div>
+        <p id="wsl-harness-result" class="hint">The immutable contract can be checked only by the deterministic fake runner in this phase. No WSL process, socket listener, relay, Codex process, or network request starts from this UI.</p>
+        <div class="row wsl-isolation-actions">
+          <button id="run-wsl-egress-harness" class="button ghost" type="button" disabled>Run deterministic fake harness</button>
+        </div>
+      </div>
     </section>
 
     <section class="panel router-preview-panel">

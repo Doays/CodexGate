@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import re
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Mapping
 from urllib.parse import urlsplit
@@ -228,7 +229,7 @@ def public_contract_result(result: Mapping[str, Any] | None) -> dict[str, Any]:
     if not isinstance(result, Mapping):
         return {"status": UNCONFIGURED, "start_allowed": False, "endpoint_type": "UNCONFIGURED"}
     fields = (
-        "status", "checked_at", "contract_hash", "endpoint_type", "relay_status",
+        "contract_id", "preview_hash", "status", "checked_at", "contract_hash", "endpoint_type", "relay_status",
         "broker_status", "auth_status", "start_allowed", "error_code",
     )
     return {field: result.get(field) for field in fields if field in result}
@@ -248,15 +249,26 @@ class SealedEgressContractService:
         if problem:
             return self._save_failure(problem, started)
         assert runtime is not None and isolation is not None
+        preview = build_private_contract(
+            runtime_fingerprint=runtime["runtime_fingerprint"],
+            isolation_cache_key=isolation["cache_key"],
+            binary_sha256=runtime["binary_sha256"],
+        )
+        # A creation request seals a freshly materialized instance, not a UI
+        # preview object.  Both must produce the same canonical identity.
         private = build_private_contract(
             runtime_fingerprint=runtime["runtime_fingerprint"],
             isolation_cache_key=isolation["cache_key"],
             binary_sha256=runtime["binary_sha256"],
         )
         snapshot = provider_snapshot()
+        checked_at = _now()
         result = {
+            "contract_id": str(uuid.uuid4()),
+            "preview_hash": preview["contract_hash"],
+            "created_at": checked_at,
             "status": AUTH_UNCONFIGURED,
-            "checked_at": _now(),
+            "checked_at": checked_at,
             "contract_hash": private["contract_hash"],
             "runtime_fingerprint": runtime["runtime_fingerprint"],
             "isolation_cache_key": isolation["cache_key"],
@@ -272,7 +284,11 @@ class SealedEgressContractService:
             "error_code": "auth_unconfigured",
             "local_duration_ms": max(0, round((time.monotonic() - started) * 1000)),
         }
-        saved = self.store.save_sealed_egress_contract(result)
+        # Preview and immutable instance hashes are deliberately compared before
+        # the SQLite write.  A mismatch is a HOLD, never a best-effort save.
+        if result["preview_hash"] != result["contract_hash"]:
+            return self._save_failure("preview_hash_mismatch", started)
+        saved = self.store.create_sealed_egress_contract_instance(result)
         self.store.record_sealed_egress_contract_ledger(saved)
         return saved
 

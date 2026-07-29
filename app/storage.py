@@ -397,6 +397,34 @@ class Store:
                 )"""
             )
             conn.execute(
+                """CREATE TABLE IF NOT EXISTS sealed_egress_contract_instances (
+                    contract_id TEXT PRIMARY KEY,
+                    contract_hash TEXT NOT NULL UNIQUE,
+                    preview_hash TEXT NOT NULL,
+                    runtime_fingerprint TEXT NOT NULL,
+                    isolation_cache_key TEXT NOT NULL,
+                    binary_sha256 TEXT NOT NULL,
+                    provider_config_hash TEXT NOT NULL,
+                    policy_version TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    integrity_hash TEXT NOT NULL,
+                    UNIQUE(runtime_fingerprint, isolation_cache_key, binary_sha256, provider_config_hash, policy_version)
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS egress_harness_runs (
+                    harness_id TEXT PRIMARY KEY,
+                    contract_hash TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    payload TEXT NOT NULL,
+                    integrity_hash TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
                 """CREATE TABLE IF NOT EXISTS wsl_isolation_probe_results (
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                     backend TEXT NOT NULL,
@@ -550,6 +578,7 @@ class Store:
             conn.execute("CREATE INDEX IF NOT EXISTS catalog_entries_source_generation ON catalog_entries(source_id, scan_generation)")
             conn.execute("CREATE INDEX IF NOT EXISTS catalog_scans_source_status ON catalog_scans(source_id, status)")
             conn.execute("CREATE INDEX IF NOT EXISTS format_probes_entry_status ON format_probes(entry_id, status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS egress_harness_runs_status ON egress_harness_runs(status)")
             self._migrate_route_plan_uses(conn)
             self._migrate_route_plans(conn)
             self._migrate_bridge_nonces(conn)
@@ -1789,6 +1818,15 @@ class Store:
         return {**record, "integrity_hash": integrity_hash}
 
     def sealed_egress_contract(self) -> dict[str, Any] | None:
+        """Return the latest immutable instance, falling back only for Phase 1 rows."""
+        with self._connection() as conn:
+            instance = conn.execute(
+                """SELECT contract_id, contract_hash, preview_hash, runtime_fingerprint, isolation_cache_key,
+                          binary_sha256, provider_config_hash, policy_version, status, created_at, payload, integrity_hash
+                   FROM sealed_egress_contract_instances ORDER BY created_at DESC, contract_id DESC LIMIT 1"""
+            ).fetchone()
+        if instance:
+            return self._decode_sealed_egress_contract_instance(instance)
         with self._connection() as conn:
             row = conn.execute(
                 """SELECT status, checked_at, contract_hash, runtime_fingerprint, isolation_cache_key, payload, integrity_hash
@@ -1809,6 +1847,270 @@ class Store:
         if sha256_json(record) != row[6]:
             raise PolicyError("sealed egress contract integrity check failed")
         return {**record, "integrity_hash": row[6]}
+
+    @staticmethod
+    def _validate_sealed_egress_contract_instance(record: Mapping[str, Any]) -> dict[str, Any]:
+        value = dict(record)
+        required = {
+            "contract_id", "preview_hash", "created_at", "status", "checked_at", "contract_hash",
+            "runtime_fingerprint", "isolation_cache_key", "binary_sha256", "provider_config_hash",
+            "contract_policy_version", "endpoint_type", "provider_snapshot", "relay_status", "broker_status",
+            "auth_status", "start_allowed", "error_code", "local_duration_ms",
+        }
+        if set(value) != required:
+            raise PolicyError("sealed egress contract instance fields are invalid")
+        try:
+            uuid.UUID(str(value["contract_id"]))
+        except (ValueError, TypeError) as exc:
+            raise PolicyError("sealed egress contract instance id is invalid") from exc
+        if value["status"] != "AUTH_UNCONFIGURED" or value["auth_status"] != "AUTH_UNCONFIGURED":
+            raise PolicyError("sealed egress contract instance must remain auth-unconfigured")
+        if value["start_allowed"] is not False or value["error_code"] != "auth_unconfigured":
+            raise PolicyError("sealed egress contract instance must remain start-blocked")
+        for field in ("preview_hash", "contract_hash", "runtime_fingerprint", "isolation_cache_key", "binary_sha256", "provider_config_hash"):
+            if not isinstance(value.get(field), str) or not re.fullmatch(r"[0-9a-f]{64}", value[field]):
+                raise PolicyError("sealed egress contract instance digest is invalid")
+        if value["preview_hash"] != value["contract_hash"]:
+            raise PolicyError("sealed egress contract preview hash does not match")
+        if value["contract_policy_version"] != "sealed-egress-contract-v1":
+            raise PolicyError("sealed egress contract policy version is invalid")
+        if value["endpoint_type"] != "LOOPBACK_HTTP_V1" or value["relay_status"] != "RELAY_MISSING" or value["broker_status"] != "BROKER_MISSING":
+            raise PolicyError("sealed egress contract instance state is invalid")
+        if not all(isinstance(value.get(field), str) and value[field] for field in ("created_at", "checked_at")):
+            raise PolicyError("sealed egress contract instance timestamp is invalid")
+        if not isinstance(value["local_duration_ms"], int) or value["local_duration_ms"] < 0:
+            raise PolicyError("sealed egress contract instance duration is invalid")
+        snapshot = value["provider_snapshot"]
+        expected_snapshot = {
+            "provider_id", "endpoint_type", "wire_api", "requires_openai_auth", "env_key_name",
+            "supports_websockets", "request_max_retries", "stream_max_retries",
+        }
+        if not isinstance(snapshot, dict) or set(snapshot) != expected_snapshot:
+            raise PolicyError("sealed egress provider snapshot is invalid")
+        if (snapshot.get("provider_id") != "codexgate-sealed" or snapshot.get("endpoint_type") != "LOOPBACK_HTTP_V1"
+                or snapshot.get("wire_api") != "responses" or snapshot.get("requires_openai_auth") is not False
+                or snapshot.get("env_key_name") != "CODEXGATE_EPHEMERAL_TOKEN" or snapshot.get("supports_websockets") is not False
+                or snapshot.get("request_max_retries") != 0 or snapshot.get("stream_max_retries") != 0):
+            raise PolicyError("sealed egress provider snapshot is not closed")
+        serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        forbidden = ("authorization", "cookie", "proxy-", "config_toml", "credential", "api_key", "secret", "path", "argv", "environment")
+        if any(token in serialized.casefold() for token in forbidden):
+            raise PolicyError("sealed egress contract instance includes sensitive material")
+        return value
+
+    def create_sealed_egress_contract_instance(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Atomically preserve a user-created immutable contract, or return its exact twin."""
+        record = self._validate_sealed_egress_contract_instance(payload)
+        identity = (
+            record["runtime_fingerprint"], record["isolation_cache_key"], record["binary_sha256"],
+            record["provider_config_hash"], record["contract_policy_version"],
+        )
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """SELECT contract_id, contract_hash, preview_hash, runtime_fingerprint, isolation_cache_key,
+                          binary_sha256, provider_config_hash, policy_version, status, created_at, payload, integrity_hash
+                   FROM sealed_egress_contract_instances
+                   WHERE runtime_fingerprint=? AND isolation_cache_key=? AND binary_sha256=?
+                         AND provider_config_hash=? AND policy_version=?""",
+                identity,
+            ).fetchone()
+            if row:
+                existing = self._decode_sealed_egress_contract_instance(row)
+                if existing["contract_hash"] != record["contract_hash"] or existing["preview_hash"] != record["preview_hash"]:
+                    raise PolicyError("sealed egress immutable contract hash mismatch")
+                return {**existing, "reused": True}
+            digest = sha256_json(record)
+            conn.execute(
+                """INSERT INTO sealed_egress_contract_instances
+                   (contract_id, contract_hash, preview_hash, runtime_fingerprint, isolation_cache_key, binary_sha256,
+                    provider_config_hash, policy_version, status, created_at, payload, integrity_hash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    record["contract_id"], record["contract_hash"], record["preview_hash"],
+                    record["runtime_fingerprint"], record["isolation_cache_key"], record["binary_sha256"],
+                    record["provider_config_hash"], record["contract_policy_version"], record["status"],
+                    record["created_at"], json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")), digest,
+                ),
+            )
+        return {**record, "integrity_hash": digest, "reused": False}
+
+    @staticmethod
+    def _decode_sealed_egress_contract_instance(row: tuple[Any, ...]) -> dict[str, Any]:
+        try:
+            record = json.loads(row[10])
+        except json.JSONDecodeError as exc:
+            raise PolicyError("sealed egress contract instance payload was modified") from exc
+        expected = {
+            "contract_id": row[0], "contract_hash": row[1], "preview_hash": row[2],
+            "runtime_fingerprint": row[3], "isolation_cache_key": row[4], "binary_sha256": row[5],
+            "provider_config_hash": row[6], "contract_policy_version": row[7], "status": row[8], "created_at": row[9],
+        }
+        if not isinstance(record, dict) or any(record.get(key) != value for key, value in expected.items()):
+            raise PolicyError("sealed egress contract instance metadata was modified")
+        Store._validate_sealed_egress_contract_instance(record)
+        if sha256_json(record) != row[11]:
+            raise PolicyError("sealed egress contract instance integrity check failed")
+        return {**record, "integrity_hash": row[11]}
+
+    def egress_contract_instance(self, contract_hash: str) -> dict[str, Any] | None:
+        if not isinstance(contract_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", contract_hash):
+            raise PolicyError("sealed egress contract hash is invalid")
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT contract_id, contract_hash, preview_hash, runtime_fingerprint, isolation_cache_key,
+                          binary_sha256, provider_config_hash, policy_version, status, created_at, payload, integrity_hash
+                   FROM sealed_egress_contract_instances WHERE contract_hash=?""", (contract_hash,)
+            ).fetchone()
+        return self._decode_sealed_egress_contract_instance(row) if row else None
+
+    @staticmethod
+    def _validate_egress_harness_record(record: Mapping[str, Any], *, final: bool) -> dict[str, Any]:
+        value = dict(record)
+        required = {
+            "harness_id", "contract_hash", "status", "started_at", "finished_at", "error_code",
+            "request_bytes", "response_bytes", "response_hash", "status_code", "relay_connections",
+            "broker_connections", "relay_requests", "broker_requests", "local_duration_ms",
+            "resources_cleaned", "start_allowed",
+        }
+        if set(value) != required:
+            raise PolicyError("sealed egress harness fields are invalid")
+        try:
+            uuid.UUID(str(value["harness_id"]))
+        except (ValueError, TypeError) as exc:
+            raise PolicyError("sealed egress harness id is invalid") from exc
+        if not isinstance(value["contract_hash"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["contract_hash"]):
+            raise PolicyError("sealed egress harness contract hash is invalid")
+        allowed_statuses = {"RUNNING", "PASSED", "BLOCKED", "ERROR"}
+        if value["status"] not in allowed_statuses or (not final and value["status"] != "RUNNING") or (final and value["status"] == "RUNNING"):
+            raise PolicyError("sealed egress harness state is invalid")
+        if not isinstance(value["started_at"], str) or not value["started_at"]:
+            raise PolicyError("sealed egress harness timestamp is invalid")
+        if final != (value["finished_at"] is not None) or (value["finished_at"] is not None and not isinstance(value["finished_at"], str)):
+            raise PolicyError("sealed egress harness completion timestamp is invalid")
+        for field in ("request_bytes", "response_bytes", "relay_connections", "broker_connections", "relay_requests", "broker_requests", "local_duration_ms"):
+            if not isinstance(value[field], int) or value[field] < 0:
+                raise PolicyError("sealed egress harness counter is invalid")
+        if value["response_hash"] is not None and (not isinstance(value["response_hash"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["response_hash"])):
+            raise PolicyError("sealed egress harness response hash is invalid")
+        if value["status_code"] is not None and (not isinstance(value["status_code"], int) or not 100 <= value["status_code"] <= 599):
+            raise PolicyError("sealed egress harness response status is invalid")
+        if not isinstance(value["resources_cleaned"], bool) or value["start_allowed"] is not False:
+            raise PolicyError("sealed egress harness lock state is invalid")
+        if value["error_code"] is not None and (not isinstance(value["error_code"], str) or not re.fullmatch(r"[a-z0-9_]{1,80}", value["error_code"])):
+            raise PolicyError("sealed egress harness error code is invalid")
+        serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        forbidden = ("body", "authorization", "cookie", "credential", "api_key", "secret", "path", "argv", "stdout", "stderr", "raw")
+        if any(token in serialized.casefold() for token in forbidden):
+            raise PolicyError("sealed egress harness includes sensitive material")
+        return value
+
+    def begin_egress_harness(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        record = self._validate_egress_harness_record(payload, final=False)
+        digest = sha256_json(record)
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """INSERT INTO egress_harness_runs
+                   (harness_id, contract_hash, status, started_at, finished_at, payload, integrity_hash)
+                   VALUES (?, ?, 'RUNNING', ?, NULL, ?, ?)
+                   ON CONFLICT(contract_hash) DO UPDATE SET harness_id=excluded.harness_id, status='RUNNING',
+                     started_at=excluded.started_at, finished_at=NULL, payload=excluded.payload,
+                     integrity_hash=excluded.integrity_hash""",
+                (record["harness_id"], record["contract_hash"], record["started_at"],
+                 json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")), digest),
+            )
+        return {**record, "integrity_hash": digest}
+
+    def finish_egress_harness(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        record = self._validate_egress_harness_record(payload, final=True)
+        digest = sha256_json(record)
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """UPDATE egress_harness_runs
+                   SET status=?, finished_at=?, payload=?, integrity_hash=?
+                   WHERE contract_hash=? AND harness_id=? AND status='RUNNING'""",
+                (record["status"], record["finished_at"], json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                 digest, record["contract_hash"], record["harness_id"]),
+            )
+        if cursor.rowcount != 1:
+            raise PolicyError("sealed egress harness could not finish")
+        return {**record, "integrity_hash": digest}
+
+    def egress_harness_result(self, contract_hash: str) -> dict[str, Any] | None:
+        if not isinstance(contract_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", contract_hash):
+            raise PolicyError("sealed egress harness contract hash is invalid")
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT harness_id, contract_hash, status, started_at, finished_at, payload, integrity_hash
+                   FROM egress_harness_runs WHERE contract_hash=?""", (contract_hash,)
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            record = json.loads(row[5])
+        except json.JSONDecodeError as exc:
+            raise PolicyError("sealed egress harness payload was modified") from exc
+        expected = {"harness_id": row[0], "contract_hash": row[1], "status": row[2], "started_at": row[3], "finished_at": row[4]}
+        if not isinstance(record, dict) or any(record.get(key) != value for key, value in expected.items()):
+            raise PolicyError("sealed egress harness metadata was modified")
+        self._validate_egress_harness_record(record, final=row[2] != "RUNNING")
+        if sha256_json(record) != row[6]:
+            raise PolicyError("sealed egress harness integrity check failed")
+        return {**record, "integrity_hash": row[6]}
+
+    def recover_interrupted_egress_harnesses(self) -> int:
+        now = _now()
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT harness_id, contract_hash, payload FROM egress_harness_runs WHERE status='RUNNING'"
+            ).fetchall()
+            count = 0
+            for harness_id, contract_hash, payload in rows:
+                try:
+                    record = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                record = dict(record)
+                record.update({"status": "ERROR", "finished_at": now, "error_code": "harness_interrupted", "resources_cleaned": False})
+                self._validate_egress_harness_record(record, final=True)
+                digest = sha256_json(record)
+                cursor = conn.execute(
+                    """UPDATE egress_harness_runs SET status='ERROR', finished_at=?, payload=?, integrity_hash=?
+                       WHERE harness_id=? AND contract_hash=? AND status='RUNNING'""",
+                    (now, json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")), digest, harness_id, contract_hash),
+                )
+                count += int(cursor.rowcount)
+        return count
+
+    def record_egress_harness_ledger(self, result: Mapping[str, Any]) -> dict[str, Any]:
+        checked_at = result.get("finished_at") if isinstance(result.get("finished_at"), str) else _now()
+        contract_hash = result.get("contract_hash") if isinstance(result.get("contract_hash"), str) else "unknown"
+        record = {
+            "source_event_id": f"sealed-egress-harness:{contract_hash}:{result.get('harness_id', 'unknown')}",
+            "source": "LOCAL_ESTIMATE", "quality": "OBSERVED", "event_type": "SEALED_EGRESS_HARNESS",
+            "status": result.get("status") if isinstance(result.get("status"), str) else "ERROR",
+            "contract_hash": contract_hash, "local_executions": 1,
+            "local_duration_ms": int(result.get("local_duration_ms") or 0),
+            "tokens": 0, "app_server_rpc_calls": 0, "occurred_at": checked_at,
+        }
+        digest = sha256_json(record)
+        with self._connection() as conn:
+            existing = conn.execute("SELECT payload, integrity_hash FROM ledger_usage_events WHERE source_event_id=?", (record["source_event_id"],)).fetchone()
+            if existing:
+                if existing[1] != digest:
+                    raise PolicyError("sealed egress harness ledger event was reused with different content")
+                return {**json.loads(existing[0]), "integrity_hash": existing[1]}
+            conn.execute(
+                """INSERT INTO ledger_usage_events
+                   (event_id, source_event_id, source, quality, event_type, status, payload, integrity_hash, occurred_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str(uuid.uuid4()), record["source_event_id"], record["source"], record["quality"], record["event_type"],
+                 record["status"], json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")), digest, checked_at),
+            )
+        return {**record, "integrity_hash": digest}
 
     def record_sealed_egress_contract_ledger(self, result: Mapping[str, Any]) -> dict[str, Any]:
         """Account for local contract construction only; tokens and RPCs stay zero."""
@@ -2681,6 +2983,13 @@ class Store:
         report["sealed_egress_contract"] = {
             "executions": sum(int(event.get("contract_executions") or 0) for event in contract_events),
             "local_duration_ms": sum(int(event.get("contract_duration_ms") or 0) for event in contract_events),
+            "tokens": 0,
+            "app_server_rpc_calls": 0,
+        }
+        harness_events = [event for event in usage_events if event.get("event_type") == "SEALED_EGRESS_HARNESS"]
+        report["sealed_egress_harness"] = {
+            "executions": sum(int(event.get("local_executions") or 0) for event in harness_events),
+            "local_duration_ms": sum(int(event.get("local_duration_ms") or 0) for event in harness_events),
             "tokens": 0,
             "app_server_rpc_calls": 0,
         }

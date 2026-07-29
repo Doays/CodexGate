@@ -15,3 +15,4 @@ label { display:block; color:var(--muted); font-size:12px; margin:0 0 13px; } in
 .wsl-isolation-panel { margin-bottom:16px; }.wsl-isolation-actions { align-items:flex-end; }.wsl-isolation-actions label { flex:1; min-width:220px; }
 .wsl-runtime-panel { margin-top:18px; padding-top:18px; border-top:1px solid var(--line); }.wsl-runtime-panel .panel-title { margin-bottom:10px; }
 .wsl-egress-panel { margin-top:18px; padding-top:18px; border-top:1px solid var(--line); }.wsl-egress-panel .panel-title { margin-bottom:10px; }
+.wsl-harness-panel { margin-top:18px; padding-top:18px; border-top:1px solid var(--line); }.wsl-harness-panel .panel-title { margin-bottom:10px; }
