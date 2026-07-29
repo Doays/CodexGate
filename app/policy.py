@@ -58,6 +58,9 @@ _BRIDGE_SECRET_PATTERNS = (
 _ABSOLUTE_USER_PATH = re.compile(r"(?i)(?:\b[a-z]:[\\/]|(?:^|\s)/(?:users|home)/)")
 _SENSITIVE_EVIDENCE_NAME = re.compile(r"(?i)(?:^|[\\/])(?:\.env|[^\\/]*\.(?:pem|key|pfx)|credentials(?:\.[^\\/]*)?|service-account[^\\/]*)$")
 _WSL_DISTRO_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_WSL_CODEX_BINARY = re.compile(
+    r"^/(?:usr/local/bin/codex|home/[A-Za-z0-9][A-Za-z0-9_-]{0,31}/\.local/bin/codex)$"
+)
 
 
 class PolicyError(ValueError):
@@ -316,6 +319,21 @@ def validate_wsl_distro(value: str) -> str:
     if not _WSL_DISTRO_NAME.fullmatch(distro):
         raise PolicyError("WSL distribution name is invalid")
     return distro
+
+
+def validate_wsl_codex_binary_path(value: str) -> str:
+    """Allow only an explicitly selected WSL-native Codex binary path.
+
+    The narrow grammar rules out PATH lookup, Windows paths, shell syntax, and
+    traversal before an argv is ever built.
+    """
+    if not isinstance(value, str) or not value:
+        raise PolicyError("WSL Codex binary path must be configured")
+    if value != value.strip() or any(char.isspace() or ord(char) < 32 for char in value):
+        raise PolicyError("WSL Codex binary path is invalid")
+    if not _WSL_CODEX_BINARY.fullmatch(value):
+        raise PolicyError("WSL Codex binary path is outside the allowlist")
+    return value
 
 
 def resolve_project_path(root: str | Path, value: str) -> tuple[Path, str]:

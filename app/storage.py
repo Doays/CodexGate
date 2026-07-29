@@ -17,6 +17,7 @@ from .policy import (
     validate_project_id,
     validate_source_alias,
     validate_task_id,
+    validate_wsl_codex_binary_path,
     validate_wsl_distro,
 )
 from .token_ledger import build_report, normalize_baseline_payload, normalize_run_record, normalize_usage_event, render_markdown
@@ -362,6 +363,25 @@ class Store:
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                     distro TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS wsl_codex_runtime_config (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    binary_path TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS wsl_codex_runtime_results (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    status TEXT NOT NULL,
+                    checked_at TEXT NOT NULL,
+                    config_hash TEXT,
+                    runtime_fingerprint TEXT,
+                    launch_spec_hash TEXT,
+                    payload TEXT NOT NULL,
+                    integrity_hash TEXT NOT NULL
                 )"""
             )
             conn.execute(
@@ -1553,6 +1573,168 @@ class Store:
             })
         return {**record, "integrity_hash": row[6]}
 
+    def save_wsl_codex_runtime_config(self, binary_path: str) -> dict[str, Any]:
+        """Persist the explicit WSL binary selection without returning its path."""
+        clean_path = validate_wsl_codex_binary_path(binary_path)
+        updated_at = _now()
+        with self._connection() as conn:
+            conn.execute(
+                """INSERT INTO wsl_codex_runtime_config (singleton, binary_path, updated_at)
+                   VALUES (1, ?, ?)
+                   ON CONFLICT(singleton) DO UPDATE SET
+                       binary_path=excluded.binary_path, updated_at=excluded.updated_at""",
+                (clean_path, updated_at),
+            )
+        return {"backend": "WSL2_BWRAP", "binary_configured": True, "updated_at": updated_at}
+
+    def wsl_codex_runtime_config_private(self) -> dict[str, Any] | None:
+        """Internal-only lookup.  Callers must not pass this record to an API."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT binary_path, updated_at FROM wsl_codex_runtime_config WHERE singleton=1"
+            ).fetchone()
+        if not row:
+            return None
+        return {"binary_path": row[0], "updated_at": row[1]}
+
+    def wsl_codex_runtime_config(self) -> dict[str, Any]:
+        private = self.wsl_codex_runtime_config_private()
+        if private is None:
+            return {"backend": "WSL2_BWRAP", "status": "UNCONFIGURED", "binary_configured": False}
+        return {
+            "backend": "WSL2_BWRAP", "status": "CONFIGURED", "binary_configured": True,
+            "updated_at": private["updated_at"],
+        }
+
+    def save_wsl_codex_runtime_result(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Store a redacted runtime preflight result, never argv, paths, env, or auth."""
+        record = dict(payload)
+        required = {
+            "status", "checked_at", "config_hash", "runtime_fingerprint", "launch_spec_hash",
+            "binary_configured", "version_match", "isolation_match", "egress_blocked",
+            "start_allowed", "error_code", "local_duration_ms",
+        }
+        missing = required - record.keys()
+        if missing:
+            raise PolicyError(f"WSL Codex runtime result is missing fields: {', '.join(sorted(missing))}")
+        allowed = required | {"preflight_status", "binary_size"}
+        if set(record) - allowed:
+            raise PolicyError("WSL Codex runtime result contains unsupported fields")
+        statuses = {
+            "UNCONFIGURED", "BINARY_MISSING", "INVALID_BINARY", "VERSION_MISMATCH",
+            "EGRESS_UNCONFIGURED", "READY_CANDIDATE", "BLOCKED", "ERROR",
+        }
+        if record["status"] not in statuses:
+            raise PolicyError("WSL Codex runtime status is invalid")
+        for field in ("config_hash", "runtime_fingerprint", "launch_spec_hash"):
+            value = record[field]
+            if value is not None and (not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)):
+                raise PolicyError("WSL Codex runtime digest is invalid")
+        for field in ("binary_configured", "version_match", "isolation_match", "egress_blocked", "start_allowed"):
+            if not isinstance(record[field], bool):
+                raise PolicyError("WSL Codex runtime flags are invalid")
+        if record["egress_blocked"] is not True or record["start_allowed"] is not False:
+            raise PolicyError("WSL Codex runtime must remain fail-closed")
+        if not isinstance(record["checked_at"], str) or not record["checked_at"]:
+            raise PolicyError("WSL Codex runtime timestamp is invalid")
+        if record["error_code"] is not None and (
+            not isinstance(record["error_code"], str)
+            or not re.fullmatch(r"[a-z0-9_]{1,80}", record["error_code"])
+        ):
+            raise PolicyError("WSL Codex runtime error code is invalid")
+        if not isinstance(record["local_duration_ms"], int) or record["local_duration_ms"] < 0:
+            raise PolicyError("WSL Codex runtime duration is invalid")
+        if record.get("preflight_status") is not None and record.get("preflight_status") != "READY_CANDIDATE":
+            raise PolicyError("WSL Codex runtime preflight status is invalid")
+        if record.get("binary_size") is not None and (
+            not isinstance(record["binary_size"], int) or record["binary_size"] < 0
+        ):
+            raise PolicyError("WSL Codex runtime binary size is invalid")
+        forbidden = ("path", "argv", "environment", "auth", "token", "stdout", "stderr", "command", "secret")
+        if any(any(fragment in key.casefold() for fragment in forbidden) for key in record):
+            raise PolicyError("WSL Codex runtime result includes sensitive data")
+        integrity_hash = sha256_json(record)
+        with self._connection() as conn:
+            conn.execute(
+                """INSERT INTO wsl_codex_runtime_results
+                   (singleton, status, checked_at, config_hash, runtime_fingerprint, launch_spec_hash, payload, integrity_hash)
+                   VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(singleton) DO UPDATE SET
+                       status=excluded.status, checked_at=excluded.checked_at,
+                       config_hash=excluded.config_hash, runtime_fingerprint=excluded.runtime_fingerprint,
+                       launch_spec_hash=excluded.launch_spec_hash, payload=excluded.payload,
+                       integrity_hash=excluded.integrity_hash""",
+                (
+                    record["status"], record["checked_at"], record["config_hash"],
+                    record["runtime_fingerprint"], record["launch_spec_hash"],
+                    json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")), integrity_hash,
+                ),
+            )
+        return {**record, "integrity_hash": integrity_hash}
+
+    def wsl_codex_runtime_result(self) -> dict[str, Any] | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT status, checked_at, config_hash, runtime_fingerprint, launch_spec_hash, payload, integrity_hash
+                   FROM wsl_codex_runtime_results WHERE singleton=1"""
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            record = json.loads(row[5])
+        except json.JSONDecodeError as exc:
+            raise PolicyError("WSL Codex runtime result payload was modified") from exc
+        expected = {
+            "status": row[0], "checked_at": row[1], "config_hash": row[2],
+            "runtime_fingerprint": row[3], "launch_spec_hash": row[4],
+        }
+        if not isinstance(record, dict) or any(record.get(key) != value for key, value in expected.items()):
+            raise PolicyError("WSL Codex runtime result metadata was modified")
+        if sha256_json(record) != row[6]:
+            raise PolicyError("WSL Codex runtime result integrity check failed")
+        return {**record, "integrity_hash": row[6]}
+
+    def record_wsl_codex_runtime_preflight_ledger(self, result: Mapping[str, Any]) -> dict[str, Any]:
+        """Account for local metadata work only; it cannot consume a model token or RPC."""
+        checked_at = result.get("checked_at") if isinstance(result.get("checked_at"), str) else _now()
+        config_hash = result.get("config_hash") if isinstance(result.get("config_hash"), str) else "unconfigured"
+        fingerprint = result.get("runtime_fingerprint") if isinstance(result.get("runtime_fingerprint"), str) else "unknown"
+        record = {
+            "source_event_id": f"wsl-codex-runtime-preflight:{config_hash}:{fingerprint}:{checked_at}",
+            "source": "LOCAL_ESTIMATE", "quality": "OBSERVED", "event_type": "WSL_CODEX_RUNTIME_PREFLIGHT",
+            "status": result.get("status") if isinstance(result.get("status"), str) else "ERROR",
+            "config_hash": config_hash, "runtime_fingerprint": fingerprint,
+            "runtime_preflight_executions": 1,
+            "runtime_preflight_duration_ms": int(result.get("local_duration_ms") or 0),
+            "tokens": 0, "app_server_rpc_calls": 0, "occurred_at": checked_at,
+        }
+        digest = sha256_json(record)
+        with self._connection() as conn:
+            existing = conn.execute(
+                "SELECT payload, integrity_hash FROM ledger_usage_events WHERE source_event_id=?", (record["source_event_id"],)
+            ).fetchone()
+            if existing:
+                if existing[1] != digest:
+                    raise PolicyError("WSL Codex runtime ledger event id was reused with different content")
+                return {**json.loads(existing[0]), "integrity_hash": existing[1]}
+            conn.execute(
+                """INSERT INTO ledger_usage_events (
+                    event_id, source_event_id, source, quality, event_type, run_id, task_id, route_plan_id,
+                    comparison_key, success_criteria_hash, task_class, planned_model, actual_model, effort, status,
+                    input_tokens, cached_input_tokens, output_tokens, reasoning_tokens, provider_total_tokens,
+                    codex_context_bytes, web_packet_bytes, evidence_bytes, source_bytes, catalog_source_bytes,
+                    probe_bytes, model_turns, high_model_turns, retries, reroutes, compactions, subagent_count,
+                    occurred_at, payload, integrity_hash
+                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL, NULL,
+                    NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, ?, ?, ?)""",
+                (
+                    str(uuid.uuid4()), record["source_event_id"], record["source"], record["quality"], record["event_type"],
+                    record["status"], record["occurred_at"],
+                    json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")), digest,
+                ),
+            )
+        return {**record, "integrity_hash": digest}
+
     def save_wsl_isolation_config(self, distro: str) -> dict[str, Any]:
         clean_distro = validate_wsl_distro(distro)
         updated_at = _now()
@@ -2329,6 +2511,13 @@ class Store:
         report["wsl_isolation_repro"] = {
             "executions": sum(int(event.get("local_executions") or 0) for event in repro_events),
             "local_duration_ms": sum(int(event.get("local_duration_ms") or 0) for event in repro_events),
+            "tokens": 0,
+            "app_server_rpc_calls": 0,
+        }
+        runtime_events = [event for event in usage_events if event.get("event_type") == "WSL_CODEX_RUNTIME_PREFLIGHT"]
+        report["wsl_codex_runtime_preflight"] = {
+            "executions": sum(int(event.get("runtime_preflight_executions") or 0) for event in runtime_events),
+            "local_duration_ms": sum(int(event.get("runtime_preflight_duration_ms") or 0) for event in runtime_events),
             "tokens": 0,
             "app_server_rpc_calls": 0,
         }

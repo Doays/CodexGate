@@ -6,6 +6,7 @@ let currentPlan = null;
 let currentCapsule = null;
 let isolationStatus = "UNKNOWN";
 let wslIsolationStatus = "UNCONFIGURED";
+let wslRuntimeStatus = "UNCONFIGURED";
 let stream = null;
 let planExpiryTimer = null;
 let currentBridge = null;
@@ -221,6 +222,7 @@ async function connect() {
     renderCatalog(data.model_catalog);
     renderIsolation(data.isolation);
     renderWSLIsolation(data.wsl_isolation);
+    renderWSLCodexRuntime(data.wsl_codex_runtime);
     renderTokenLedger(data.token_ledger || {});
     $("connection-dot").classList.add("live");
     $("connection-text").textContent = `${data.choices.length} models connected`;
@@ -284,6 +286,20 @@ function renderWSLRepro(result) {
   node.textContent = `Repeatability: ${success}/${completed || 10} successful; final status ${status}. Live runs remain locked.`;
 }
 
+function renderWSLCodexRuntime(result) {
+  wslRuntimeStatus = result?.status || "UNCONFIGURED";
+  const statusNode = $("wsl-runtime-status");
+  const detailNode = $("wsl-runtime-result");
+  if (!statusNode || !detailNode) return;
+  statusNode.textContent = wslRuntimeStatus;
+  const configured = result?.binary_configured === true ? "configured" : "not configured";
+  const version = result?.version_match === true ? "matches 0.145.0" : "not matched";
+  const isolation = result?.isolation_match === true ? "matches WSL isolation" : "isolation not matched";
+  const fingerprint = result?.runtime_fingerprint ? "recorded" : "not available";
+  const code = result?.error_code ? ` Code: ${result.error_code}.` : "";
+  detailNode.textContent = `Binary ${configured}; version ${version}; runtime fingerprint ${fingerprint}; ${isolation}; egress remains blocked.${code} Codex start stays locked.`;
+}
+
 async function runIsolationProbe() {
   try {
     $("run-isolation-probe").disabled = true;
@@ -336,6 +352,34 @@ async function runWSLIsolationRepro() {
     say(error.message, true);
   } finally {
     $("run-wsl-isolation-repro").disabled = wslIsolationStatus !== "SAFE_CANDIDATE";
+  }
+}
+
+async function saveWSLCodexRuntimeConfig() {
+  try {
+    const value = $("wsl-runtime-binary").value;
+    await api("/api/isolation/wsl/runtime/config", {
+      method: "POST",
+      body: JSON.stringify({ binary_path: value }),
+    });
+    $("wsl-runtime-binary").value = "";
+    say("WSL Codex binary selection was saved privately. Validate metadata without starting Codex.");
+  } catch (error) {
+    say(error.message, true);
+  }
+}
+
+async function runWSLCodexRuntimePreflight() {
+  try {
+    $("run-wsl-runtime-preflight").disabled = true;
+    say("Validating the selected WSL binary metadata only; no Codex process will start...");
+    const result = await api("/api/isolation/wsl/runtime/preflight", { method: "POST" });
+    renderWSLCodexRuntime(result);
+    say(`Sealed runtime validation: ${result.status}. Egress and Codex start remain locked.`, result.status !== "EGRESS_UNCONFIGURED");
+  } catch (error) {
+    say(error.message, true);
+  } finally {
+    $("run-wsl-runtime-preflight").disabled = false;
   }
 }
 
@@ -1044,6 +1088,8 @@ $("ledger-export-md").onclick = () => exportTokenLedger("markdown");
 $("save-wsl-isolation-config").onclick = saveWSLIsolationConfig;
 $("run-wsl-isolation-probe").onclick = runWSLIsolationProbe;
 $("run-wsl-isolation-repro").onclick = runWSLIsolationRepro;
+$("save-wsl-runtime-config").onclick = saveWSLCodexRuntimeConfig;
+$("run-wsl-runtime-preflight").onclick = runWSLCodexRuntimePreflight;
 for (const id of ["catalog-filter-status", "catalog-filter-kind", "catalog-filter-extension"]) $(id).addEventListener("change", () => refreshCatalogEntries().catch((error) => say(error.message, true)));
 renderBridge(null);
 restoreBridge();

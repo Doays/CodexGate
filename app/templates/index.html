@@ -101,6 +101,16 @@
       </div>
       <p class="hint">Checks only the selected distribution, `/usr/bin/python3`, and `bwrap`; the sandbox binds the Capsule as read-only at `/work`, leaves Windows mounts unbound, and keeps the run button locked.</p>
       <p id="wsl-isolation-repro-result" class="hint">Repeatability check is available only after SAFE_CANDIDATE; live runs remain locked.</p>
+      <div class="wsl-runtime-panel">
+        <div class="panel-title"><span>SEALED RUNTIME</span><h2>WSL Codex Phase 0</h2><span id="wsl-runtime-status" class="status">UNCONFIGURED</span></div>
+        <p id="wsl-runtime-result" class="hint">Configure one allowlisted WSL-native binary. This phase validates metadata only; egress and all Codex starts remain blocked.</p>
+        <div class="row wsl-isolation-actions">
+          <label>WSL Codex binary<input id="wsl-runtime-binary" maxlength="512" autocomplete="off" placeholder="allowlisted WSL-native binary"></label>
+          <button id="save-wsl-runtime-config" class="button ghost" type="button">Save binary</button>
+          <button id="run-wsl-runtime-preflight" class="button" type="button">Validate sealed runtime</button>
+        </div>
+        <p class="hint">Shown: configured state, version match, runtime fingerprint, isolation match, and egress blocking only. Paths, argv, environment values, and credentials are never displayed.</p>
+      </div>
     </section>
 
     <section class="panel router-preview-panel">

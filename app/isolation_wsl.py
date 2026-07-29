@@ -40,6 +40,7 @@ INTERNAL_BWRAP_TIMEOUT_SECONDS = 3
 MAX_CAPTURED_OUTPUT_BYTES = 8 * 1024
 CANARY_BYTES = 32
 PROBE_VERSION = "wsl2-bwrap-v1"
+SEALED_READ_ONLY_BINDS = ("/usr", "/bin", "/lib", "/lib64", "/etc")
 _DISTRO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _VERSION_RE = re.compile(r"[^A-Za-z0-9._+ -]")
 
