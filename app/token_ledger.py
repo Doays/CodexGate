@@ -10,10 +10,13 @@ from jsonschema import Draft7Validator
 from .policy import PolicyError, bridge_packet_safety_reason, canonical_json, sha256_json
 
 
-LEDGER_SOURCES = frozenset({"MANUAL_BASELINE", "CODEX_APP_SERVER", "OPENAI_API", "LOCAL_ESTIMATE"})
+LEDGER_SOURCES = frozenset({"MANUAL_BASELINE", "CODEX_APP_SERVER", "OPENAI_API", "LOCAL_ESTIMATE", "LOCAL_OBSERVED"})
 LEDGER_QUALITIES = frozenset({"OBSERVED", "IMPORTED", "ESTIMATED"})
 SUCCESS_STATUSES = frozenset({"SUCCESS"})
 HIGH_EFFORTS = frozenset({"high", "very-high", "very high", "xhigh", "x-high", "max", "ultra"})
+# These locally simulated verification events are deliberately not evidence of
+# provider usage.  They remain ESTIMATED and cannot make savings comparable.
+LOCAL_ONLY_EVENT_TYPES = frozenset({"SEALED_OFFLINE_CODEX_PROCESS_CANARY", "SEALED_OFFLINE_CODEX_PROCESS_CANARY_PLAN"})
 
 BASELINE_IMPORT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -106,6 +109,13 @@ def _require_quality(value: Any) -> str:
     return value
 
 
+def _validate_source_quality(source: str, quality: str) -> None:
+    if source == "LOCAL_ESTIMATE" and quality != "ESTIMATED":
+        raise PolicyError("LOCAL_ESTIMATE requires ESTIMATED quality")
+    if source == "LOCAL_OBSERVED" and quality != "OBSERVED":
+        raise PolicyError("LOCAL_OBSERVED requires OBSERVED quality")
+
+
 def _reject_sensitive_text(record: Mapping[str, Any]) -> None:
     reason = bridge_packet_safety_reason(canonical_json(record))
     if reason:
@@ -183,6 +193,7 @@ def normalize_usage_event(payload: Mapping[str, Any]) -> dict[str, Any]:
     record["source_event_id"] = _string_field(record, "source_event_id")
     record["source"] = _require_source(record.get("source"))
     record["quality"] = _require_quality(record.get("quality"))
+    _validate_source_quality(record["source"], record["quality"])
     record["event_type"] = _string_field(record, "event_type")
     for field in ("run_id", "task_id", "route_plan_id", "comparison_key", "success_criteria_hash", "task_class", "planned_model", "actual_model", "effort", "status", "note"):
         if field in record and record[field] is not None:
@@ -264,6 +275,7 @@ def normalize_baseline_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     record["status"] = _string_field(record, "status")
     record["source"] = _require_source(record.get("source"))
     record["quality"] = _require_quality(record.get("quality"))
+    _validate_source_quality(record["source"], record["quality"])
     _normalize_tokens(record)
     for field in ("codex_context_bytes", "web_packet_bytes", "evidence_bytes", "source_bytes", "catalog_source_bytes", "probe_bytes", "model_turns", "high_model_turns", "retries", "reroutes", "compactions", "subagent_count"):
         record[field] = _optional_int(record, field)
@@ -441,6 +453,29 @@ def build_report(runs: list[Mapping[str, Any]], baselines: list[Mapping[str, Any
         "baselines": normalized_baselines,
         "comparisons": comparisons,
         "recent_events": latest_events[-25:],
+    }
+    local_only = [event for event in usage_events if event.get("event_type") in LOCAL_ONLY_EVENT_TYPES]
+    report["sealed_offline_codex_process_canary"] = {
+        "executions": sum(int(event.get("local_executions") or 0) for event in local_only),
+        "estimated_planned_processes": sum(
+            int(event.get("planned_local_processes") or 0)
+            for event in local_only if event.get("quality") == "ESTIMATED"
+        ),
+        "observed_executions": sum(
+            int(event.get("local_executions") or 0)
+            for event in local_only if event.get("quality") == "OBSERVED"
+        ),
+        "local_processes": sum(
+            int(event.get("local_processes") or 0)
+            for event in local_only if event.get("quality") == "OBSERVED"
+        ),
+        "observed_duration_ms": sum(
+            int(event.get("local_duration_ms") or 0)
+            for event in local_only if event.get("quality") == "OBSERVED"
+        ),
+        "external_tokens": 0,
+        "app_server_rpc_calls": 0,
+        "measurement": "NOT_COMPARABLE",
     }
     return report
 

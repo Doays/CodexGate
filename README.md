@@ -162,6 +162,14 @@ The window binds a stored immutable Contract ID/hash, WSL runner kind/version/im
 
 Only the sealed `WSLEgressHarnessRunner` identity is accepted by this endpoint; fake identities are a policy violation and cannot become actual evidence. The window grants no Runtime, `SAFE_CAPSULE_ONLY`, normal live-run, Workspace Write, Ultra, network, or authentication permission. This implementation is tested with a no-I/O process double only; it does not execute WSL, bubblewrap, AF_UNIX, Codex, app-server, or a model turn.
 
+### Sealed Offline Codex Process Canary Phase 4.0
+
+Phase 4.0 defines a separate, two-minute, one-use offline Codex Canary window. It requires a complete `runtime-identity-v1`, the current immutable `AUTH_UNCONFIGURED` Contract, an exact current `WSL_SUPERVISOR` Harness `PASSED` record, a fresh isolation Canary, and the matching `SAFE_REPRODUCIBLE` 10/10/10 result. The Canary runner implementation hash canonically binds its fixed broker, relay/Codex, and supervisor program bytes, fixed Codex argv, fixed prompt, and deterministic fake Responses result; changing any of those inputs creates a different runner identity and prevents old `PASSED` results or capabilities from being reused.
+
+The modeled process arrangement is one read-only broker bubblewrap and one sealed relay/Codex bubblewrap. The latter has a throwaway tmpfs `CODEX_HOME` whose only config is the immutable Contract TOML bytes, a fixed `/work`, and no inherited environment, host mounts, credentials, or general network. It permits exactly one fixed `POST /v1/responses`, no WebSocket, second request, model change, tool call, command execution, file change, retry, reroute, or network tool. A valid result requires the exact success marker, exit code zero, a 45-second limit, and at most 16 KB combined output; raw prompt, response, config, stdout, stderr, paths, and token values are never stored.
+
+The production runner is deliberately `DISABLED` in this phase, so arm/run APIs fail closed and no WSL, bubblewrap, Codex, socket, external network, app-server RPC, or model request can start. Tests use only an in-memory deterministic runner. Plan/fake events use `LOCAL_ESTIMATE`/`ESTIMATED`; only a future real runner may emit `LOCAL_OBSERVED`/`OBSERVED` process counts and monotonic duration. Provider token columns remain null, external tokens and RPC are zero, and reports remain `NOT_COMPARABLE`; no planned process count is included in measured totals. A future successful Canary would still leave Runtime start, ordinary live runs, `SAFE_CAPSULE_ONLY`, Workspace Write, and Ultra locked.
+
 - Only `127.0.0.1` and `localhost` are accepted as `Host`
 - If `Origin` is present, it must match the same local origin
 - `project_id` must be a safe slug or UUID

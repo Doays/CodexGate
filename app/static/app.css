@@ -16,3 +16,4 @@ label { display:block; color:var(--muted); font-size:12px; margin:0 0 13px; } in
 .wsl-runtime-panel { margin-top:18px; padding-top:18px; border-top:1px solid var(--line); }.wsl-runtime-panel .panel-title { margin-bottom:10px; }
 .wsl-egress-panel { margin-top:18px; padding-top:18px; border-top:1px solid var(--line); }.wsl-egress-panel .panel-title { margin-bottom:10px; }
 .wsl-harness-panel { margin-top:18px; padding-top:18px; border-top:1px solid var(--line); }.wsl-harness-panel .panel-title { margin-bottom:10px; }.wsl-harness-panel .hint { max-width:920px; }.wsl-harness-panel .window-run:not(:disabled) { border-color:#b88939; background:#3b2d18; color:#ffe1a4; }
+.wsl-codex-canary-panel { margin-top:18px; padding-top:18px; border-top:1px dashed #405046; }.wsl-codex-canary-panel .panel-title { margin-bottom:10px; }.wsl-codex-canary-panel .hint { max-width:920px; }

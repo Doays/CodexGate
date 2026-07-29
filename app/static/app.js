@@ -11,6 +11,7 @@ let wslEgressStatus = "UNCONFIGURED";
 let wslHarnessStatus = "BLOCKED";
 let actualWSLHarnessStatus = "NOT RUN";
 let actualWSLHarnessArm = null;
+let codexProcessCanaryArm = null;
 let stream = null;
 let planExpiryTimer = null;
 let currentBridge = null;
@@ -230,6 +231,7 @@ async function connect() {
     renderSealedEgressContract(data.sealed_egress_contract);
     renderSealedEgressHarness(data.sealed_egress_harness);
     renderActualWSLEgressHarness(data.actual_wsl_egress_harness);
+    renderCodexProcessCanary(data.codex_process_canary);
     renderTokenLedger(data.token_ledger || {});
     $("connection-dot").classList.add("live");
     $("connection-text").textContent = `${data.choices.length} models connected`;
@@ -356,6 +358,23 @@ function renderActualWSLEgressHarness(result) {
   if (runButton) runButton.disabled = windowState !== "ARMED" || !actualWSLHarnessArm;
 }
 
+function renderCodexProcessCanary(result) {
+  const statusNode = $("codex-process-canary-status");
+  const detailNode = $("codex-process-canary-result");
+  if (!statusNode || !detailNode) return;
+  const status = result?.status || "DISABLED";
+  const window = result?.execution_window || { status: "DISABLED", remaining_seconds: 0 };
+  const remaining = window.status === "ARMED" ? ` ${window.remaining_seconds || 0}s remaining.` : "";
+  const implementation = result?.implementation_hash ? "implementation sealed" : "implementation not runnable";
+  const code = result?.error_code ? ` Code: ${result.error_code}.` : "";
+  statusNode.textContent = status;
+  detailNode.textContent = `Offline Codex canary ${status}; ${implementation}. Window ${window.status || "DISABLED"}.${remaining}${code} It verifies one fixed fake response only and never unlocks Runtime or live execution.`;
+  const armButton = $("arm-codex-process-canary");
+  const runButton = $("run-codex-process-canary");
+  if (armButton) armButton.disabled = status !== "READY" || window.status === "ARMED";
+  if (runButton) runButton.disabled = window.status !== "ARMED" || !codexProcessCanaryArm;
+}
+
 async function runIsolationProbe() {
   try {
     $("run-isolation-probe").disabled = true;
@@ -453,6 +472,7 @@ async function createSealedEgressContract() {
     renderSealedEgressContract(result);
     renderSealedEgressHarness(await api("/api/isolation/wsl/egress-harness"));
     renderActualWSLEgressHarness(await api("/api/isolation/wsl/egress-harness/actual"));
+    renderCodexProcessCanary(await api("/api/isolation/wsl/codex-process-canary"));
     say(`Sealed egress contract: ${result.status}. Authentication and all starts remain locked.`, result.status !== "AUTH_UNCONFIGURED");
   } catch (error) {
     say(error.message, true);
@@ -490,6 +510,33 @@ async function runActualWSLEgressHarness() {
     actualWSLHarnessArm = null;
     say(error.message, true);
     renderActualWSLEgressHarness(await api("/api/isolation/wsl/egress-harness/actual"));
+  }
+}
+
+async function armCodexProcessCanary() {
+  try {
+    codexProcessCanaryArm = await api("/api/isolation/wsl/codex-process-canary/arm", { method: "POST" });
+    renderCodexProcessCanary(await api("/api/isolation/wsl/codex-process-canary"));
+    say("A one-time offline Codex canary window is armed locally. Runtime and live execution remain locked.");
+  } catch (error) {
+    codexProcessCanaryArm = null;
+    say(error.message, true);
+  }
+}
+
+async function runCodexProcessCanary() {
+  if (!codexProcessCanaryArm) return;
+  try {
+    const result = await api("/api/isolation/wsl/codex-process-canary", {
+      method: "POST",
+      body: JSON.stringify({ canary_nonce: codexProcessCanaryArm.canary_nonce }),
+    });
+    codexProcessCanaryArm = null;
+    renderCodexProcessCanary(result);
+  } catch (error) {
+    codexProcessCanaryArm = null;
+    say(error.message, true);
+    renderCodexProcessCanary(await api("/api/isolation/wsl/codex-process-canary"));
   }
 }
 
@@ -1219,6 +1266,8 @@ $("create-wsl-egress-contract").onclick = createSealedEgressContract;
 $("run-wsl-egress-harness").onclick = runSealedEgressHarness;
 $("arm-actual-wsl-egress-harness").onclick = armActualWSLEgressHarness;
 $("run-actual-wsl-egress-harness").onclick = runActualWSLEgressHarness;
+$("arm-codex-process-canary").onclick = armCodexProcessCanary;
+$("run-codex-process-canary").onclick = runCodexProcessCanary;
 for (const id of ["catalog-filter-status", "catalog-filter-kind", "catalog-filter-extension"]) $(id).addEventListener("change", () => refreshCatalogEntries().catch((error) => say(error.message, true)));
 renderBridge(null);
 restoreBridge();

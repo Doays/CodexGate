@@ -133,6 +133,16 @@ def test_usage_events_are_idempotent_and_reject_conflicts(tmp_path):
         store.record_ledger_usage_event({**event, "web_packet_bytes": 333})
 
 
+def test_local_source_quality_contract_is_strict_and_observed_is_explicit():
+    base = {"source_event_id": "local:1", "event_type": "local_metric", "input_tokens": None}
+    with pytest.raises(PolicyError):
+        normalize_usage_event({**base, "source": "LOCAL_ESTIMATE", "quality": "OBSERVED"})
+    with pytest.raises(PolicyError):
+        normalize_usage_event({**base, "source": "LOCAL_OBSERVED", "quality": "ESTIMATED"})
+    observed = normalize_usage_event({**base, "source": "LOCAL_OBSERVED", "quality": "OBSERVED"})
+    assert observed["source"] == "LOCAL_OBSERVED" and observed["quality"] == "OBSERVED"
+
+
 def test_imports_reject_negative_cached_secret_and_absolute_path():
     with pytest.raises(PolicyError):
         normalize_baseline_payload(

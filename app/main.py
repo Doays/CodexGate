@@ -36,6 +36,14 @@ from .egress_harness_wsl import (
     WSLEgressHarnessRunner,
     WSL_EGRESS_RUNNER_VERSION,
 )
+from .codex_process_canary import (
+    CANARY_RUNNER_KIND,
+    RUNNER_IMPLEMENTATION_HASH as CODEX_CANARY_IMPLEMENTATION_HASH,
+    RUNNER_VERSION as CODEX_CANARY_RUNNER_VERSION,
+    SealedOfflineCodexProcessCanary,
+    WSLCodexProcessCanaryRunner,
+    public_canary_result,
+)
 from .format_probe import FormatProbeService
 from .indexer import preflight
 from .policy import PolicyError, model_choices, validate_project_id, validate_workspace_root
@@ -183,6 +191,12 @@ class ActualWSLHarnessRequest(BaseModel):
     arm_nonce: str | None = Field(default=None, min_length=32, max_length=128)
 
 
+class CodexProcessCanaryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    canary_nonce: str | None = Field(default=None, min_length=32, max_length=128)
+
+
 def _local_host(value: str | None) -> str | None:
     if not value:
         return None
@@ -240,6 +254,8 @@ async def lifespan(app: FastAPI):
     store.recover_interrupted_wsl_isolation_repros()
     store.recover_interrupted_egress_harnesses()
     store.recover_armed_egress_execution_windows()
+    store.recover_interrupted_codex_process_canaries()
+    store.recover_armed_codex_process_canary_windows()
     gate_instance = Gate(store)
     app.state.wsl_isolation_service = WSLBubblewrapIsolation(store)
     app.state.wsl_repro_service = IsolationReproService(store, app.state.wsl_isolation_service)
@@ -256,6 +272,12 @@ async def lifespan(app: FastAPI):
     # permits it behind an explicit, non-persistent execution window.
     app.state.actual_wsl_egress_harness_gate = ActualWSLHarnessGate(
         store, app.state.actual_wsl_egress_harness_service,
+    )
+    # Phase 4.0 deliberately exposes no runnable WSL/Codex executor.  The
+    # service still publishes its sealed requirements and can only be armed by
+    # a future explicit release after a separate implementation review.
+    app.state.codex_process_canary_service = SealedOfflineCodexProcessCanary(
+        store, app.state.sealed_egress_contract_service, WSLCodexProcessCanaryRunner(),
     )
     app.state.sealed_egress_harness_runner_version = WSL_EGRESS_RUNNER_VERSION
     BridgeService(store, gate_instance.create_route_plan).recover_processing_on_startup()
@@ -322,6 +344,26 @@ def actual_wsl_egress_harness_gate(request: Request) -> ActualWSLHarnessGate:
     return request.app.state.actual_wsl_egress_harness_gate
 
 
+def codex_process_canary(request: Request) -> SealedOfflineCodexProcessCanary:
+    return request.app.state.codex_process_canary_service
+
+
+def codex_process_canary_snapshot(request: Request) -> dict[str, Any]:
+    service = codex_process_canary(request)
+    readiness = service.ready()
+    if readiness.get("status") == "READY":
+        current = gate(request).store.codex_process_canary_result(
+            readiness["contract_hash"], CANARY_RUNNER_KIND, CODEX_CANARY_RUNNER_VERSION,
+            CODEX_CANARY_IMPLEMENTATION_HASH,
+        )
+        result = public_canary_result(current) if current else readiness
+    else:
+        result = readiness
+    result["execution_window"] = service.window_status()
+    result["execution_enabled"] = result["execution_window"].get("status") == "ARMED"
+    return result
+
+
 def as_http_error(error: Exception) -> HTTPException:
     return HTTPException(status_code=400, detail=str(error))
 
@@ -352,6 +394,7 @@ async def status(request: Request):
     state["actual_wsl_egress_harness"]["execution_enabled"] = (
         state["actual_wsl_egress_harness"]["execution_window"].get("status") == "ARMED"
     )
+    state["codex_process_canary"] = codex_process_canary_snapshot(request)
     state["choices"] = model_choices(state["models"])
     return state
 
@@ -379,6 +422,7 @@ async def connect(request: Request):
         state["actual_wsl_egress_harness"]["execution_enabled"] = (
             state["actual_wsl_egress_harness"]["execution_window"].get("status") == "ARMED"
         )
+        state["codex_process_canary"] = codex_process_canary_snapshot(request)
         return {
             "models": models,
             "choices": model_choices(models),
@@ -399,6 +443,7 @@ async def connect(request: Request):
                     "sealed_egress_contract",
                     "sealed_egress_harness",
                     "actual_wsl_egress_harness",
+                    "codex_process_canary",
                     "token_ledger",
                 )
             },
@@ -539,6 +584,35 @@ async def arm_actual_wsl_egress_harness(request: Request):
 async def run_actual_wsl_egress_harness(payload: ActualWSLHarnessRequest, request: Request):
     try:
         return await actual_wsl_egress_harness_gate(request).run(payload.window_nonce, payload.arm_nonce)
+    except PolicyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/api/isolation/wsl/codex-process-canary")
+async def codex_process_canary_status(request: Request):
+    try:
+        return codex_process_canary_snapshot(request)
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
+@app.post("/api/isolation/wsl/codex-process-canary/arm")
+async def arm_codex_process_canary(request: Request):
+    rejection = _enforce_execution_window_arm_request(request)
+    if rejection is not None:
+        return rejection
+    try:
+        # The production runner is disabled in Phase 4.0, so this endpoint
+        # remains fail-closed without starting WSL, Codex, or a network path.
+        return await codex_process_canary(request).arm()
+    except PolicyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/isolation/wsl/codex-process-canary")
+async def run_codex_process_canary(payload: CodexProcessCanaryRequest, request: Request):
+    try:
+        return await codex_process_canary(request).run(payload.canary_nonce)
     except PolicyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
