@@ -12,7 +12,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from .egress_contract import AUTH_UNCONFIGURED, canonical_provider_toml, provider_config_hash, validate_sealed_execution_proof
 from .egress_harness import WSL_RUNNER_KIND
@@ -141,6 +141,17 @@ class CodexProcessCanaryRunner(Protocol):
     async def run(self, binding: Mapping[str, str], launch_spec: Mapping[str, Any]) -> CanaryExecution: ...
 
 
+class CodexProcessCanaryExecutor(Protocol):
+    """Execution seam used only after a sealed one-shot claim.
+
+    Production deliberately supplies no executor in this release.  The small
+    protocol lets tests prove the selection and accounting path without
+    creating a WSL, bubblewrap, Codex, socket, or network process.
+    """
+
+    async def run(self, binding: Mapping[str, str], launch_spec: Mapping[str, Any]) -> CanaryExecution: ...
+
+
 class DisabledCodexProcessCanaryRunner:
     """Production default: no process can be started by this release."""
 
@@ -156,12 +167,52 @@ class DisabledCodexProcessCanaryRunner:
 
 
 class WSLCodexProcessCanaryRunner(DisabledCodexProcessCanaryRunner):
-    """Sealed WSL runner identity reserved for a later execution release.
+    """The only runner identity accepted by the sealed one-shot endpoint.
 
-    It intentionally inherits the disabled ``run`` method in Phase 4.0.  This
-    gives review code one implementation identity without providing a path to
-    start a child process prematurely.
+    Its ordinary ``run`` method remains disabled.  A process executor is
+    constructed lazily *after* a valid execution claim is stored and marked
+    running.  Production supplies no executor in Phase 4.2, while tests use a
+    no-I/O executor to exercise the exact same identity and accounting path.
     """
+
+    def __init__(self, executor_factory: Callable[[], CodexProcessCanaryExecutor] | None = None):
+        self._executor_factory = executor_factory
+        self.executor_creations = 0
+        self.one_shot_calls = 0
+
+    @property
+    def execution_available(self) -> bool:
+        """An executor is still absent in the production Phase 4.2 wiring."""
+        return self._executor_factory is not None
+
+    async def run_one_shot(
+        self,
+        claim: Mapping[str, str],
+        binding: Mapping[str, str],
+        launch_spec: Mapping[str, Any],
+    ) -> CanaryExecution:
+        required = {
+            "execution_claim_id", "binding_hash", "contract_hash",
+            "runner_kind", "runner_version", "runner_implementation_hash",
+        }
+        if not required <= set(claim):
+            raise PolicyError("canary_execution_claim_invalid")
+        if (
+            claim["runner_kind"] != self.runner_kind
+            or claim["runner_version"] != self.runner_version
+            or claim["runner_implementation_hash"] != self.runner_implementation_hash
+            or claim["binding_hash"] != binding.get("binding_hash")
+            or claim["contract_hash"] != binding.get("contract_hash")
+        ):
+            raise PolicyError("canary_implementation_mismatch")
+        self.one_shot_calls += 1
+        if self._executor_factory is None:
+            raise PolicyError("codex_canary_execution_disabled")
+        executor = self._executor_factory()
+        self.executor_creations += 1
+        if not callable(getattr(executor, "run", None)):
+            raise PolicyError("actual_runner_policy_violation")
+        return await executor.run(binding, launch_spec)
 
 
 class FakeCodexProcessCanaryRunner:
@@ -306,21 +357,79 @@ class SealedOfflineCodexProcessCanary:
 
     _locks: dict[str, asyncio.Lock] = {}
 
-    def __init__(self, store, contract_service, runner: CodexProcessCanaryRunner | None = None):
+    def __init__(
+        self,
+        store,
+        contract_service,
+        runner: CodexProcessCanaryRunner | None = None,
+        *,
+        runner_factory: Callable[[], CodexProcessCanaryRunner] | None = None,
+    ):
         self.store = store
         self.contract_service = contract_service
-        self.runner = runner or DisabledCodexProcessCanaryRunner()
+        # A factory is used by the production one-shot route so neither the
+        # runner nor its process executor exists before SQLite has atomically
+        # consumed both capabilities.  Existing fake-runner tests continue to
+        # inject a concrete in-memory runner.
+        self.runner = runner
+        self._runner_factory = runner_factory
+        if self.runner is None and self._runner_factory is None:
+            self.runner = DisabledCodexProcessCanaryRunner()
         self._arm_lock = asyncio.Lock()
-        self.runner_kind = getattr(self.runner, "runner_kind", None)
-        self.runner_version = getattr(self.runner, "runner_version", None)
-        self.runner_implementation_hash = getattr(self.runner, "runner_implementation_hash", None)
+        if self.runner is None:
+            self.runner_kind = CANARY_RUNNER_KIND
+            self.runner_version = RUNNER_VERSION
+            self.runner_implementation_hash = RUNNER_IMPLEMENTATION_HASH
+        else:
+            self.runner_kind = getattr(self.runner, "runner_kind", None)
+            self.runner_version = getattr(self.runner, "runner_version", None)
+            self.runner_implementation_hash = getattr(self.runner, "runner_implementation_hash", None)
         if self.runner_kind not in {CANARY_RUNNER_KIND, FAKE_CANARY_RUNNER_KIND} or not isinstance(self.runner_version, str) or not _is_hash(self.runner_implementation_hash):
             raise PolicyError("codex_canary_runner_invalid")
 
+    def _runner_enabled(self) -> bool:
+        return bool(self.runner is not None and getattr(self.runner, "enabled", False))
+
+    def is_sealed_actual_runner_candidate(self) -> bool:
+        """Check identity without materializing a lazy production runner."""
+        if self.runner is not None:
+            return (
+                isinstance(self.runner, WSLCodexProcessCanaryRunner)
+                and self.runner_kind == CANARY_RUNNER_KIND
+                and not bool(getattr(self.runner, "is_fake", False))
+                and self.runner_version == RUNNER_VERSION
+                and self.runner_implementation_hash == RUNNER_IMPLEMENTATION_HASH
+            )
+        return self._runner_factory is not None and (
+            self.runner_kind,
+            self.runner_version,
+            self.runner_implementation_hash,
+        ) == (CANARY_RUNNER_KIND, RUNNER_VERSION, RUNNER_IMPLEMENTATION_HASH)
+
+    def _materialize_sealed_actual_runner(self) -> WSLCodexProcessCanaryRunner:
+        runner = self.runner
+        if runner is None:
+            if self._runner_factory is None:
+                raise PolicyError("actual_runner_policy_violation")
+            runner = self._runner_factory()
+        if (
+            not isinstance(runner, WSLCodexProcessCanaryRunner)
+            or runner.runner_kind != CANARY_RUNNER_KIND
+            or bool(getattr(runner, "is_fake", False))
+            or runner.runner_version != RUNNER_VERSION
+            or runner.runner_implementation_hash != RUNNER_IMPLEMENTATION_HASH
+        ):
+            raise PolicyError("actual_runner_policy_violation")
+        return runner
+
     def _binding(self, *, allow_disabled_runner: bool = False) -> dict[str, str]:
-        if not bool(getattr(self.runner, "enabled", False)) and not allow_disabled_runner:
+        if not self._runner_enabled() and not allow_disabled_runner:
             raise PolicyError("codex_canary_execution_disabled")
-        if not REQUIRED_EXEC_OPTIONS <= set(getattr(self.runner, "supported_options", frozenset())):
+        supported_options = (
+            REQUIRED_EXEC_OPTIONS if self.runner is None
+            else set(getattr(self.runner, "supported_options", frozenset()))
+        )
+        if not REQUIRED_EXEC_OPTIONS <= set(supported_options):
             raise PolicyError("codex_canary_required_option_missing")
         runtime = self.store.wsl_codex_runtime_result()
         if not isinstance(runtime, Mapping) or runtime.get("identity_version") != RUNTIME_IDENTITY_VERSION:
@@ -364,7 +473,7 @@ class SealedOfflineCodexProcessCanary:
         return {"binding_hash": sha256_json(fields), **fields}  # type: ignore[arg-type]
 
     def ready(self) -> dict[str, Any]:
-        if not bool(getattr(self.runner, "enabled", False)):
+        if not self._runner_enabled():
             return {
                 "status": DISABLED, "runner_kind": self.runner_kind, "runner_version": self.runner_version,
                 "runner_implementation_hash": self.runner_implementation_hash,
@@ -461,7 +570,7 @@ class SealedOfflineCodexProcessCanary:
         if current.get("binding_hash") != expected_binding.get("binding_hash"):
             self.record_blocked_execution_attempt(claimed_window, "execution_binding_changed")
             raise PolicyError("execution_binding_changed")
-        if not bool(getattr(self.runner, "enabled", False)):
+        if not self._runner_enabled():
             self.record_blocked_execution_attempt(claimed_window, "codex_canary_execution_disabled")
             raise PolicyError("codex_canary_execution_disabled")
         key = f"{self.store.db_path}:{current['contract_hash']}:{self.runner_implementation_hash}"
@@ -474,7 +583,92 @@ class SealedOfflineCodexProcessCanary:
                 return public_canary_result({**existing, "reused": True})
             return await self._run_once(current)
 
-    async def _run_once(self, binding: Mapping[str, str]) -> dict[str, Any]:
+    async def run_one_shot_execution_claim(
+        self,
+        claim: Mapping[str, str],
+        expected_binding: Mapping[str, str],
+    ) -> dict[str, Any]:
+        """Run the concrete sealed runner only after an immutable claim exists.
+
+        This is deliberately distinct from ``run_claimed_execution_permit``:
+        the ordinary endpoint remains disabled, whereas this method admits a
+        lazy ``WSLCodexProcessCanaryRunner`` only after storage has consumed
+        both capabilities and recorded a claim.  No fake runner can enter this
+        path.
+        """
+        claim_id = claim.get("execution_claim_id")
+        if not isinstance(claim_id, str):
+            raise PolicyError("canary_execution_claim_invalid")
+        try:
+            current = self._binding(allow_disabled_runner=True)
+        except PolicyError as exc:
+            self.store.finish_codex_canary_execution_claim(claim_id, ERROR, "execution_binding_changed")
+            self.record_blocked_execution_attempt(claim, "execution_binding_changed")
+            raise PolicyError("execution_binding_changed") from exc
+        if (
+            current.get("binding_hash") != expected_binding.get("binding_hash")
+            or current.get("binding_hash") != claim.get("binding_hash")
+            or current.get("implementation_hash") != claim.get("runner_implementation_hash")
+        ):
+            self.store.finish_codex_canary_execution_claim(claim_id, ERROR, "execution_binding_changed")
+            self.record_blocked_execution_attempt(claim, "execution_binding_changed")
+            raise PolicyError("execution_binding_changed")
+        # A second request cannot get beyond this compare-and-set.  It occurs
+        # before the runner factory (and, consequently, any executor factory)
+        # is touched.
+        claimed = self.store.begin_codex_canary_execution_claim(claim_id, current)
+        existing = self.store.codex_process_canary_result(
+            current["contract_hash"], CANARY_RUNNER_KIND, RUNNER_VERSION, RUNNER_IMPLEMENTATION_HASH,
+        )
+        if isinstance(existing, Mapping) and existing.get("status") == PASSED:
+            self.store.finish_codex_canary_execution_claim(claim_id, PASSED, None)
+            return public_canary_result({**existing, "reused": True})
+        try:
+            active_runner = self._materialize_sealed_actual_runner()
+        except PolicyError as exc:
+            self.store.finish_codex_canary_execution_claim(claim_id, POLICY_VIOLATION, str(exc))
+            self.record_blocked_execution_attempt(claimed, str(exc))
+            raise
+        if (
+            active_runner.runner_kind != claim.get("runner_kind")
+            or active_runner.runner_version != claim.get("runner_version")
+            or active_runner.runner_implementation_hash != claim.get("runner_implementation_hash")
+        ):
+            self.store.finish_codex_canary_execution_claim(claim_id, POLICY_VIOLATION, "canary_implementation_mismatch")
+            self.record_blocked_execution_attempt(claimed, "canary_implementation_mismatch")
+            raise PolicyError("canary_implementation_mismatch")
+        if not active_runner.execution_available:
+            self.store.finish_codex_canary_execution_claim(claim_id, ERROR, "codex_canary_execution_disabled")
+            self.record_blocked_execution_attempt(claimed, "codex_canary_execution_disabled")
+            raise PolicyError("codex_canary_execution_disabled")
+        try:
+            result = await self._run_once(current, runner=active_runner, execution_claim=claimed)
+        except Exception:
+            self.store.finish_codex_canary_execution_claim(claim_id, ERROR, "canary_error")
+            raise
+        final_status = PASSED if result.get("status") == PASSED else ERROR
+        self.store.finish_codex_canary_execution_claim(claim_id, final_status, result.get("error_code"))
+        return result
+
+    async def _run_once(
+        self,
+        binding: Mapping[str, str],
+        *,
+        runner: CodexProcessCanaryRunner | None = None,
+        execution_claim: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
+        active_runner = runner or self.runner
+        if active_runner is None:
+            raise PolicyError("codex_canary_execution_disabled")
+        runner_kind = getattr(active_runner, "runner_kind", None)
+        runner_version = getattr(active_runner, "runner_version", None)
+        runner_implementation_hash = getattr(active_runner, "runner_implementation_hash", None)
+        if (
+            runner_kind != self.runner_kind
+            or runner_version != self.runner_version
+            or runner_implementation_hash != self.runner_implementation_hash
+        ):
+            raise PolicyError("actual_runner_policy_violation")
         started_at = _now()
         running = {
             "canary_id": str(uuid.uuid4()), "contract_hash": binding["contract_hash"], "binding_hash": binding["binding_hash"],
@@ -482,8 +676,8 @@ class SealedOfflineCodexProcessCanary:
             "request_count": 0, "request_hash": None, "response_hash": None, "config_hash": binding["config_hash"],
             "prompt_hash": EXPECTED_PROMPT_HASH, "expected_output_hash": EXPECTED_OUTPUT_HASH,
             "exit_code": None, "output_bytes": 0, "local_processes": 0, "local_duration_ms": 0,
-            "runner_kind": self.runner_kind, "runner_version": self.runner_version,
-            "runner_implementation_hash": self.runner_implementation_hash, "implementation_hash": self.runner_implementation_hash,
+            "runner_kind": runner_kind, "runner_version": runner_version,
+            "runner_implementation_hash": runner_implementation_hash, "implementation_hash": runner_implementation_hash,
             "start_allowed": False,
         }
         self.store.begin_codex_process_canary(running)
@@ -494,8 +688,17 @@ class SealedOfflineCodexProcessCanary:
             contract, error_code = self.contract_service.immutable_execution_contract()
             if contract is None:
                 raise PolicyError(error_code or "stored_contract_required")
-            execution = await asyncio.wait_for(self.runner.run(binding, build_canary_launch_spec(contract)), timeout=PROCESS_TIMEOUT_SECONDS)
-            self._validate_execution(execution)
+            launch_spec = build_canary_launch_spec(contract)
+            if execution_claim is not None:
+                if not isinstance(active_runner, WSLCodexProcessCanaryRunner):
+                    raise PolicyError("actual_runner_policy_violation")
+                execution = await asyncio.wait_for(
+                    active_runner.run_one_shot(execution_claim, binding, launch_spec),
+                    timeout=PROCESS_TIMEOUT_SECONDS,
+                )
+            else:
+                execution = await asyncio.wait_for(active_runner.run(binding, launch_spec), timeout=PROCESS_TIMEOUT_SECONDS)
+            self._validate_execution(execution, active_runner)
             result = {
                 **running, "status": PASSED, "request_count": execution.request_count,
                 "request_hash": execution.request_hash, "response_hash": execution.response_hash,
@@ -533,17 +736,17 @@ class SealedOfflineCodexProcessCanary:
             "start_allowed": False,
         }
         saved = self.store.finish_codex_process_canary(result)
-        ledger_source = "LOCAL_ESTIMATE" if bool(getattr(self.runner, "is_fake", False)) else "LOCAL_OBSERVED"
+        ledger_source = "LOCAL_ESTIMATE" if bool(getattr(active_runner, "is_fake", False)) else "LOCAL_OBSERVED"
         ledger_quality = "ESTIMATED" if ledger_source == "LOCAL_ESTIMATE" else "OBSERVED"
         self.store.record_codex_process_canary_ledger(saved, "RUN", source=ledger_source, quality=ledger_quality)
         return public_canary_result(saved)
 
-    def _validate_execution(self, execution: CanaryExecution) -> None:
+    def _validate_execution(self, execution: CanaryExecution, active_runner: CodexProcessCanaryRunner) -> None:
         if (execution.runner_kind, execution.runner_version, execution.runner_implementation_hash) != (
-            self.runner_kind, self.runner_version, self.runner_implementation_hash,
+            active_runner.runner_kind, active_runner.runner_version, active_runner.runner_implementation_hash,
         ):
             raise PolicyError("canary_runner_identity_mismatch")
-        if execution.runner_implementation_hash != self.runner_implementation_hash:
+        if execution.runner_implementation_hash != active_runner.runner_implementation_hash:
             raise PolicyError("canary_implementation_mismatch")
         if execution.stdout_bytes < 0 or execution.stderr_bytes < 0 or execution.stdout_bytes + execution.stderr_bytes > PROCESS_OUTPUT_LIMIT_BYTES:
             raise PolicyError("canary_output_limit")
@@ -600,13 +803,7 @@ class CodexCanaryExecutionPermitGate:
         self._permit_lock = asyncio.Lock()
 
     def _require_actual_runner(self) -> None:
-        if (
-            not isinstance(self.service.runner, WSLCodexProcessCanaryRunner)
-            or self.service.runner_kind != CANARY_RUNNER_KIND
-            or bool(getattr(self.service.runner, "is_fake", False))
-            or self.service.runner_version != RUNNER_VERSION
-            or self.service.runner_implementation_hash != RUNNER_IMPLEMENTATION_HASH
-        ):
+        if not self.service.is_sealed_actual_runner_candidate():
             raise PolicyError("actual_runner_policy_violation")
 
     def _sealed_binding(self) -> dict[str, str]:
@@ -647,8 +844,42 @@ class CodexCanaryExecutionPermitGate:
             raise
 
     async def run(self, permit_nonce: str | None, canary_nonce: str | None) -> dict[str, Any]:
+        """The legacy endpoint stays disabled in Phase 4.2."""
+        return await self._run_consumed_capabilities(permit_nonce, canary_nonce, one_shot=False)
+
+    async def run_one_shot(self, permit_nonce: str | None, canary_nonce: str | None) -> dict[str, Any]:
+        """Select the sealed WSL runner for one already-authorized request."""
+        return await self._run_consumed_capabilities(permit_nonce, canary_nonce, one_shot=True)
+
+    async def _run_consumed_capabilities(
+        self,
+        permit_nonce: str | None,
+        canary_nonce: str | None,
+        *,
+        one_shot: bool,
+    ) -> dict[str, Any]:
         # Both capabilities are claimed before any new binding check or runner
         # selection.  Thus failures cannot leave an authorization reusable.
+        # The one-shot transaction additionally creates an immutable execution
+        # claim.  It contains only IDs and sealed hashes, never either nonce.
+        expected: dict[str, str] | None = None
+        try:
+            expected = self._sealed_binding()
+        except PolicyError:
+            # Still consume a valid capability pair before reporting an
+            # environment change.  It cannot be retried after a failed
+            # revalidation.
+            claimed = self.store.consume_codex_canary_execution_permit_and_window(permit_nonce, canary_nonce)
+            window = claimed["window"]
+            self.service.record_blocked_execution_attempt(window, "execution_binding_changed")
+            self.store.mark_codex_canary_execution_permit_blocked(claimed["permit"]["permit_id"], "execution_binding_changed")
+            raise PolicyError("execution_binding_changed")
+        if one_shot:
+            claim = self.store.claim_codex_canary_one_shot_execution(permit_nonce, canary_nonce, expected)
+            # A claim is authorization bookkeeping, not a spawn measurement.
+            # It remains an ESTIMATED plan event with zero actual processes.
+            self.store.record_codex_process_canary_ledger(claim, "CLAIM")
+            return await self.service.run_one_shot_execution_claim(claim, expected)
         claimed = self.store.consume_codex_canary_execution_permit_and_window(permit_nonce, canary_nonce)
         permit = claimed["permit"]
         window = claimed["window"]

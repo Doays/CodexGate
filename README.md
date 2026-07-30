@@ -174,6 +174,31 @@ Phase 4.1 adds a separate **Offline Canary Execution Permit** without adding a d
 
 The execution request atomically consumes the Permit nonce and Canary-window nonce before it rechecks the binding or could select the runner. A changed binding is recorded as `execution_binding_changed`; either capability cannot be retried. App restart expires any remaining Permit. Only the concrete sealed WSL Canary runner identity is accepted—fake runner injection is a policy violation. Permit issuance and consumption start no process; a pre-spawn denial records `LOCAL_OBSERVED` with `local_processes = 0`, null provider tokens, zero external model requests, and zero app-server RPCs. The currently sealed production runner remains disabled, so this phase still performs no WSL, bwrap, Codex, socket, DNS, or model execution.
 
+### Sealed Offline Codex Canary One-Shot Runner Phase 4.2
+
+Phase 4.2 keeps the ordinary Canary endpoint fail-closed as
+`codex_canary_execution_disabled`. A separate local IPv4/same-Origin
+one-shot endpoint is the only route that can select the concrete
+`WSLCodexProcessCanaryRunner`. It accepts no user command, path, model, prompt,
+or argv. The Permit and Canary-window nonce hashes, the complete Runtime,
+Contract, actual Harness, Canary, Repro, and runner implementation identities
+are rechecked and atomically claimed in one SQLite `BEGIN IMMEDIATE`
+transaction. The claim stores only identifiers and SHA-256 values; both
+plaintext nonces are immediately unrecoverable.
+
+No runner object or executor is materialized before a claim reaches `RUNNING`.
+The concrete runner receives only its sealed launch specification and may make
+at most one spawn attempt; retry, fallback, reroute, resume, and a second spawn
+are prohibited. A changed binding is consumed and reported as
+`execution_binding_changed` before a process can start. Restart recovery turns
+orphaned `CLAIMED`/`RUNNING` claims into `ERROR/canary_interrupted`. The Phase
+4.2 production factory deliberately has no executor, so the one-shot endpoint
+still records a zero-process observed block instead of starting WSL or Codex.
+Tests inject only a deterministic no-I/O executor behind the same concrete
+runner class. Any actual future spawn records only the count that started and
+monotonic duration as `LOCAL_OBSERVED`; provider tokens stay null, fake usage
+is ignored, and external-model and app-server-RPC counters remain zero.
+
 - Only `127.0.0.1` and `localhost` are accepted as `Host`
 - If `Origin` is present, it must match the same local origin
 - `project_id` must be a safe slug or UUID

@@ -372,7 +372,8 @@ function renderCodexProcessCanary(result) {
   const implementation = result?.implementation_hash ? "implementation sealed" : "implementation not runnable";
   const code = result?.error_code ? ` Code: ${result.error_code}.` : "";
   statusNode.textContent = status;
-  detailNode.textContent = `Offline Codex canary ${status}; ${implementation}. Permit ${permit.status || "DISABLED"}.${permitRemaining} Canary window ${window.status || "DISABLED"}.${remaining}${code} One local click authorizes at most one fixed fake-response check with external model tokens 0; Runtime and live execution remain locked.`;
+  const claim = result?.execution_claim || { status: "DISABLED" };
+  detailNode.textContent = `Offline Codex canary ${status}; ${implementation}. Permit ${permit.status || "DISABLED"}.${permitRemaining} Canary window ${window.status || "DISABLED"}.${remaining} One-shot claim ${claim.status || "DISABLED"}.${code} One local click authorizes at most one fixed fake-response check with external model tokens 0; Runtime and live execution remain locked.`;
   const permitButton = $("issue-codex-process-canary-permit");
   const armButton = $("arm-codex-process-canary");
   const runButton = $("run-codex-process-canary");
@@ -551,8 +552,14 @@ async function armCodexProcessCanary() {
 
 async function runCodexProcessCanary() {
   if (!codexProcessCanaryPermit || !codexProcessCanaryArm) return;
+  const button = $("run-codex-process-canary");
   try {
-    const result = await api("/api/isolation/wsl/codex-process-canary", {
+    // Disable synchronously before the request so the browser cannot resend
+    // the same two one-time capabilities while the response is pending.
+    if (button) button.disabled = true;
+    // This is the only UI path that can request the sealed actual runner.
+    // It always clears both browser-side capabilities after one submission.
+    const result = await api("/api/isolation/wsl/codex-process-canary/one-shot", {
       method: "POST",
       body: JSON.stringify({
         permit_nonce: codexProcessCanaryPermit.permit_nonce,

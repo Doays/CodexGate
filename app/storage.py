@@ -528,6 +528,25 @@ class Store:
                 )"""
             )
             conn.execute(
+                """CREATE TABLE IF NOT EXISTS codex_canary_execution_claims (
+                    execution_claim_id TEXT PRIMARY KEY,
+                    permit_id TEXT NOT NULL UNIQUE,
+                    window_id TEXT NOT NULL UNIQUE,
+                    binding_hash TEXT NOT NULL,
+                    contract_hash TEXT NOT NULL,
+                    runner_kind TEXT NOT NULL,
+                    runner_version TEXT NOT NULL,
+                    runner_implementation_hash TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('CLAIMED', 'RUNNING', 'PASSED', 'FAILED', 'POLICY_VIOLATION', 'ERROR')),
+                    claimed_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    error_code TEXT,
+                    payload TEXT NOT NULL,
+                    integrity_hash TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
                 """CREATE TABLE IF NOT EXISTS wsl_isolation_probe_results (
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                     backend TEXT NOT NULL,
@@ -686,6 +705,7 @@ class Store:
             conn.execute("CREATE INDEX IF NOT EXISTS codex_process_canary_runs_status ON codex_process_canary_runs(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS codex_process_canary_windows_status ON codex_process_canary_windows(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS codex_canary_execution_permits_status ON codex_canary_execution_permits(status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS codex_canary_execution_claims_status ON codex_canary_execution_claims(status)")
             self._migrate_route_plan_uses(conn)
             self._migrate_route_plans(conn)
             self._migrate_bridge_nonces(conn)
@@ -3311,6 +3331,314 @@ class Store:
             "binding_hash": permit["binding_hash"],
         }
 
+    @staticmethod
+    def _codex_canary_execution_claim_public(record: Mapping[str, Any]) -> dict[str, Any]:
+        fields = (
+            "execution_claim_id", "permit_id", "window_id", "binding_hash", "contract_hash",
+            "runner_kind", "runner_version", "runner_implementation_hash", "status",
+            "claimed_at", "started_at", "finished_at", "error_code",
+        )
+        return {field: record.get(field) for field in fields}
+
+    @staticmethod
+    def _codex_canary_execution_claim_record(row: tuple[Any, ...]) -> dict[str, Any]:
+        fields = (
+            "execution_claim_id", "permit_id", "window_id", "binding_hash", "contract_hash",
+            "runner_kind", "runner_version", "runner_implementation_hash", "status",
+            "claimed_at", "started_at", "finished_at", "error_code", "payload", "integrity_hash",
+        )
+        record = dict(zip(fields, row))
+        try:
+            payload = json.loads(record.pop("payload"))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise PolicyError("codex_canary_execution_claim_invalid") from exc
+        if not isinstance(payload, dict) or sha256_json(payload) != record["integrity_hash"]:
+            raise PolicyError("codex_canary_execution_claim_invalid")
+        if any(payload.get(field) != record[field] for field in fields[:-2]):
+            raise PolicyError("codex_canary_execution_claim_invalid")
+        return {**payload, "integrity_hash": record["integrity_hash"]}
+
+    @staticmethod
+    def _codex_canary_claim_binding_is_current(
+        conn: sqlite3.Connection,
+        expected: Mapping[str, str],
+        now_value: str,
+    ) -> bool:
+        """Recheck every sealed identity inside the claim transaction."""
+        try:
+            runtime_row = conn.execute("SELECT payload, integrity_hash FROM wsl_codex_runtime_results WHERE singleton=1").fetchone()
+            isolation_row = conn.execute("SELECT payload, integrity_hash FROM wsl_isolation_probe_results WHERE singleton=1").fetchone()
+            contract_row = conn.execute(
+                "SELECT contract_id, contract_hash, status FROM sealed_egress_contract_instances WHERE contract_id=? AND contract_hash=?",
+                (expected["contract_id"], expected["contract_hash"]),
+            ).fetchone()
+            repro_row = conn.execute("SELECT payload, integrity_hash FROM wsl_isolation_repro_runs WHERE cache_key=?", (expected["repro_key"],)).fetchone()
+            harness_row = conn.execute(
+                """SELECT status FROM egress_harness_runs
+                   WHERE contract_hash=? AND runner_kind=? AND runner_version=? AND runner_implementation_hash=?""",
+                (
+                    expected["contract_hash"], expected["harness_runner_kind"],
+                    expected["harness_runner_version"], expected["harness_implementation_hash"],
+                ),
+            ).fetchone()
+            if not all((runtime_row, isolation_row, contract_row, repro_row, harness_row)):
+                return False
+            runtime = json.loads(runtime_row[0])
+            isolation = json.loads(isolation_row[0])
+            repro = json.loads(repro_row[0])
+            if (
+                not isinstance(runtime, dict) or sha256_json(runtime) != runtime_row[1]
+                or not isinstance(isolation, dict) or sha256_json(isolation) != isolation_row[1]
+                or not isinstance(repro, dict) or sha256_json(repro) != repro_row[1]
+            ):
+                return False
+            current = datetime.fromisoformat(now_value)
+            expires_at = datetime.fromisoformat(str(isolation.get("expires_at")))
+            if current.tzinfo is None or expires_at.tzinfo is None:
+                return False
+            return (
+                runtime.get("identity_version") == expected["runtime_identity_version"]
+                and runtime.get("status") == "EGRESS_UNCONFIGURED"
+                and runtime.get("runtime_fingerprint") == expected["runtime_fingerprint"]
+                and runtime.get("launch_spec_hash") == expected["launch_spec_hash"]
+                and runtime.get("binary_sha256") == expected["binary_sha256"]
+                and runtime.get("isolation_cache_key") == expected["isolation_cache_key"]
+                and runtime.get("egress_blocked") is True
+                and runtime.get("start_allowed") is False
+                and isolation.get("status") == "SAFE_CANDIDATE"
+                and isolation.get("config_hash") == expected["isolation_config_hash"]
+                and isolation.get("tool_fingerprint") == expected["tool_fingerprint"]
+                and isolation.get("cache_key") == expected["isolation_cache_key"]
+                and expires_at >= current + timedelta(seconds=300)
+                and contract_row[2] == "AUTH_UNCONFIGURED"
+                and repro.get("status") == "SAFE_REPRODUCIBLE"
+                and repro.get("config_hash") == expected["isolation_config_hash"]
+                and repro.get("tool_fingerprint") == expected["tool_fingerprint"]
+                and repro.get("result_hash") == expected["repro_result_hash"]
+                and int(repro.get("requested_runs") or 0) == 10
+                and int(repro.get("completed_runs") or 0) == 10
+                and int(repro.get("success_count") or 0) == 10
+                and harness_row[0] == "PASSED"
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+
+    def claim_codex_canary_one_shot_execution(
+        self,
+        permit_nonce: str | None,
+        canary_nonce: str | None,
+        binding: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically consume both capabilities and persist an immutable claim.
+
+        The call deliberately starts its own ``BEGIN IMMEDIATE`` transaction:
+        capability validation, identity comparison, consumption, and claim
+        creation cannot be split across two callers.  Only sealed identifiers
+        and hashes become claim data; plaintext nonces never leave this scope.
+        """
+        expected = self._validate_codex_canary_execution_permit_binding(binding)
+        permit_nonce = self._require_codex_canary_nonce(permit_nonce, "codex_canary_permit_required")
+        canary_nonce = self._require_codex_canary_nonce(canary_nonce, "codex_canary_nonce_required")
+        current = datetime.now(timezone.utc)
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            permit_row = conn.execute(
+                """SELECT permit_id, binding_hash, contract_id, contract_hash, runtime_identity_version,
+                          runtime_fingerprint, launch_spec_hash, binary_sha256, isolation_config_hash,
+                          tool_fingerprint, isolation_cache_key, harness_runner_kind, harness_runner_version,
+                          harness_implementation_hash, canary_runner_kind, canary_runner_version,
+                          canary_implementation_hash, repro_version, repro_key, repro_result_hash, status,
+                          issued_at, expires_at, consumed_at, error_code
+                   FROM codex_canary_execution_permits WHERE nonce_hash=?""",
+                (hashlib.sha256(permit_nonce.encode("ascii")).hexdigest(),),
+            ).fetchone()
+            window_row = conn.execute(
+                """SELECT window_id, binding_hash, contract_hash, runner_kind, runner_version, runner_implementation_hash,
+                          status, issued_at, expires_at, consumed_at, error_code
+                   FROM codex_process_canary_windows WHERE nonce_hash=?""",
+                (hashlib.sha256(canary_nonce.encode("ascii")).hexdigest(),),
+            ).fetchone()
+            if not permit_row:
+                raise PolicyError("codex_canary_permit_invalid")
+            if not window_row:
+                raise PolicyError("codex_canary_nonce_invalid")
+            permit = self._codex_canary_execution_permit_row(permit_row)
+            window_fields = (
+                "window_id", "binding_hash", "contract_hash", "runner_kind", "runner_version",
+                "runner_implementation_hash", "status", "issued_at", "expires_at", "consumed_at", "error_code",
+            )
+            window = dict(zip(window_fields, window_row))
+            if permit["status"] != "ARMED" or permit["consumed_at"] is not None:
+                raise PolicyError("codex_canary_permit_reused")
+            if window["status"] != "ARMED" or window["consumed_at"] is not None:
+                raise PolicyError("codex_canary_nonce_reused")
+            now_value = current.isoformat()
+            if str(permit["expires_at"]) <= now_value:
+                conn.execute("UPDATE codex_canary_execution_permits SET status='EXPIRED', error_code='codex_canary_permit_expired' WHERE permit_id=? AND status='ARMED'", (permit["permit_id"],))
+                conn.commit()
+                raise PolicyError("codex_canary_permit_expired")
+            if str(window["expires_at"]) <= now_value:
+                conn.execute("UPDATE codex_process_canary_windows SET status='EXPIRED', error_code='canary_window_expired' WHERE window_id=? AND status='ARMED'", (window["window_id"],))
+                conn.commit()
+                raise PolicyError("codex_canary_window_expired")
+            matches = (
+                all(
+                    permit.get("canary_implementation_hash" if field == "implementation_hash" else field)
+                    == expected.get(field)
+                    for field in self._CODEX_CANARY_PERMIT_FIELDS
+                )
+                and permit["binding_hash"] == window["binding_hash"] == expected["binding_hash"]
+                and permit["contract_hash"] == window["contract_hash"] == expected["contract_hash"]
+                and permit["canary_runner_kind"] == window["runner_kind"] == expected["canary_runner_kind"]
+                and permit["canary_runner_version"] == window["runner_version"] == expected["canary_runner_version"]
+                and permit["canary_implementation_hash"] == window["runner_implementation_hash"] == expected["implementation_hash"]
+                and self._codex_canary_claim_binding_is_current(conn, expected, now_value)
+            )
+            if not matches:
+                conn.execute("UPDATE codex_canary_execution_permits SET status='CONSUMED', consumed_at=?, error_code='execution_binding_changed' WHERE permit_id=? AND status='ARMED'", (now_value, permit["permit_id"]))
+                conn.execute("UPDATE codex_process_canary_windows SET status='CONSUMED', consumed_at=?, error_code='execution_binding_changed' WHERE window_id=? AND status='ARMED'", (now_value, window["window_id"]))
+                conn.commit()
+                raise PolicyError("execution_binding_changed")
+            permit_cursor = conn.execute(
+                "UPDATE codex_canary_execution_permits SET status='CONSUMED', consumed_at=? WHERE permit_id=? AND status='ARMED' AND consumed_at IS NULL",
+                (now_value, permit["permit_id"]),
+            )
+            window_cursor = conn.execute(
+                "UPDATE codex_process_canary_windows SET status='CONSUMED', consumed_at=? WHERE window_id=? AND status='ARMED' AND consumed_at IS NULL",
+                (now_value, window["window_id"]),
+            )
+            if permit_cursor.rowcount != 1 or window_cursor.rowcount != 1:
+                raise PolicyError("codex_canary_nonce_reused")
+            record = {
+                "execution_claim_id": str(uuid.uuid4()), "permit_id": permit["permit_id"], "window_id": window["window_id"],
+                **expected,
+                "runner_kind": expected["canary_runner_kind"],
+                "runner_version": expected["canary_runner_version"],
+                "runner_implementation_hash": expected["implementation_hash"],
+                "status": "CLAIMED", "claimed_at": now_value, "started_at": None,
+                "finished_at": None, "error_code": None,
+            }
+            digest = sha256_json(record)
+            conn.execute(
+                """INSERT INTO codex_canary_execution_claims
+                   (execution_claim_id, permit_id, window_id, binding_hash, contract_hash, runner_kind,
+                    runner_version, runner_implementation_hash, status, claimed_at, started_at, finished_at,
+                    error_code, payload, integrity_hash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)""",
+                (
+                    record["execution_claim_id"], record["permit_id"], record["window_id"], record["binding_hash"],
+                    record["contract_hash"], record["runner_kind"], record["runner_version"],
+                    record["runner_implementation_hash"], record["status"], record["claimed_at"],
+                    json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")), digest,
+                ),
+            )
+        return dict(record)
+
+    def _codex_canary_execution_claim(self, claim_id: str) -> dict[str, Any]:
+        if not isinstance(claim_id, str) or not re.fullmatch(r"[0-9a-f-]{36}", claim_id):
+            raise PolicyError("canary_execution_claim_invalid")
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT execution_claim_id, permit_id, window_id, binding_hash, contract_hash, runner_kind,
+                          runner_version, runner_implementation_hash, status, claimed_at, started_at, finished_at,
+                          error_code, payload, integrity_hash
+                   FROM codex_canary_execution_claims WHERE execution_claim_id=?""", (claim_id,),
+            ).fetchone()
+        if not row:
+            raise PolicyError("canary_execution_claim_invalid")
+        return self._codex_canary_execution_claim_record(row)
+
+    def begin_codex_canary_execution_claim(self, claim_id: str, binding: Mapping[str, Any]) -> dict[str, Any]:
+        expected = self._validate_codex_canary_execution_permit_binding(binding)
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """SELECT execution_claim_id, permit_id, window_id, binding_hash, contract_hash, runner_kind,
+                          runner_version, runner_implementation_hash, status, claimed_at, started_at, finished_at,
+                          error_code, payload, integrity_hash
+                   FROM codex_canary_execution_claims WHERE execution_claim_id=?""", (claim_id,),
+            ).fetchone()
+            if not row:
+                raise PolicyError("canary_execution_claim_invalid")
+            record = self._codex_canary_execution_claim_record(row)
+            if record["status"] != "CLAIMED":
+                raise PolicyError("canary_execution_claim_reused")
+            if (
+                record["binding_hash"] != expected["binding_hash"]
+                or record["contract_hash"] != expected["contract_hash"]
+                or record["runner_kind"] != expected["canary_runner_kind"]
+                or record["runner_version"] != expected["canary_runner_version"]
+                or record["runner_implementation_hash"] != expected["implementation_hash"]
+            ):
+                raise PolicyError("execution_binding_changed")
+            started_at = _now()
+            record.update({"status": "RUNNING", "started_at": started_at})
+            digest = sha256_json({key: value for key, value in record.items() if key != "integrity_hash"})
+            cursor = conn.execute(
+                """UPDATE codex_canary_execution_claims SET status='RUNNING', started_at=?, payload=?, integrity_hash=?
+                   WHERE execution_claim_id=? AND status='CLAIMED'""",
+                (started_at, json.dumps({key: value for key, value in record.items() if key != "integrity_hash"}, ensure_ascii=False, sort_keys=True, separators=(",", ":")), digest, claim_id),
+            )
+            if cursor.rowcount != 1:
+                raise PolicyError("canary_execution_claim_reused")
+        return {key: value for key, value in record.items() if key != "integrity_hash"}
+
+    def finish_codex_canary_execution_claim(self, claim_id: str, status: str, error_code: str | None) -> dict[str, Any]:
+        if status not in {"PASSED", "FAILED", "ERROR", "POLICY_VIOLATION"}:
+            raise PolicyError("canary_execution_claim_invalid")
+        if error_code is not None and (not isinstance(error_code, str) or not re.fullmatch(r"[a-z0-9_]{1,80}", error_code)):
+            raise PolicyError("canary_execution_claim_invalid")
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """SELECT execution_claim_id, permit_id, window_id, binding_hash, contract_hash, runner_kind,
+                          runner_version, runner_implementation_hash, status, claimed_at, started_at, finished_at,
+                          error_code, payload, integrity_hash
+                   FROM codex_canary_execution_claims WHERE execution_claim_id=?""", (claim_id,),
+            ).fetchone()
+            if not row:
+                raise PolicyError("canary_execution_claim_invalid")
+            record = self._codex_canary_execution_claim_record(row)
+            if record["status"] not in {"CLAIMED", "RUNNING"}:
+                return self._codex_canary_execution_claim_public(record)
+            finished_at = _now()
+            record.update({"status": status, "finished_at": finished_at, "error_code": error_code})
+            payload = {key: value for key, value in record.items() if key != "integrity_hash"}
+            digest = sha256_json(payload)
+            conn.execute(
+                """UPDATE codex_canary_execution_claims SET status=?, finished_at=?, error_code=?, payload=?, integrity_hash=?
+                   WHERE execution_claim_id=? AND status IN ('CLAIMED', 'RUNNING')""",
+                (status, finished_at, error_code, json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")), digest, claim_id),
+            )
+        return self._codex_canary_execution_claim_public(record)
+
+    def codex_canary_execution_claim(self) -> dict[str, Any]:
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT execution_claim_id, permit_id, window_id, binding_hash, contract_hash, runner_kind,
+                          runner_version, runner_implementation_hash, status, claimed_at, started_at, finished_at,
+                          error_code, payload, integrity_hash
+                   FROM codex_canary_execution_claims ORDER BY claimed_at DESC LIMIT 1""",
+            ).fetchone()
+        if not row:
+            return {"status": "DISABLED"}
+        return self._codex_canary_execution_claim_public(self._codex_canary_execution_claim_record(row))
+
+    def recover_interrupted_codex_canary_execution_claims(self) -> int:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """SELECT execution_claim_id, permit_id, window_id, binding_hash, contract_hash, runner_kind,
+                          runner_version, runner_implementation_hash, status, claimed_at, started_at, finished_at,
+                          error_code, payload, integrity_hash
+                   FROM codex_canary_execution_claims WHERE status IN ('CLAIMED', 'RUNNING')""",
+            ).fetchall()
+        count = 0
+        for row in rows:
+            record = self._codex_canary_execution_claim_record(row)
+            self.finish_codex_canary_execution_claim(record["execution_claim_id"], "ERROR", "canary_interrupted")
+            count += 1
+        return count
+
     def invalidate_codex_canary_execution_permit(self, nonce: str | None, error_code: str) -> None:
         nonce = self._require_codex_canary_nonce(nonce, "codex_canary_permit_required")
         if not re.fullmatch(r"[a-z0-9_]{1,80}", error_code):
@@ -3340,19 +3668,25 @@ class Store:
     def record_codex_process_canary_ledger(
         self, result: Mapping[str, Any], action: str, *, source: str | None = None, quality: str | None = None
     ) -> dict[str, Any]:
-        if action not in {"ARM", "CONSUME", "BLOCKED", "RUN"}:
+        if action not in {"ARM", "CONSUME", "CLAIM", "BLOCKED", "RUN"}:
             raise PolicyError("codex_canary_ledger_invalid")
-        identifier = result.get("canary_id") if action == "RUN" else result.get("window_id")
+        identifier = result.get("canary_id") if action == "RUN" else (
+            result.get("execution_claim_id") if action == "CLAIM" else result.get("window_id")
+        )
         if not isinstance(identifier, str):
             identifier = "unknown"
-        occurred_at = result.get("finished_at") if action == "RUN" else (result.get("consumed_at") if action in {"CONSUME", "BLOCKED"} else result.get("issued_at"))
+        occurred_at = result.get("finished_at") if action == "RUN" else (
+            result.get("claimed_at") if action == "CLAIM" else (
+                result.get("consumed_at") if action in {"CONSUME", "BLOCKED"} else result.get("issued_at")
+            )
+        )
         if not isinstance(occurred_at, str):
             occurred_at = _now()
         # Only the sealed real runner identity can emit observed process
         # counters; an absent or fake identity remains an estimate.
         fake = result.get("runner_kind") != "WSL_CODEX_CANARY"
         if source is None:
-            source = "LOCAL_ESTIMATE" if action in {"ARM", "CONSUME"} or fake else "LOCAL_OBSERVED"
+            source = "LOCAL_ESTIMATE" if action in {"ARM", "CONSUME", "CLAIM"} or fake else "LOCAL_OBSERVED"
         if quality is None:
             quality = "ESTIMATED" if source == "LOCAL_ESTIMATE" else "OBSERVED"
         if (source, quality) not in {("LOCAL_ESTIMATE", "ESTIMATED"), ("LOCAL_OBSERVED", "OBSERVED")}:
@@ -3364,7 +3698,11 @@ class Store:
         record = {
             "source_event_id": f"sealed-offline-codex-process-canary:{identifier}:{action}",
             "source": source, "quality": quality,
-            "event_type": "SEALED_OFFLINE_CODEX_PROCESS_CANARY_PLAN" if plan else "SEALED_OFFLINE_CODEX_PROCESS_CANARY",
+            "event_type": (
+                "SEALED_OFFLINE_CODEX_PROCESS_CANARY_CLAIM" if action == "CLAIM"
+                else "SEALED_OFFLINE_CODEX_PROCESS_CANARY_PLAN" if plan
+                else "SEALED_OFFLINE_CODEX_PROCESS_CANARY"
+            ),
             "status": result.get("status") if isinstance(result.get("status"), str) else "ERROR", "action": action,
             "contract_hash": result.get("contract_hash") if isinstance(result.get("contract_hash"), str) else "unknown",
             "implementation_hash": result.get("implementation_hash") or result.get("runner_implementation_hash"),

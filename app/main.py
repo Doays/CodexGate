@@ -263,6 +263,7 @@ async def lifespan(app: FastAPI):
     store.recover_interrupted_egress_harnesses()
     store.recover_armed_egress_execution_windows()
     store.recover_interrupted_codex_process_canaries()
+    store.recover_interrupted_codex_canary_execution_claims()
     store.recover_armed_codex_process_canary_windows()
     store.recover_armed_codex_canary_execution_permits()
     gate_instance = Gate(store)
@@ -282,10 +283,12 @@ async def lifespan(app: FastAPI):
     app.state.actual_wsl_egress_harness_gate = ActualWSLHarnessGate(
         store, app.state.actual_wsl_egress_harness_service,
     )
-    # Phase 4.1 adds only a one-use Permit gate.  The runner itself remains
-    # disabled, so constructing either object cannot start WSL or Codex.
+    # The production runner is a lazy factory: no runner object or process
+    # executor exists until the one-shot endpoint has atomically consumed a
+    # Permit and Canary-window pair.  The default factory still has no
+    # executor, so this release cannot start WSL or Codex.
     app.state.codex_process_canary_service = SealedOfflineCodexProcessCanary(
-        store, app.state.sealed_egress_contract_service, WSLCodexProcessCanaryRunner(),
+        store, app.state.sealed_egress_contract_service, runner_factory=WSLCodexProcessCanaryRunner,
     )
     app.state.codex_canary_execution_permit_gate = CodexCanaryExecutionPermitGate(
         store, app.state.codex_process_canary_service,
@@ -378,6 +381,7 @@ def codex_process_canary_snapshot(request: Request) -> dict[str, Any]:
     permit_readiness = permit_gate.ready()
     result["execution_window"] = service.window_status()
     result["execution_permit"] = permit_gate.permit_status()
+    result["execution_claim"] = gate(request).store.codex_canary_execution_claim()
     result["permit_ready"] = permit_readiness.get("status") == "READY"
     result["execution_enabled"] = (
         result["execution_permit"].get("status") == "ARMED"
@@ -641,6 +645,20 @@ async def arm_codex_process_canary(payload: CodexProcessCanaryArmRequest, reques
 async def run_codex_process_canary(payload: CodexProcessCanaryRequest, request: Request):
     try:
         return await codex_canary_execution_permit_gate(request).run(payload.permit_nonce, payload.canary_nonce)
+    except PolicyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/isolation/wsl/codex-process-canary/one-shot")
+async def run_codex_process_canary_one_shot(payload: CodexProcessCanaryRequest, request: Request):
+    """The only route permitted to select the sealed actual runner."""
+    rejection = _enforce_execution_window_arm_request(request)
+    if rejection is not None:
+        return rejection
+    try:
+        return await codex_canary_execution_permit_gate(request).run_one_shot(
+            payload.permit_nonce, payload.canary_nonce,
+        )
     except PolicyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 

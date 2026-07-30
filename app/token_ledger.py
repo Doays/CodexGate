@@ -16,7 +16,13 @@ SUCCESS_STATUSES = frozenset({"SUCCESS"})
 HIGH_EFFORTS = frozenset({"high", "very-high", "very high", "xhigh", "x-high", "max", "ultra"})
 # These locally simulated verification events are deliberately not evidence of
 # provider usage.  They remain ESTIMATED and cannot make savings comparable.
-LOCAL_ONLY_EVENT_TYPES = frozenset({"SEALED_OFFLINE_CODEX_PROCESS_CANARY", "SEALED_OFFLINE_CODEX_PROCESS_CANARY_PLAN"})
+LOCAL_ONLY_EVENT_TYPES = frozenset({
+    "SEALED_OFFLINE_CODEX_PROCESS_CANARY",
+    "SEALED_OFFLINE_CODEX_PROCESS_CANARY_PLAN",
+    # A one-shot claim consumes authorization but proves no process spawn.
+    # Keeping it in the local-only family preserves NOT_COMPARABLE semantics.
+    "SEALED_OFFLINE_CODEX_PROCESS_CANARY_CLAIM",
+})
 
 BASELINE_IMPORT_SCHEMA: dict[str, Any] = {
     "type": "object",
