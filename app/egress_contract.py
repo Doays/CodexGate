@@ -32,7 +32,12 @@ EGRESS_CONTRACT_POLICY_VERSION = "sealed-egress-contract-v1"
 CUSTOM_PROVIDER_ID = "codexgate-sealed"
 LOOPBACK_HOST = "127.0.0.1"
 LOOPBACK_PORT = 8788
-SEALED_BASE_URL = f"http://{LOOPBACK_HOST}:{LOOPBACK_PORT}/v1"
+# The sealed endpoint is the single source of truth for every local provider,
+# relay, and broker authority.  Consumers must import this contract rather
+# than carrying a second loopback port or authority literal.
+SEALED_LOOPBACK_ENDPOINT = (LOOPBACK_HOST, LOOPBACK_PORT)
+SEALED_LOOPBACK_AUTHORITY = f"{LOOPBACK_HOST}:{LOOPBACK_PORT}"
+SEALED_BASE_URL = f"http://{SEALED_LOOPBACK_AUTHORITY}/v1"
 EPHEMERAL_TOKEN_ENV = "CODEXGATE_EPHEMERAL_TOKEN"
 BROKER_SOCKET_PATH = "/runtime-state/codexgate-broker.sock"
 BROKER_REQUEST_PATH = "/v1/responses"
@@ -203,7 +208,7 @@ def broker_contract(unix_socket: str = BROKER_SOCKET_PATH) -> dict[str, Any]:
         "listen": {"transport": "unix_socket", "path": unix_socket},
         "allowed_methods": ["POST"],
         "allowed_paths": [BROKER_REQUEST_PATH],
-        "required_host": f"{LOOPBACK_HOST}:{LOOPBACK_PORT}",
+        "required_host": SEALED_LOOPBACK_AUTHORITY,
         "reject_connect": True,
         "reject_redirects": True,
         "reject_absolute_form": True,
@@ -243,7 +248,7 @@ def validate_broker_request(method: str, path: str, headers: Mapping[str, str], 
         raise PolicyError("sealed broker request body exceeds its limit")
     clean = sanitize_broker_headers(headers)
     host_values = [value for name, value in clean.items() if name.casefold() == "host"]
-    if len(host_values) != 1 or host_values[0].casefold() != f"{LOOPBACK_HOST}:{LOOPBACK_PORT}":
+    if len(host_values) != 1 or host_values[0].casefold() != SEALED_LOOPBACK_AUTHORITY:
         raise PolicyError("sealed broker host is invalid")
     return clean
 

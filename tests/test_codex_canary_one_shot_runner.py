@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -32,7 +30,8 @@ from app.codex_process_executor_wsl import (
     EXPECTED_PROMPT_HASH as EXECUTOR_PROMPT_HASH,
     EXPECTED_REQUEST_HASH as EXECUTOR_REQUEST_HASH,
     EXPECTED_RESPONSE_HASH as EXECUTOR_RESPONSE_HASH,
-    SUPERVISOR_FRAME_PREFIX,
+    synthetic_relay_broker_roundtrip,
+    encode_supervisor_frame,
     WSLCodexProcessCanaryExecutor,
 )
 from app.isolation_wsl import ProcessResult, SAFE_CANDIDATE
@@ -56,16 +55,19 @@ class NoIoSupervisor:
         self.calls += 1
         if on_started is not None:
             on_started()
+        proof = synthetic_relay_broker_roundtrip()
         payload = {
-            "schema_version": "1", "status": "PASSED", "executor_implementation_hash": EXECUTOR_IMPLEMENTATION_HASH,
-            "request_count": 1, "request_hash": EXECUTOR_REQUEST_HASH, "response_hash": EXECUTOR_RESPONSE_HASH,
-            "config_hash": EXECUTOR_CONFIG_HASH, "prompt_hash": EXECUTOR_PROMPT_HASH,
-            "expected_output_hash": EXECUTOR_OUTPUT_HASH, "marker_hash": EXECUTOR_OUTPUT_HASH,
-            "supervisor_processes": 1, "bwrap_processes": 2, "codex_processes": 1,
-            "resources_cleaned": not self.bad_frame, "children_terminated": True, "sensitive_headers_removed": True,
+            "status": "ERROR" if self.bad_frame else "PASSED", "stage": "CLEANUP",
+            "error_code": "cleanup_failed" if self.bad_frame else None,
+            "process_counts": {"supervisor": 1, "broker_bwrap": 1, "relay_codex_bwrap": 1, "codex_cli": 1},
+            "cleanup_ok": not self.bad_frame, "implementation_hash": EXECUTOR_IMPLEMENTATION_HASH,
+            "request_count": 0 if self.bad_frame else proof["request_count"],
+            "request_hash": None if self.bad_frame else proof["request_hash"],
+            "response_hash": None if self.bad_frame else proof["response_hash"],
+            "output_hash": None if self.bad_frame else proof["output_hash"],
+            "sensitive_headers_removed": False if self.bad_frame else proof["sensitive_headers_removed"],
         }
-        encoded = base64.urlsafe_b64encode(canonical_json(payload).encode("utf-8")).rstrip(b"=").decode("ascii")
-        return ProcessResult(exit_code=0, stdout=f"{SUPERVISOR_FRAME_PREFIX}{encoded}\n", stderr="")
+        return ProcessResult(exit_code=0, stdout=encode_supervisor_frame(payload), stderr="")
 
 
 def one_shot_gate(tmp_path, *, supervisor: NoIoSupervisor | None = None, changed_runner_hash: str | None = None):
@@ -203,7 +205,7 @@ def test_partial_failure_records_only_observed_started_processes(tmp_path):
     permit, window = arm_pair(gate)
     result = asyncio.run(gate.run_one_shot(permit["permit_nonce"], window["canary_nonce"]))
     assert result["status"] == ERROR
-    assert result["error_code"] == "canary_resource_cleanup_failed"
+    assert result["error_code"] == "cleanup_failed"
     event = next(event for event in store.ledger_usage_events() if event.get("action") == "RUN")
     assert event["source"] == "LOCAL_OBSERVED" and event["quality"] == "OBSERVED"
     assert event["local_processes"] == 4 and event["local_duration_ms"] >= 0

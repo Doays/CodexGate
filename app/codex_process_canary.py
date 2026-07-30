@@ -16,6 +16,7 @@ from typing import Any, Callable, Mapping, Protocol
 
 from .codex_process_executor_wsl import (
     BROKER_CHILD_CODE,
+    EXPECTED_REQUEST_HASH as SEALED_REQUEST_HASH,
     EXECUTOR_IMPLEMENTATION_HASH,
     EXECUTOR_VERSION,
     FIXED_CODEX_ARGV,
@@ -28,7 +29,10 @@ from .codex_process_executor_wsl import (
     WSLCodexProcessCanaryExecutor,
     compute_executor_implementation,
 )
-from .egress_contract import AUTH_UNCONFIGURED, canonical_provider_toml, provider_config_hash, validate_sealed_execution_proof
+from .egress_contract import (
+    AUTH_UNCONFIGURED, BROKER_REQUEST_PATH, LOOPBACK_HOST, LOOPBACK_PORT,
+    canonical_provider_toml, provider_config_hash, validate_sealed_execution_proof,
+)
 from .egress_harness import WSL_RUNNER_KIND
 from .egress_harness_wsl import RUNNER_IMPLEMENTATION_HASH as HARNESS_IMPLEMENTATION_HASH
 from .egress_harness_wsl import WSL_EGRESS_RUNNER_VERSION
@@ -57,7 +61,7 @@ def _digest(value: bytes | str) -> str:
     return hashlib.sha256(value.encode("utf-8") if isinstance(value, str) else value).hexdigest()
 
 
-EXPECTED_REQUEST_HASH = sha256_json({"method": "POST", "path": "/v1/responses", "model": "codexgate-sealed"})
+EXPECTED_REQUEST_HASH = SEALED_REQUEST_HASH
 EXPECTED_RESPONSE_HASH = sha256_json(FIXED_FAKE_RESPONSE)
 EXPECTED_CONFIG_HASH = provider_config_hash(canonical_provider_toml())
 EXPECTED_PROMPT_HASH = _digest(FIXED_PROMPT)
@@ -120,7 +124,7 @@ class CanaryExecution:
     stdout_bytes: int
     stderr_bytes: int
     local_processes: int
-    marker: str
+    marker: str | None
     tool_calls: int = 0
     second_requests: int = 0
     websockets: int = 0
@@ -140,6 +144,11 @@ class CanaryExecution:
     supervisor_processes: int = 0
     bwrap_processes: int = 0
     codex_processes: int = 0
+    supervisor_stage: str | None = None
+    cleanup_ok: bool | None = None
+    # These are observed sealed-frame digests, never reconstructed output.
+    output_hash: str | None = None
+    marker_verified: bool = False
 
 
 class CodexProcessCanaryRunner(Protocol):
@@ -300,6 +309,8 @@ class FakeCodexProcessCanaryRunner:
             stderr_bytes=self.stderr_bytes,
             local_processes=1,
             marker=self.marker,
+            output_hash=EXPECTED_OUTPUT_HASH,
+            marker_verified=True,
             tool_calls=self.tool_calls,
             second_requests=self.second_requests,
             websockets=self.websockets,
@@ -341,6 +352,7 @@ def build_canary_launch_spec(contract: Mapping[str, Any]) -> dict[str, Any]:
             "tmpfs": ("/tmp", "/runtime-state"),
             "network": "sealed_loopback_only",
             "argv": list(FIXED_CODEX_ARGV),
+            "endpoint": {"host": LOOPBACK_HOST, "port": LOOPBACK_PORT, "path": BROKER_REQUEST_PATH},
         },
         "contract_hash": contract.get("contract_hash"),
         # This private byte value is the only file materialized in the tmpfs
@@ -356,11 +368,17 @@ def public_canary_result(result: Mapping[str, Any] | None) -> dict[str, Any]:
     fields = (
         "canary_id", "contract_hash", "status", "started_at", "finished_at", "error_code",
         "request_count", "request_hash", "response_hash", "config_hash", "prompt_hash",
-        "expected_output_hash", "exit_code", "output_bytes", "local_processes",
+        "expected_output_hash", "output_hash", "sensitive_headers_removed", "marker_verified", "exit_code", "output_bytes", "local_processes",
+        "stdout_bytes", "stderr_bytes", "stage", "cleanup_ok", "legacy_error",
         "local_duration_ms", "runner_kind", "runner_version", "runner_implementation_hash",
         "implementation_hash", "reused", "start_allowed",
     )
-    return {field: result.get(field) for field in fields if field in result}
+    value = {field: result.get(field) for field in fields if field in result}
+    if "legacy_error" not in value:
+        value["legacy_error"] = result.get("error_code") == "canary_exit_invalid" and not all(
+            field in result for field in ("stage", "stdout_bytes", "stderr_bytes", "cleanup_ok")
+        )
+    return value
 
 
 class SealedOfflineCodexProcessCanary:
@@ -686,6 +704,8 @@ class SealedOfflineCodexProcessCanary:
             "request_count": 0, "request_hash": None, "response_hash": None, "config_hash": binding["config_hash"],
             "prompt_hash": EXPECTED_PROMPT_HASH, "expected_output_hash": EXPECTED_OUTPUT_HASH,
             "exit_code": None, "output_bytes": 0, "local_processes": 0, "local_duration_ms": 0,
+            "stdout_bytes": 0, "stderr_bytes": 0, "stage": "BOOT", "cleanup_ok": None,
+            "output_hash": None, "sensitive_headers_removed": False, "marker_verified": False,
             "supervisor_processes": 0, "bwrap_processes": 0, "codex_processes": 0,
             "runner_kind": runner_kind, "runner_version": runner_version,
             "runner_implementation_hash": runner_implementation_hash, "implementation_hash": runner_implementation_hash,
@@ -725,13 +745,16 @@ class SealedOfflineCodexProcessCanary:
                 "request_hash": execution.request_hash, "response_hash": execution.response_hash,
                 "config_hash": execution.config_hash, "prompt_hash": execution.prompt_hash,
                 "expected_output_hash": execution.expected_output_hash, "exit_code": execution.exit_code,
+                "output_hash": execution.output_hash, "sensitive_headers_removed": execution.sensitive_headers_removed,
+                "marker_verified": execution.marker_verified,
                 "output_bytes": execution.stdout_bytes + execution.stderr_bytes, "local_processes": execution.local_processes,
                 "supervisor_processes": execution.supervisor_processes, "bwrap_processes": execution.bwrap_processes,
                 "codex_processes": execution.codex_processes,
-                "error_code": None,
+                "error_code": None, "stdout_bytes": execution.stdout_bytes, "stderr_bytes": execution.stderr_bytes,
+                "stage": execution.supervisor_stage or "CLEANUP", "cleanup_ok": execution.cleanup_ok if execution.cleanup_ok is not None else execution.resources_cleaned,
             }
         except asyncio.TimeoutError:
-            result = {**running, "status": ERROR, "error_code": "canary_timeout"}
+            result = {**running, "status": ERROR, "error_code": "canary_timeout", "stage": "BOOT", "cleanup_ok": False}
         except PolicyError as exc:
             code = str(exc)
             observed_counts = {
@@ -743,18 +766,22 @@ class SealedOfflineCodexProcessCanary:
             status = POLICY_VIOLATION if code in {
                 "canary_request_policy_violation", "canary_tool_policy_violation", "canary_model_policy_violation",
                 "canary_websocket_policy_violation", "canary_header_policy_violation", "canary_implementation_mismatch",
-                "actual_runner_policy_violation",
+                "actual_runner_policy_violation", "supervisor_implementation_mismatch", "supervisor_policy_violation",
             } else ERROR
             result = {**running, **observed_counts, "status": status, "error_code": code if code in {
-                "canary_timeout", "canary_output_limit", "canary_marker_invalid", "canary_exit_invalid",
+                "canary_timeout", "canary_output_limit", "canary_marker_invalid", "canary_process_exit_nonzero",
                 "canary_process_termination_failed", "canary_resource_cleanup_failed", "canary_request_policy_violation",
                 "canary_tool_policy_violation", "canary_model_policy_violation", "canary_websocket_policy_violation",
                 "canary_header_policy_violation",
                 "canary_implementation_mismatch", "canary_runner_identity_mismatch",
                 "actual_runner_policy_violation",
-            } else "canary_policy_error"}
+            } else (code if isinstance(code, str) and len(code) <= 80 and code.replace("_", "").isalnum() else "canary_policy_error"),
+                "stage": getattr(exc, "stage", None) or running.get("stage"),
+                "cleanup_ok": getattr(exc, "cleanup_ok", None), "stdout_bytes": getattr(exc, "stdout_bytes", 0),
+                "stderr_bytes": getattr(exc, "stderr_bytes", 0), "exit_code": getattr(exc, "exit_code", None),
+                "output_bytes": int(getattr(exc, "stdout_bytes", 0) or 0) + int(getattr(exc, "stderr_bytes", 0) or 0)}
         except Exception:
-            result = {**running, "status": ERROR, "error_code": "canary_error"}
+            result = {**running, "status": ERROR, "error_code": "canary_error", "stage": "BOOT", "cleanup_ok": False}
         if execution is not None:
             result.update({
                 "request_count": execution.request_count,
@@ -764,6 +791,11 @@ class SealedOfflineCodexProcessCanary:
                 "bwrap_processes": execution.bwrap_processes,
                 "codex_processes": execution.codex_processes,
                 "exit_code": execution.exit_code,
+                "stdout_bytes": execution.stdout_bytes, "stderr_bytes": execution.stderr_bytes,
+                "stage": execution.supervisor_stage or result.get("stage"),
+                "cleanup_ok": execution.cleanup_ok if execution.cleanup_ok is not None else execution.resources_cleaned,
+                "output_hash": execution.output_hash, "sensitive_headers_removed": execution.sensitive_headers_removed,
+                "marker_verified": execution.marker_verified,
             })
         result = {
             **result, "finished_at": _now(), "local_duration_ms": max(0, round((time.monotonic() - began) * 1000)),
@@ -785,13 +817,13 @@ class SealedOfflineCodexProcessCanary:
         if execution.stdout_bytes < 0 or execution.stderr_bytes < 0 or execution.stdout_bytes + execution.stderr_bytes > PROCESS_OUTPUT_LIMIT_BYTES:
             raise PolicyError("canary_output_limit")
         if execution.exit_code != 0:
-            raise PolicyError("canary_exit_invalid")
-        if (
-            execution.marker != SUCCESS_MARKER
-            or execution.stdout_bytes != len(SUCCESS_MARKER.encode("utf-8"))
-            or execution.stderr_bytes != 0
-        ):
-            raise PolicyError("canary_marker_invalid")
+            raise PolicyError("canary_exit_invalid" if bool(getattr(active_runner, "is_fake", False)) else "canary_process_exit_nonzero")
+        observed_marker = execution.marker == SUCCESS_MARKER or (
+            not bool(getattr(active_runner, "is_fake", False))
+            and execution.marker_verified and execution.output_hash == EXPECTED_OUTPUT_HASH
+        )
+        if not observed_marker:
+            raise PolicyError("canary_marker_invalid" if bool(getattr(active_runner, "is_fake", False)) else "canary_marker_mismatch")
         if not execution.process_terminated:
             raise PolicyError("canary_process_termination_failed")
         if not execution.resources_cleaned:
@@ -808,7 +840,7 @@ class SealedOfflineCodexProcessCanary:
             raise PolicyError("canary_tool_policy_violation")
         if not execution.sensitive_headers_removed:
             raise PolicyError("canary_header_policy_violation")
-        if not all(_is_hash(getattr(execution, field)) for field in ("request_hash", "response_hash", "config_hash", "prompt_hash", "expected_output_hash")):
+        if not all(_is_hash(getattr(execution, field)) for field in ("request_hash", "response_hash", "config_hash", "prompt_hash", "expected_output_hash", "output_hash")):
             raise PolicyError("canary_request_policy_violation")
         if (
             execution.request_hash != EXPECTED_REQUEST_HASH or execution.response_hash != EXPECTED_RESPONSE_HASH
@@ -816,6 +848,12 @@ class SealedOfflineCodexProcessCanary:
             or execution.expected_output_hash != EXPECTED_OUTPUT_HASH
         ):
             raise PolicyError("canary_request_policy_violation")
+        if isinstance(active_runner, WSLCodexProcessCanaryRunner):
+            if (
+                (execution.supervisor_processes, execution.bwrap_processes, execution.codex_processes) != (1, 2, 1)
+                or execution.local_processes != 4 or execution.output_hash != EXPECTED_OUTPUT_HASH
+            ):
+                raise PolicyError("canary_success_proof_invalid")
 
     def window_status(self) -> dict[str, Any]:
         return self.store.codex_process_canary_window()

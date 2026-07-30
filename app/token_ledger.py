@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -173,6 +174,22 @@ def normalize_usage_event(payload: Mapping[str, Any]) -> dict[str, Any]:
         "actual_model",
         "effort",
         "status",
+        # Sanitized Offline Codex supervisor diagnostics.  Raw frame bytes,
+        # argv, paths, prompts, and responses never enter a ledger event.
+        "stage",
+        "error_code",
+        "exit_code",
+        "stdout_bytes",
+        "stderr_bytes",
+        "cleanup_ok",
+        "request_hash",
+        "response_hash",
+        "output_hash",
+        "sensitive_headers_removed",
+        "supervisor_processes",
+        "bwrap_processes",
+        "codex_processes",
+        "local_processes",
         "input_tokens",
         "cached_input_tokens",
         "output_tokens",
@@ -204,6 +221,20 @@ def normalize_usage_event(payload: Mapping[str, Any]) -> dict[str, Any]:
     for field in ("run_id", "task_id", "route_plan_id", "comparison_key", "success_criteria_hash", "task_class", "planned_model", "actual_model", "effort", "status", "note"):
         if field in record and record[field] is not None:
             record[field] = _string_field(record, field, required=False)
+    for field in ("stage", "error_code"):
+        if field in record and record[field] is not None:
+            record[field] = _string_field(record, field, required=False)
+    for field in ("exit_code", "stdout_bytes", "stderr_bytes", "supervisor_processes", "bwrap_processes", "codex_processes", "local_processes"):
+        if field in record:
+            record[field] = _optional_int(record, field)
+    if "cleanup_ok" in record and record["cleanup_ok"] is not None and not isinstance(record["cleanup_ok"], bool):
+        raise PolicyError("usage event cleanup flag is invalid")
+    if "sensitive_headers_removed" in record and record["sensitive_headers_removed"] is not None and not isinstance(record["sensitive_headers_removed"], bool):
+        raise PolicyError("usage event header proof is invalid")
+    for field in ("request_hash", "response_hash", "output_hash"):
+        if field in record and record[field] is not None:
+            if not isinstance(record[field], str) or not re.fullmatch(r"[0-9a-f]{64}", record[field]):
+                raise PolicyError("usage event proof hash is invalid")
     _normalize_tokens(record)
     for field in ("codex_context_bytes", "web_packet_bytes", "evidence_bytes", "source_bytes", "catalog_source_bytes", "probe_bytes", "model_turns", "high_model_turns", "retries", "reroutes", "compactions", "subagent_count"):
         record[field] = _optional_int(record, field)

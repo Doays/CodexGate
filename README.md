@@ -321,3 +321,44 @@ RUNNING claim. Windows junction helper calls are emulated inside the test
 temporary directory without starting PowerShell. The incident audit is kept
 outside the repository in `TEST_REAL_IO_INCIDENT.json` and contains no raw
 arguments, paths, output, process identifiers, or socket identifiers.
+
+## Offline Codex supervisor diagnostics
+
+The sealed Offline Codex supervisor now emits exactly one
+`CODEXGATE_CODEX_SUPERVISOR_V1:<base64url canonical JSON>` line.  Its payload
+contains only `status`, `stage`, `error_code`, the four provenance counters
+(`supervisor`, `broker_bwrap`, `relay_codex_bwrap`, `codex_cli`), `cleanup_ok`,
+the implementation digest, request count, request/response/output digests,
+and a sensitive-header-removal flag.  It never contains a prompt, response,
+token, path, argv, environment, or raw process output.  Valid stages are `BOOT`, `CLAIM_VALIDATE`,
+`SPEC_VALIDATE`, `RUNTIME_VALIDATE`, `BROKER_SPAWN`, `BROKER_READY`,
+`RELAY_CODEX_SPAWN`, `RESPONSE_VALIDATE`, and `CLEANUP`.
+
+Supervisor workload failures are sealed in a frame with transport exit zero;
+only a failure before Python starts or a WSL transport termination is a
+transport error.  Missing, duplicate, extra, non-canonical, or hash-mismatched
+frames are distinct protocol diagnostics.  Counters increase only after the
+corresponding spawn succeeds, never include pre-existing Codex processes, and
+must show zero child processes before `BROKER_SPAWN`.  The legacy
+`canary_exit_invalid` value remains immutable in old rows and is marked as a
+legacy diagnostic on read; new supervisor failures use their stage-specific
+sanitized codes.  All tests use the no-I/O fuse and the normal runtime and live
+execution locks remain closed.
+
+The one sealed provider authority is `127.0.0.1:8788`: the provider TOML,
+relay listener, and broker Host validation all derive from the Egress Contract
+constant.  A supervisor creates a private CODEX_HOME, writes canonical TOML in
+binary mode, binds it read-only into the relay/Codex capsule, and passes only a
+per-execution in-memory token to that capsule.  The fixed prompt is sent only
+to the fixed Codex child stdin.  The relay accepts one bounded `POST
+/v1/responses`, removes Authorization/Cookie/Proxy-* before its sole AF_UNIX
+hop, and the broker returns one deterministic response.  A second connection,
+request, WebSocket, host, path, or model is fail-closed.
+
+`PASSED` additionally requires observed supervisor/broker-bwrap/relay-bwrap/
+Codex counts of `1/1/1/1`, exactly one request, all three observed proof
+digests matching their sealed expectations, the marker digest, and successful
+cleanup of both children.  The pinned `codex-cli 0.145.0` request wire format
+has not yet been independently proven, so a production supervisor blocks at
+`RUNTIME_VALIDATE` before it can spawn a child; no guessed wire format can
+produce a pass.

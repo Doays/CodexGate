@@ -2859,7 +2859,13 @@ class Store:
             "runner_implementation_hash", "implementation_hash", "start_allowed", "supervisor_processes",
             "bwrap_processes", "codex_processes",
         }
-        if set(value) != required:
+        legacy_diagnostic_fields = {"stage", "stdout_bytes", "stderr_bytes", "cleanup_ok"}
+        diagnostic_fields = {
+            "stage", "stdout_bytes", "stderr_bytes", "cleanup_ok", "output_hash",
+            "sensitive_headers_removed", "marker_verified",
+        }
+        legacy = set(value) == required or set(value) == required | legacy_diagnostic_fields
+        if not legacy and set(value) != required | diagnostic_fields:
             raise PolicyError("codex process canary fields are invalid")
         try:
             uuid.UUID(str(value["canary_id"]))
@@ -2895,6 +2901,24 @@ class Store:
             raise PolicyError("codex process canary runner is invalid")
         if value["runner_implementation_hash"] != value["implementation_hash"] or value["start_allowed"] is not False:
             raise PolicyError("codex process canary lock state is invalid")
+        if not legacy:
+            stage = value.get("stage")
+            if stage is not None and (not isinstance(stage, str) or stage not in {
+                "BOOT", "CLAIM_VALIDATE", "SPEC_VALIDATE", "RUNTIME_VALIDATE", "BROKER_SPAWN",
+                "BROKER_READY", "RELAY_CODEX_SPAWN", "RESPONSE_VALIDATE", "CLEANUP",
+            }):
+                raise PolicyError("codex process canary stage is invalid")
+            for field in ("stdout_bytes", "stderr_bytes"):
+                if isinstance(value[field], bool) or not isinstance(value[field], int) or value[field] < 0:
+                    raise PolicyError("codex process canary byte count is invalid")
+            if value["output_bytes"] != value["stdout_bytes"] + value["stderr_bytes"]:
+                raise PolicyError("codex process canary byte count is invalid")
+            if not isinstance(value["cleanup_ok"], (bool, type(None))):
+                raise PolicyError("codex process canary cleanup flag is invalid")
+            if value["output_hash"] is not None and (not isinstance(value["output_hash"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["output_hash"])):
+                raise PolicyError("codex process canary output hash is invalid")
+            if not isinstance(value["sensitive_headers_removed"], bool) or not isinstance(value["marker_verified"], bool):
+                raise PolicyError("codex process canary proof flag is invalid")
         # Every stored field is an identifier, scalar counter, timestamp, or
         # digest.  This prevents accidental storage of private process inputs.
         return value
@@ -2968,7 +2992,10 @@ class Store:
         self._validate_codex_process_canary_record(record, final=row[5] != "RUNNING")
         if sha256_json(record) != row[9]:
             raise PolicyError("codex process canary integrity check failed")
-        return {**record, "integrity_hash": row[9]}
+        legacy_error = record.get("error_code") == "canary_exit_invalid" and not all(
+            field in record for field in ("stage", "stdout_bytes", "stderr_bytes", "cleanup_ok")
+        )
+        return {**record, "integrity_hash": row[9], "legacy_error": legacy_error}
 
     def recover_interrupted_codex_process_canaries(self) -> int:
         now = _now()
@@ -2983,6 +3010,8 @@ class Store:
                     continue
                 record = dict(record)
                 record.update({"status": "ERROR", "finished_at": now, "error_code": "canary_interrupted", "start_allowed": False})
+                if "cleanup_ok" in record:
+                    record["cleanup_ok"] = False
                 self._validate_codex_process_canary_record(record, final=True)
                 digest = sha256_json(record)
                 cursor = conn.execute(
@@ -3845,6 +3874,16 @@ class Store:
             "status": result.get("status") if isinstance(result.get("status"), str) else "ERROR", "action": action,
             "contract_hash": result.get("contract_hash") if isinstance(result.get("contract_hash"), str) else "unknown",
             "implementation_hash": result.get("implementation_hash") or result.get("runner_implementation_hash"),
+            "stage": result.get("stage") if isinstance(result.get("stage"), str) else None,
+            "error_code": result.get("error_code") if isinstance(result.get("error_code"), str) else None,
+            "exit_code": result.get("exit_code") if isinstance(result.get("exit_code"), int) and not isinstance(result.get("exit_code"), bool) else None,
+            "stdout_bytes": int(result.get("stdout_bytes") or 0) if not plan else 0,
+            "stderr_bytes": int(result.get("stderr_bytes") or 0) if not plan else 0,
+            "cleanup_ok": result.get("cleanup_ok") if isinstance(result.get("cleanup_ok"), bool) else None,
+            "request_hash": result.get("request_hash") if isinstance(result.get("request_hash"), str) else None,
+            "response_hash": result.get("response_hash") if isinstance(result.get("response_hash"), str) else None,
+            "output_hash": result.get("output_hash") if isinstance(result.get("output_hash"), str) else None,
+            "sensitive_headers_removed": result.get("sensitive_headers_removed") if isinstance(result.get("sensitive_headers_removed"), bool) else None,
             "planned_local_processes": 1 if plan and action == "ARM" else (1 if plan and action == "RUN" else 0),
             "local_executions": 1 if action in {"BLOCKED", "RUN"} and not plan else 0,
             "local_processes": observed_processes,
