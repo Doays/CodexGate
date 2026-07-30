@@ -359,6 +359,24 @@ request, WebSocket, host, path, or model is fail-closed.
 Codex counts of `1/1/1/1`, exactly one request, all three observed proof
 digests matching their sealed expectations, the marker digest, and successful
 cleanup of both children.  The pinned `codex-cli 0.145.0` request wire format
-has not yet been independently proven, so a production supervisor blocks at
-`RUNTIME_VALIDATE` before it can spawn a child; no guessed wire format can
-produce a pass.
+is now represented by the Phase 4.4 proof module.  If its tagged source
+digests do not match, a production supervisor blocks at `RUNTIME_VALIDATE`
+before it can spawn a child; no guessed wire format can produce a pass.
+
+## Codex 0.145.0 wire-contract proof
+
+`app/codex_wire_contract.py` is a pure, no-I/O contract boundary.  It records
+only relative paths, source digests, field names, event names, and hashes for
+the official `openai/codex` `rust-v0.145.0` sources.  The no-tool stream is
+strictly two `response.output_item.done` events followed by
+`response.completed`; missing,
+duplicate, extra, failed, error, or tool events are rejected.  Request model,
+prompt hash, streaming, no-tools, and `parallel_tool_calls=false` are checked
+before a request can be considered.
+
+Until every exact tagged source byte has an independently verified SHA-256,
+the proof stays `UNPROVEN` and the production runner remains blocked with
+`codex_wire_contract_unproven`.  The contract hash is part of the runner
+implementation hash, so prior PASSED results, permits, and windows cannot be
+reused after a wire proof change.  The external proof snapshot never stores
+source bodies, prompts, responses, paths, credentials, or raw output.

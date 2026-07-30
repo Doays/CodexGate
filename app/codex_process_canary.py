@@ -29,6 +29,7 @@ from .codex_process_executor_wsl import (
     WSLCodexProcessCanaryExecutor,
     compute_executor_implementation,
 )
+from .codex_wire_contract import WIRE_CONTRACT_HASH, WIRE_CONTRACT_STATUS, fixture_stream_hash
 from .egress_contract import (
     AUTH_UNCONFIGURED, BROKER_REQUEST_PATH, LOOPBACK_HOST, LOOPBACK_PORT,
     canonical_provider_toml, provider_config_hash, validate_sealed_execution_proof,
@@ -62,7 +63,7 @@ def _digest(value: bytes | str) -> str:
 
 
 EXPECTED_REQUEST_HASH = SEALED_REQUEST_HASH
-EXPECTED_RESPONSE_HASH = sha256_json(FIXED_FAKE_RESPONSE)
+EXPECTED_RESPONSE_HASH = fixture_stream_hash()
 EXPECTED_CONFIG_HASH = provider_config_hash(canonical_provider_toml())
 EXPECTED_PROMPT_HASH = _digest(FIXED_PROMPT)
 EXPECTED_OUTPUT_HASH = _digest(SUCCESS_MARKER)
@@ -355,6 +356,7 @@ def build_canary_launch_spec(contract: Mapping[str, Any]) -> dict[str, Any]:
             "endpoint": {"host": LOOPBACK_HOST, "port": LOOPBACK_PORT, "path": BROKER_REQUEST_PATH},
         },
         "contract_hash": contract.get("contract_hash"),
+        "wire_contract_hash": WIRE_CONTRACT_HASH,
         # This private byte value is the only file materialized in the tmpfs
         # CODEX_HOME; it is never persisted or returned from this function's
         # callers.
@@ -494,6 +496,7 @@ class SealedOfflineCodexProcessCanary:
             "harness_implementation_hash": harness.get("runner_implementation_hash"),
             "canary_runner_kind": self.runner_kind, "canary_runner_version": self.runner_version,
             "implementation_hash": self.runner_implementation_hash,
+            "wire_contract_hash": WIRE_CONTRACT_HASH,
             "config_hash": EXPECTED_CONFIG_HASH,
             **proof,
         }

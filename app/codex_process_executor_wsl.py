@@ -31,6 +31,18 @@ from .egress_contract import (
     validate_broker_request,
 )
 from .egress_harness_wsl import BWRAP_COMMON_ARGS, sealed_bwrap_environment_args
+from .codex_wire_contract import (
+    FIXED_PROMPT as WIRE_FIXED_PROMPT,
+    SUCCESS_MARKER as WIRE_SUCCESS_MARKER,
+    WIRE_CONTRACT_HASH,
+    WIRE_CONTRACT_STATUS,
+    build_fixed_request,
+    canonical_request_hash,
+    fixture_stream_bytes,
+    fixture_stream_hash,
+    fixed_prompt_hash,
+    validate_request,
+)
 from .isolation_wsl import ProcessResult, separate_stream_byte_count
 from .policy import PolicyError, canonical_json, sha256_json, validate_wsl_distro
 from .wsl_codex_runtime import sealed_runtime_execution_policy, validate_wsl_codex_binary_path
@@ -57,8 +69,8 @@ SUPERVISOR_STATUSES = frozenset({"PASSED", "ERROR", "BLOCKED", "POLICY_VIOLATION
 
 # These fixed process inputs are sealed into the implementation hash.  They
 # are never accepted from a UI, API, environment, or caller.
-SUCCESS_MARKER = "CODEXGATE_OFFLINE_CANARY_OK"
-FIXED_PROMPT = "Return exactly the offline CodexGate canary marker."
+SUCCESS_MARKER = WIRE_SUCCESS_MARKER
+FIXED_PROMPT = WIRE_FIXED_PROMPT
 FIXED_FAKE_RESPONSE = {
     "id": "sealed-offline-canary",
     "object": "response",
@@ -66,21 +78,18 @@ FIXED_FAKE_RESPONSE = {
 }
 FIXED_CODEX_ARGV: tuple[str, ...] = ("exec", "--json", "--skip-git-repo-check", "--sandbox", "read-only")
 REQUIRED_EXEC_OPTIONS = frozenset({"--json", "--skip-git-repo-check", "--sandbox", "read-only"})
-FIXED_REQUEST_BODY = {"model": CUSTOM_PROVIDER_ID, "input": FIXED_PROMPT}
+FIXED_REQUEST_BODY = build_fixed_request(CUSTOM_PROVIDER_ID, FIXED_PROMPT)
 FIXED_REQUEST_BODY_BYTES = canonical_json(FIXED_REQUEST_BODY).encode("utf-8")
-EXPECTED_REQUEST_HASH = sha256_json({
-    "method": "POST", "path": BROKER_REQUEST_PATH, "host": SEALED_LOOPBACK_AUTHORITY,
-    "model": CUSTOM_PROVIDER_ID, "body_sha256": hashlib.sha256(FIXED_REQUEST_BODY_BYTES).hexdigest(),
-})
-EXPECTED_RESPONSE_HASH = sha256_json(FIXED_FAKE_RESPONSE)
+EXPECTED_REQUEST_HASH = canonical_request_hash(FIXED_REQUEST_BODY)
+EXPECTED_RESPONSE_HASH = fixture_stream_hash()
 EXPECTED_CONFIG_HASH = provider_config_hash(canonical_provider_toml())
-EXPECTED_PROMPT_HASH = hashlib.sha256(FIXED_PROMPT.encode("utf-8")).hexdigest()
+EXPECTED_PROMPT_HASH = fixed_prompt_hash()
 EXPECTED_OUTPUT_HASH = hashlib.sha256(SUCCESS_MARKER.encode("utf-8")).hexdigest()
 # The help audit did not prove that the pinned CLI serialises ``exec --json``
 # into this exact Responses request.  A real supervisor therefore blocks
 # before any child spawn until a separately reviewed wire-contract seal flips
 # this sealed constant.  Tests exercise only the pure byte-level relay path.
-PINNED_CODEX_WIRE_CONTRACT_PROVEN = False
+PINNED_CODEX_WIRE_CONTRACT_PROVEN = WIRE_CONTRACT_STATUS == "PROVEN"
 
 
 def _digest_or_none(value: Any) -> bool:
@@ -135,14 +144,17 @@ def parse_sealed_loopback_request(raw: bytes) -> dict[str, Any]:
         raise PolicyError("canary_request_policy_violation") from exc
     if not isinstance(request, dict) or request.get("model") != CUSTOM_PROVIDER_ID:
         raise PolicyError("canary_model_policy_violation")
+    try:
+        request_meta = validate_request(request, expected_model=CUSTOM_PROVIDER_ID, expected_prompt_hash=EXPECTED_PROMPT_HASH)
+    except PolicyError as exc:
+        raise PolicyError(str(exc)) from exc
     sensitive = any(name.casefold() in {"authorization", "cookie"} or name.casefold().startswith("proxy-") for name in headers)
     clean = sanitize_broker_headers(headers)
     validate_broker_request(method, target, clean, len(body))
     body_hash = hashlib.sha256(body).hexdigest()
     return {
         "request_count": 1,
-        "request_hash": sha256_json({"method": method, "path": target, "host": SEALED_LOOPBACK_AUTHORITY,
-                                       "model": CUSTOM_PROVIDER_ID, "body_sha256": body_hash}),
+        "request_hash": request_meta["request_hash"],
         "body_sha256": body_hash,
         "sensitive_headers_removed": sensitive or clean == headers,
         "clean_headers": clean,
@@ -157,7 +169,7 @@ def synthetic_relay_broker_roundtrip(raw: bytes | None = None, *, second_request
     response_bytes = canonical_json(FIXED_FAKE_RESPONSE).encode("utf-8")
     return {
         "request_count": request["request_count"], "request_hash": request["request_hash"],
-        "response_hash": hashlib.sha256(response_bytes).hexdigest(),
+        "response_hash": EXPECTED_RESPONSE_HASH,
         "output_hash": EXPECTED_OUTPUT_HASH,
         "sensitive_headers_removed": request["sensitive_headers_removed"],
     }
@@ -176,7 +188,7 @@ if request['headers'].get('Host')!=HOST or any(k.casefold() in ('authorization',
 body=bytes.fromhex(request['body_hex']); parsed=json.loads(body.decode('utf-8','strict'))
 if not isinstance(parsed,dict) or parsed.get('model')!=MODEL: raise ValueError('request_model')
 c.sendall(json.dumps({'status':200,'body_hex':RESPONSE.hex()},sort_keys=True,separators=(',',':')).encode('utf-8')); c.close(); s.close()
-""" % (SEALED_LOOPBACK_AUTHORITY, BROKER_REQUEST_PATH, CUSTOM_PROVIDER_ID, canonical_json(FIXED_FAKE_RESPONSE).encode('utf-8'))).encode("utf-8")
+""" % (SEALED_LOOPBACK_AUTHORITY, BROKER_REQUEST_PATH, CUSTOM_PROVIDER_ID, fixture_stream_bytes())).encode("utf-8")
 
 RELAY_CODEX_CHILD_CODE = ("""import base64,hashlib,json,os,socket,subprocess
 HOST=%r; PORT=%d; AUTHORITY=%r; PATH=%r; MODEL=%r; PROMPT=%r; MARKER=%r; ARGV=%r; TOKEN_ENV=%r
@@ -201,7 +213,7 @@ if len(reply)>2097152: raise ValueError('response_limit')
 response=bytes.fromhex(json.loads(reply.decode('utf-8','strict'))['body_hex']); conn.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Length: '+str(len(response)).encode('ascii')+b'\\r\\n\\r\\n'+response); conn.close(); listener.close()
 out,err=codex.communicate(PROMPT,timeout=30)
 if codex.returncode!=0 or out!=MARKER: raise ValueError('codex_marker')
-proof={'codex_cli':1,'request_hash':hashlib.sha256(canon({'method':'POST','path':PATH,'host':AUTHORITY,'model':MODEL,'body_sha256':hashlib.sha256(body).hexdigest()})).hexdigest(),'response_hash':hashlib.sha256(response).hexdigest(),'output_hash':hashlib.sha256(out).hexdigest(),'sensitive_headers_removed':bool(sensitive)}
+proof={'codex_cli':1,'request_hash':hashlib.sha256(body).hexdigest(),'response_hash':hashlib.sha256(response).hexdigest(),'output_hash':hashlib.sha256(out).hexdigest(),'sensitive_headers_removed':bool(sensitive)}
 os.write(1,b'CODEXGATE_CODEX_RELAY_V1:'+base64.urlsafe_b64encode(canon(proof)).rstrip(b'=')+b'\\n')
 """ % (LOOPBACK_HOST, LOOPBACK_PORT, SEALED_LOOPBACK_AUTHORITY, BROKER_REQUEST_PATH, CUSTOM_PROVIDER_ID, FIXED_PROMPT.encode('utf-8'), SUCCESS_MARKER.encode('utf-8'), list(FIXED_CODEX_ARGV), EPHEMERAL_TOKEN_ENV)).encode("utf-8")
 
@@ -326,6 +338,7 @@ def compute_executor_implementation(
         "fake_response_sha256": sha256_json(dict(fake_response)),
         "provider_config_sha256": provider_config_hash(canonical_provider_toml()),
         "loopback_endpoint_sha256": sha256_json({"host": LOOPBACK_HOST, "port": LOOPBACK_PORT}),
+        "wire_contract_sha256": WIRE_CONTRACT_HASH,
     }
     return sha256_json({"policy_version": EXECUTOR_POLICY_VERSION, **components}), components
 
@@ -379,6 +392,7 @@ def build_codex_executor_launch_spec(binary_path: str) -> dict[str, Any]:
         },
         "forbidden_binds": ["/mnt", "WINDOWS", "SOURCE_ROOT", "DATA_ROOT", "USER_HOME"],
         "runtime_binary": binary_path,
+        "wire_contract_hash": WIRE_CONTRACT_HASH,
         "executor_implementation_hash": EXECUTOR_IMPLEMENTATION_HASH,
     }
 
@@ -679,6 +693,10 @@ class WSLCodexProcessCanaryExecutor:
         spec = build_codex_executor_launch_spec(binary_path)
         if spec["executor_implementation_hash"] != binding.get("implementation_hash"):
             raise PolicyError("canary_implementation_mismatch")
+        if spec.get("wire_contract_hash") != WIRE_CONTRACT_HASH or canary_launch_spec.get("wire_contract_hash") != WIRE_CONTRACT_HASH:
+            raise PolicyError("codex_wire_contract_mismatch")
+        if WIRE_CONTRACT_STATUS != "PROVEN" and isinstance(self.runner, SealedWSLSupervisorRunner):
+            raise PolicyError("codex_wire_contract_unproven")
         if canary_launch_spec.get("contract_hash") != binding.get("contract_hash") or provider_config_hash(canonical_provider_toml()) != binding.get("config_hash"):
             raise PolicyError("execution_binding_changed")
         if validate_wsl_distro(self.store.wsl_isolation_config().get("distro")) != "Ubuntu":
