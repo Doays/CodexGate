@@ -336,9 +336,9 @@ try:
  codex_home=os.environ.get('CODEX_HOME','')
  config_source='/runtime/sealed/config.toml'; config_path=os.path.join(codex_home,'config.toml')
  try:
-  if not os.path.isdir(codex_home) or stat.S_IMODE(os.stat(codex_home).st_mode)!=0o700: raise ValueError('codex_home_invalid')
+  if not os.path.isdir(codex_home) or stat.S_IMODE(os.stat(codex_home).st_mode)!=0o700: raise ValueError('codex_home_mode_invalid')
  except Exception:
-  emit('ERROR','CODEX_HOME_PREPARE','codex_home_write_failed',exit_category='CODEX_HOME_WRITE_FAILED'); sys.exit(0)
+  emit('ERROR','CODEX_HOME_PREPARE','codex_home_mode_invalid',exit_category='CODEX_HOME_WRITE_FAILED'); sys.exit(0)
  try:
   with open(config_source,'rb') as fp: config_bytes=fp.read()
  except Exception:
@@ -351,10 +351,11 @@ try:
  try:
   fd=os.open(config_path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600); fp=os.fdopen(fd,'wb'); fp.write(config_bytes); fp.flush(); os.fsync(fp.fileno()); fp.close(); os.chmod(config_path,0o600)
  except Exception:
-  emit('ERROR','CODEX_HOME_PREPARE','codex_home_write_failed',exit_category='CODEX_HOME_WRITE_FAILED'); sys.exit(0)
+  emit('ERROR','CODEX_HOME_PREPARE','config_copy_failed',exit_category='CODEX_HOME_WRITE_FAILED'); sys.exit(0)
  try:
-  for name in ('tmp','arg0'):
-   path=os.path.join(codex_home,name); os.mkdir(path,0o700); os.chmod(path,0o700)
+  tmp_path=os.path.join(codex_home,'tmp'); os.mkdir(tmp_path,0o700); os.chmod(tmp_path,0o700)
+  arg0_path=os.path.join(tmp_path,'arg0'); os.mkdir(arg0_path,0o700); os.chmod(arg0_path,0o700)
+  if stat.S_IMODE(os.stat(tmp_path).st_mode)!=0o700 or stat.S_IMODE(os.stat(arg0_path).st_mode)!=0o700 or os.path.exists(os.path.join(codex_home,'arg0')): raise ValueError('arg0_init_failed')
  except Exception:
   emit('ERROR','CODEX_HOME_PREPARE','arg0_init_failed',exit_category='ARG0_INIT_FAILED'); sys.exit(0)
  try:
@@ -363,7 +364,7 @@ try:
   with open(config_path,'rb') as fp: copied_config=fp.read()
   if copied_config!=config_bytes or hashlib.sha256(copied_config).hexdigest()!=CONFIG_HASH or stat.S_IMODE(os.stat(config_path).st_mode)!=0o600: raise ValueError('config_copy_invalid')
  except Exception:
-  emit('ERROR','CODEX_HOME_PREPARE','codex_home_write_failed',exit_category='CODEX_HOME_WRITE_FAILED'); sys.exit(0)
+  emit('ERROR','CODEX_HOME_PREPARE','codex_home_write_probe_failed',exit_category='CODEX_HOME_WRITE_FAILED'); sys.exit(0)
  substage='SOCKET_VALIDATE'
  broker_socket='/runtime/broker/broker.sock'; broker_stat=os.lstat(broker_socket)
  if not stat.S_ISSOCK(broker_stat.st_mode) or not os.access(broker_socket,os.R_OK|os.W_OK):
@@ -448,7 +449,7 @@ BROKER_CHILD_ARGV_TEMPLATE: tuple[str, ...] = BWRAP_COMMON_ARGS + (
     "--setenv", "HOME", "/home/broker",
 ) + sealed_bwrap_environment_args() + _PYTHON_C_ARGS + ("{BROKER_CHILD_CODE}",)
 RELAY_CODEX_CHILD_ARGV_TEMPLATE: tuple[str, ...] = BWRAP_COMMON_ARGS + (
-    "--tmpfs", "/runtime-state", "--dir", "/runtime", "--dir", "/runtime/broker", "--dir", "/runtime/sealed", "--dir", "/runtime/codex-home", "--tmpfs", "/runtime/codex-home", "--dir", "/work", "--dir", "/home/codex",
+    "--tmpfs", "/runtime-state", "--dir", "/runtime", "--dir", "/runtime/broker", "--dir", "/runtime/sealed", "--perms", "0700", "--tmpfs", "/runtime/codex-home", "--dir", "/work", "--dir", "/home/codex",
     "--ro-bind", "{EXECUTION_SOCKET_DIR}", "/runtime/broker",
     "--ro-bind", "{FIXTURE_SOURCE}", "/work/fixture.json",
     "--ro-bind", "{SEALED_CONFIG_SOURCE}", "/runtime/sealed/config.toml",
@@ -514,47 +515,49 @@ _SUPERVISOR_SOURCE = "\n".join((
     "   except Exception: return False",
     " return p.poll() is not None",
     "def parse_child_control(raw):",
-    " try: lines=[line for line in raw.decode('utf-8','strict').replace('\\r\\n','\\n').split('\\n') if line.startswith(CHILD)]",
-    " except Exception: raise ValueError('relay_child_frame_invalid')",
-    " if not lines: raise ValueError('relay_child_frame_missing')",
-    " if len(lines)!=1: raise ValueError('relay_child_frame_duplicate')",
+    " try: decoded=raw.decode('utf-8','strict').replace('\\r\\n','\\n'); all_lines=[line for line in decoded.split('\\n') if line]",
+    " except Exception: raise ValueError('codex_child_control_invalid')",
+    " lines=[line for line in all_lines if line.startswith(CHILD)]",
+    " if not lines: raise ValueError('codex_child_control_missing')",
+    " if len(lines)!=1: raise ValueError('codex_child_control_duplicate')",
+    " if any(not line.startswith(CHILD) for line in all_lines): raise ValueError('codex_child_control_invalid')",
     " encoded=lines[0][len(CHILD):]",
-    " if not encoded or '=' in encoded or not re.fullmatch(r'[A-Za-z0-9_-]+',encoded): raise ValueError('relay_child_frame_invalid')",
+    " if not encoded or '=' in encoded or not re.fullmatch(r'[A-Za-z0-9_-]+',encoded): raise ValueError('codex_child_control_invalid')",
     " try: raw_payload=base64.urlsafe_b64decode(encoded+'='*((4-len(encoded)%4)%4)); payload=json.loads(raw_payload.decode('utf-8','strict'))",
-    " except Exception: raise ValueError('relay_child_frame_invalid')",
-    " if not isinstance(payload,dict) or set(payload)!={'stage','error_code','spawn_confirmed','process_counts','cleanup_ok','implementation_hash'}: raise ValueError('relay_child_frame_invalid')",
-    " if json.dumps(payload,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode('utf-8')!=raw_payload: raise ValueError('relay_child_frame_invalid')",
-    " if payload.get('stage') not in C_STAGES or not isinstance(payload.get('spawn_confirmed'),bool) or not isinstance(payload.get('cleanup_ok'),bool): raise ValueError('relay_child_frame_invalid')",
+    " except Exception: raise ValueError('codex_child_control_invalid')",
+    " if not isinstance(payload,dict) or set(payload)!={'stage','error_code','spawn_confirmed','process_counts','cleanup_ok','implementation_hash'}: raise ValueError('codex_child_control_invalid')",
+    " if json.dumps(payload,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode('utf-8')!=raw_payload: raise ValueError('codex_child_control_invalid')",
+    " if payload.get('stage') not in C_STAGES or not isinstance(payload.get('spawn_confirmed'),bool) or not isinstance(payload.get('cleanup_ok'),bool): raise ValueError('codex_child_control_invalid')",
     " counts=payload.get('process_counts')",
-    " if not isinstance(counts,dict) or set(counts)!={'codex_cli'} or counts.get('codex_cli') not in {0,1} or counts['codex_cli']!=int(payload['spawn_confirmed']): raise ValueError('relay_child_frame_invalid')",
-    " if payload.get('error_code') is not None and (not isinstance(payload.get('error_code'),str) or not re.fullmatch(r'[a-z0-9_]{1,80}',payload['error_code'])): raise ValueError('relay_child_frame_invalid')",
-    " if not isinstance(payload.get('implementation_hash'),str) or not re.fullmatch(r'[0-9a-f]{64}',payload['implementation_hash']) or payload.get('implementation_hash')!=implementation: raise ValueError('relay_child_frame_invalid')",
+    " if not isinstance(counts,dict) or set(counts)!={'codex_cli'} or counts.get('codex_cli') not in {0,1} or counts['codex_cli']!=int(payload['spawn_confirmed']): raise ValueError('codex_child_control_invalid')",
+    " if payload.get('error_code') is not None and (not isinstance(payload.get('error_code'),str) or not re.fullmatch(r'[a-z0-9_]{1,80}',payload['error_code'])): raise ValueError('codex_child_control_invalid')",
+    " if not isinstance(payload.get('implementation_hash'),str) or not re.fullmatch(r'[0-9a-f]{64}',payload['implementation_hash']) or payload.get('implementation_hash')!=implementation: raise ValueError('codex_child_control_invalid')",
     " return payload",
     f"def parse_relay_frame(raw,prefix={RELAY_FRAME_PREFIX!r}.encode('ascii')):",
     " try: lines=raw.decode('utf-8','strict').replace('\\r\\n','\\n').split('\\n')",
-    " except Exception: raise ValueError('relay_child_frame_invalid')",
+    " except Exception: raise ValueError('relay_proof_invalid')",
     " lines=[line for line in lines if line]",
-    " if any(not (line.startswith(prefix.decode('ascii')) or line.startswith(CHILD)) for line in lines): raise ValueError('relay_child_frame_invalid')",
-    " lines=[line for line in lines if line.startswith(prefix.decode('ascii'))]",
-    " if not lines or len(lines)>2: raise ValueError('relay_child_frame_invalid')",
+    " if any(not line.startswith(prefix.decode('ascii')) for line in lines): raise ValueError('relay_proof_invalid')",
+    " if not lines: raise ValueError('relay_proof_missing')",
+    " if len(lines)>2: raise ValueError('relay_proof_duplicate')",
     " payloads=[]",
     " for line in lines:",
-    "  if not line.startswith(prefix.decode('ascii')): raise ValueError('relay_child_frame_invalid')",
+    "  if not line.startswith(prefix.decode('ascii')): raise ValueError('relay_proof_invalid')",
     "  encoded=line[len(prefix):]",
-    "  if not encoded or '=' in encoded or not re.fullmatch(r'[A-Za-z0-9_-]+',encoded): raise ValueError('relay_child_frame_invalid')",
-    "  try: payload=json.loads(base64.urlsafe_b64decode(encoded+'='*((4-len(encoded)%4)%4)).decode('utf-8','strict'))",
-    "  except Exception: raise ValueError('relay_child_frame_invalid')",
-    "  if set(payload)!={'status','substage','error_code','codex_cli','request_count','request_hash','response_hash','output_hash','sensitive_headers_removed','connection_delay_ms','connection_delay_warning','child_stderr_bytes','child_stderr_sha256','child_exit_category','prompt_mode','config_loaded_expected','argc'}: raise ValueError('relay_child_frame_invalid')",
-    "  if payload.get('status') not in {'READY','PASSED','ERROR','BLOCKED','POLICY_VIOLATION'} or payload.get('substage') not in SUBSTAGES: raise ValueError('relay_child_frame_invalid')",
-    "  if any(isinstance(payload.get(name),bool) or not isinstance(payload.get(name),int) or payload.get(name)<0 for name in ('codex_cli','request_count','connection_delay_ms','child_stderr_bytes')) or not isinstance(payload.get('connection_delay_warning'),bool): raise ValueError('relay_child_frame_invalid')",
-    "  if payload.get('child_stderr_sha256') is not None and (not isinstance(payload.get('child_stderr_sha256'),str) or not re.fullmatch(r'[0-9a-f]{64}',payload.get('child_stderr_sha256'))): raise ValueError('relay_child_frame_invalid')",
-    "  if payload.get('child_exit_category') is not None and payload.get('child_exit_category') not in {'CODEX_HOME_WRITE_FAILED','ARG0_INIT_FAILED','CONFIG_LOAD_FAILED','AUTH_REQUIRED','CLI_USAGE_ERROR','CHILD_EXIT_OTHER'}: raise ValueError('relay_child_frame_invalid')",
-    "  if payload.get('prompt_mode')!='STDIN_FORCED' or payload.get('config_loaded_expected') is not True or isinstance(payload.get('argc'),bool) or not isinstance(payload.get('argc'),int) or payload.get('argc')<1: raise ValueError('relay_child_frame_invalid')",
-    "  if payload.get('status')=='READY' and (payload.get('substage')!='READY_EMIT' or payload.get('error_code') is not None or payload.get('codex_cli')!=0 or payload.get('request_count')!=0): raise ValueError('relay_child_frame_invalid')",
+    "  if not encoded or '=' in encoded or not re.fullmatch(r'[A-Za-z0-9_-]+',encoded): raise ValueError('relay_proof_invalid')",
+    "  try: raw_payload=base64.urlsafe_b64decode(encoded+'='*((4-len(encoded)%4)%4)); payload=json.loads(raw_payload.decode('utf-8','strict'))",
+    "  except Exception: raise ValueError('relay_proof_invalid')",
+    "  if not isinstance(payload,dict) or set(payload)!={'status','substage','error_code','codex_cli','request_count','request_hash','response_hash','output_hash','sensitive_headers_removed','connection_delay_ms','connection_delay_warning','child_stderr_bytes','child_stderr_sha256','child_exit_category','prompt_mode','config_loaded_expected','argc'} or json.dumps(payload,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode('utf-8')!=raw_payload: raise ValueError('relay_proof_invalid')",
+    "  if payload.get('status') not in {'READY','PASSED','ERROR','BLOCKED','POLICY_VIOLATION'} or payload.get('substage') not in SUBSTAGES: raise ValueError('relay_proof_invalid')",
+    "  if any(isinstance(payload.get(name),bool) or not isinstance(payload.get(name),int) or payload.get(name)<0 for name in ('codex_cli','request_count','connection_delay_ms','child_stderr_bytes')) or not isinstance(payload.get('connection_delay_warning'),bool): raise ValueError('relay_proof_invalid')",
+    "  if payload.get('child_stderr_sha256') is not None and (not isinstance(payload.get('child_stderr_sha256'),str) or not re.fullmatch(r'[0-9a-f]{64}',payload.get('child_stderr_sha256'))): raise ValueError('relay_proof_invalid')",
+    "  if payload.get('child_exit_category') is not None and payload.get('child_exit_category') not in {'CODEX_HOME_WRITE_FAILED','ARG0_INIT_FAILED','CONFIG_LOAD_FAILED','AUTH_REQUIRED','CLI_USAGE_ERROR','CHILD_EXIT_OTHER'}: raise ValueError('relay_proof_invalid')",
+    "  if payload.get('prompt_mode')!='STDIN_FORCED' or payload.get('config_loaded_expected') is not True or isinstance(payload.get('argc'),bool) or not isinstance(payload.get('argc'),int) or payload.get('argc')<1: raise ValueError('relay_proof_invalid')",
+    "  if payload.get('status')=='READY' and (payload.get('substage')!='READY_EMIT' or payload.get('error_code') is not None or payload.get('codex_cli')!=0 or payload.get('request_count')!=0): raise ValueError('relay_proof_invalid')",
     "  payloads.append(payload)",
     " if len(payloads)==2:",
-    "  if payloads[0].get('status')!='READY' or payloads[1].get('status')=='READY': raise ValueError('relay_child_frame_invalid')",
-    " elif payloads[0].get('status') in {'READY','PASSED'} or payloads[0].get('substage') not in {'LOOPBACK_BIND','LOOPBACK_LISTEN'}: raise ValueError('relay_child_frame_invalid')",
+    "  if payloads[0].get('status')!='READY' or payloads[1].get('status')=='READY': raise ValueError('relay_proof_invalid')",
+    " elif payloads[0].get('status') in {'READY','PASSED'} or payloads[0].get('substage') not in {'LOOPBACK_BIND','LOOPBACK_LISTEN','CODEX_HOME_PREPARE','CONFIG_VALIDATE','SOCKET_VALIDATE'}: raise ValueError('relay_proof_invalid')",
     " return payloads[-1]",
     "root=None; broker=None; relay=None; stage='BOOT'; failed=None; substage=None; cleaned=False",
     "try:",
@@ -601,7 +604,7 @@ _SUPERVISOR_SOURCE = "\n".join((
     " if len(out)+len(err)>16384: raise ValueError('output_limit')",
     " try: control=parse_child_control(out)",
     " except ValueError as exc:",
-    "  if relay.returncode!=0 and str(exc)=='relay_child_frame_missing': raise ValueError('relay_child_transport_error')",
+    "  if relay.returncode!=0 and str(exc)=='codex_child_control_missing': raise ValueError('relay_child_transport_error')",
     "  raise",
     " proof=parse_relay_frame(err)",
     " if relay.returncode!=0 and not control.get('error_code') and not control.get('spawn_confirmed'): raise ValueError('relay_child_transport_error')",
@@ -617,7 +620,7 @@ _SUPERVISOR_SOURCE = "\n".join((
     " stage='CLEANUP'",
     "except TimeoutError as exc: failed='supervisor_timeout'",
     "except subprocess.TimeoutExpired as exc: failed='supervisor_timeout'",
-    "except ValueError as exc: failed={'claim_invalid':'claim_invalid','implementation_invalid':'implementation_invalid','supervisor_spec_invalid':'supervisor_spec_invalid','codex_wire_contract_unproven':'codex_wire_contract_unproven','broker_not_ready':'broker_not_ready','runtime_bind_invalid':'runtime_bind_invalid','runtime_bind_missing':'runtime_bind_missing','runtime_binary_not_regular':'runtime_binary_not_regular','runtime_binary_symlink':'runtime_binary_symlink','runtime_binary_not_executable':'runtime_binary_not_executable','work_fixture_missing':'work_fixture_missing','work_fixture_not_read_only':'work_fixture_not_read_only','codex_config_missing':'codex_config_missing','codex_config_hash_mismatch':'codex_config_hash_mismatch','codex_config_invalid':'codex_config_invalid','codex_config_provider_invalid':'codex_config_provider_invalid','runtime_binary_sha_mismatch':'runtime_binary_sha_mismatch','codex_argv_invalid':'codex_argv_invalid','codex_model_invalid':'codex_model_invalid','codex_prompt_invalid':'codex_prompt_invalid','relay_codex_failed':'relay_codex_failed','relay_child_transport_error':'relay_child_transport_error','relay_child_frame_missing':'relay_child_frame_missing','relay_child_frame_duplicate':'relay_child_frame_duplicate','relay_child_frame_invalid':'relay_child_frame_invalid','relay_child_frame_hash_mismatch':'relay_child_frame_invalid','loopback_bind_failed':'loopback_bind_failed','loopback_listen_failed':'loopback_listen_failed','loopback_ready_failed':'loopback_ready_failed','loopback_accept_failed':'loopback_accept_failed','loopback_accept_timeout':'loopback_accept_timeout','codex_endpoint_not_reached':'codex_endpoint_not_reached','broker_socket_connect_failed':'broker_socket_connect_failed','output_limit':'output_limit','codex_spawn_not_proven':'codex_spawn_not_proven','codex_child_control_duplicate':'relay_child_frame_duplicate','codex_child_control_invalid':'relay_child_frame_invalid','codex_child_control_hash_mismatch':'relay_child_frame_invalid','codex_spawn_os_error':'codex_spawn_os_error','codex_binary_missing':'codex_binary_missing','codex_permission_denied':'codex_permission_denied','codex_spawned_early_exit':'codex_spawned_early_exit','codex_prompt_delivery_failed':'codex_prompt_delivery_failed','codex_spawn_timeout':'codex_spawn_timeout','codex_early_exit':'codex_early_exit','cli_no_request_exit':'cli_no_request_exit','codex_marker':'codex_marker','request_limit':'request_limit','request_target':'request_target','request_header':'request_header','request_host':'request_host','request_model':'request_model','response_limit':'response_limit','response_proof_invalid':'response_proof_invalid','cleanup_failed':'cleanup_failed','relay_child_error':'relay_child_error'}.get(str(exc),'supervisor_error')",
+    "except ValueError as exc: failed={'claim_invalid':'claim_invalid','implementation_invalid':'implementation_invalid','supervisor_spec_invalid':'supervisor_spec_invalid','codex_wire_contract_unproven':'codex_wire_contract_unproven','broker_not_ready':'broker_not_ready','runtime_bind_invalid':'runtime_bind_invalid','runtime_bind_missing':'runtime_bind_missing','runtime_binary_not_regular':'runtime_binary_not_regular','runtime_binary_symlink':'runtime_binary_symlink','runtime_binary_not_executable':'runtime_binary_not_executable','work_fixture_missing':'work_fixture_missing','work_fixture_not_read_only':'work_fixture_not_read_only','codex_config_missing':'codex_config_missing','codex_config_hash_mismatch':'codex_config_hash_mismatch','codex_config_invalid':'codex_config_invalid','codex_config_provider_invalid':'codex_config_provider_invalid','runtime_binary_sha_mismatch':'runtime_binary_sha_mismatch','codex_argv_invalid':'codex_argv_invalid','codex_model_invalid':'codex_model_invalid','codex_prompt_invalid':'codex_prompt_invalid','relay_codex_failed':'relay_codex_failed','relay_child_transport_error':'relay_child_transport_error','relay_child_frame_missing':'codex_child_control_missing','relay_child_frame_duplicate':'codex_child_control_duplicate','relay_child_frame_invalid':'codex_child_control_invalid','relay_child_frame_hash_mismatch':'codex_child_control_invalid','codex_child_control_missing':'codex_child_control_missing','codex_child_control_duplicate':'codex_child_control_duplicate','codex_child_control_invalid':'codex_child_control_invalid','codex_child_control_hash_mismatch':'codex_child_control_invalid','relay_proof_missing':'relay_proof_missing','relay_proof_duplicate':'relay_proof_duplicate','relay_proof_invalid':'relay_proof_invalid','codex_home_mode_invalid':'codex_home_mode_invalid','config_copy_failed':'config_copy_failed','codex_home_write_probe_failed':'codex_home_write_probe_failed','codex_home_write_failed':'codex_home_write_failed','arg0_init_failed':'arg0_init_failed','broker_socket_invalid':'broker_socket_invalid','loopback_bind_failed':'loopback_bind_failed','loopback_listen_failed':'loopback_listen_failed','loopback_ready_failed':'loopback_ready_failed','loopback_accept_failed':'loopback_accept_failed','loopback_accept_timeout':'loopback_accept_timeout','codex_endpoint_not_reached':'codex_endpoint_not_reached','broker_socket_connect_failed':'broker_socket_connect_failed','output_limit':'output_limit','codex_spawn_not_proven':'codex_spawn_not_proven','codex_spawn_os_error':'codex_spawn_os_error','codex_binary_missing':'codex_binary_missing','codex_permission_denied':'codex_permission_denied','codex_spawned_early_exit':'codex_spawned_early_exit','codex_prompt_delivery_failed':'codex_prompt_delivery_failed','codex_spawn_timeout':'codex_spawn_timeout','codex_early_exit':'codex_early_exit','cli_no_request_exit':'cli_no_request_exit','codex_marker':'codex_marker','request_limit':'request_limit','request_target':'request_target','request_header':'request_header','request_host':'request_host','request_model':'request_model','response_limit':'response_limit','response_proof_invalid':'response_proof_invalid','cleanup_failed':'cleanup_failed','relay_child_error':'relay_child_error'}.get(str(exc),'supervisor_error')",
     "except Exception: failed='supervisor_error'",
     "finally:",
     " stage='CLEANUP' if failed is None else stage; relay_stopped=stop(relay); broker_stopped=stop(broker); shutil.rmtree(root,ignore_errors=True) if root else None; cleaned=bool(relay_stopped and broker_stopped and (root is None or not os.path.exists(root)))",

@@ -289,6 +289,22 @@ def test_ephemeral_codex_home_prompt_and_token_are_sealed_in_child_spec():
     assert b"os.urandom(32).hex()" in RELAY_CODEX_CHILD_CODE
 
 
+def test_codex_home_tmpfs_permissions_and_arg0_hierarchy_are_sealed():
+    args = list(RELAY_CODEX_CHILD_ARGV_TEMPLATE)
+    perms = args.index("--perms")
+    assert args[perms:perms + 3] == ["--perms", "0700", "--tmpfs"]
+    assert args[perms + 3] == "/runtime/codex-home"
+    assert [args[i - 1:i + 1] for i, value in enumerate(args) if value == "/runtime/codex-home"] == [["--tmpfs", "/runtime/codex-home"], ["CODEX_HOME", "/runtime/codex-home"]]
+    source = RELAY_CODEX_CHILD_CODE.decode("utf-8")
+    assert "tmp_path=os.path.join(codex_home,'tmp')" in source
+    assert "arg0_path=os.path.join(tmp_path,'arg0')" in source
+    assert "os.path.exists(os.path.join(codex_home,'arg0'))" in source
+    assert "codex_home_mode_invalid" in source
+    assert "config_copy_failed" in source
+    assert "codex_home_write_probe_failed" in source
+    assert "arg0_init_failed" in source
+
+
 def test_relay_child_control_frame_confirms_spawn_only_after_popen_returns():
     from app.codex_process_executor_wsl import CODEX_CHILD_FRAME_PREFIX
 
@@ -346,6 +362,65 @@ def test_generated_supervisor_parser_imports_re_and_parses_sealed_child_frames_w
     passed = {**common, "status": "PASSED", "substage": "CODEX_SPAWN", "codex_cli": 1, "request_count": 1}
     parsed = namespace["parse_relay_frame"]((frame(RELAY_FRAME_PREFIX, ready) + "\n" + frame(RELAY_FRAME_PREFIX, passed) + "\n").encode("ascii"))
     assert parsed["status"] == "PASSED" and parsed["codex_cli"] == 1
+
+
+def _generated_relay_parser():
+    source = _SUPERVISOR_SOURCE.split("root=None; broker=None; relay=None;", 1)[0]
+    namespace = {"__name__": "__main__", "__file__": "<sealed-supervisor>", "__package__": None}
+    original_argv = sys.argv
+    sys.argv = ["supervisor", "00000000-0000-4000-8000-000000000000", EXECUTOR_IMPLEMENTATION_HASH, "spec"]
+    try:
+        exec(compile(source, "<sealed-supervisor>", "exec"), namespace, namespace)
+    finally:
+        sys.argv = original_argv
+    return namespace
+
+
+def _generated_relay_frame(payload):
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return RELAY_FRAME_PREFIX + base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _generated_relay_payload(*, status="ERROR", substage="LOOPBACK_BIND", error_code="loopback_bind_failed", codex_cli=0, request_count=0):
+    return {
+        "status": status, "substage": substage, "error_code": error_code,
+        "codex_cli": codex_cli, "request_count": request_count,
+        "request_hash": None, "response_hash": None, "output_hash": None,
+        "sensitive_headers_removed": False, "connection_delay_ms": 0,
+        "connection_delay_warning": False, "child_stderr_bytes": 0,
+        "child_stderr_sha256": None, "child_exit_category": None,
+        "prompt_mode": "STDIN_FORCED", "config_loaded_expected": True, "argc": 8,
+    }
+
+
+@pytest.mark.parametrize("substage", ["LOOPBACK_BIND", "LOOPBACK_LISTEN", "CODEX_HOME_PREPARE", "CONFIG_VALIDATE", "SOCKET_VALIDATE"])
+def test_generated_relay_parser_accepts_single_pre_ready_failure_with_relay_error_code(substage):
+    parser = _generated_relay_parser()["parse_relay_frame"]
+    parsed = parser((_generated_relay_frame(_generated_relay_payload(substage=substage)) + "\n").encode("ascii"))
+    assert parsed["status"] == "ERROR" and parsed["substage"] == substage
+
+
+@pytest.mark.parametrize("payload", [
+    _generated_relay_payload(status="READY", substage="READY_EMIT", error_code=None),
+    _generated_relay_payload(status="PASSED", substage="CODEX_SPAWN", error_code=None, codex_cli=1, request_count=1),
+])
+def test_generated_relay_parser_rejects_single_ready_or_passed_frame(payload):
+    with pytest.raises(ValueError, match="relay_proof_invalid"):
+        _generated_relay_parser()["parse_relay_frame"]((_generated_relay_frame(payload) + "\n").encode("ascii"))
+
+
+def test_generated_relay_parser_distinguishes_child_control_and_relay_proof_errors():
+    namespace = _generated_relay_parser()
+    parser = namespace["parse_relay_frame"]
+    with pytest.raises(ValueError, match="codex_child_control_missing"):
+        namespace["parse_child_control"](b"")
+    with pytest.raises(ValueError, match="relay_proof_missing"):
+        parser(b"\n")
+    ready = _generated_relay_payload(status="READY", substage="READY_EMIT", error_code=None)
+    failure = _generated_relay_payload(substage="CODEX_HOME_PREPARE", error_code="codex_home_write_failed")
+    passed = _generated_relay_payload(status="PASSED", substage="CODEX_SPAWN", error_code=None, codex_cli=1, request_count=1)
+    assert parser((_generated_relay_frame(ready) + "\n" + _generated_relay_frame(failure) + "\n").encode("ascii"))["error_code"] == "codex_home_write_failed"
+    assert parser((_generated_relay_frame(ready) + "\n" + _generated_relay_frame(passed) + "\n").encode("ascii"))["status"] == "PASSED"
 
 
 def test_relay_binds_listens_signals_ready_and_delivers_prompt_before_accept():
