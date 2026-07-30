@@ -51,13 +51,13 @@ class NoIoSupervisor:
     def find_wsl(self):
         return "wsl.exe"
 
-    async def run(self, args, *, timeout_seconds, on_started=None):
+    async def run(self, args, *, payload, timeout_seconds, on_started=None):
         self.calls += 1
         if on_started is not None:
             on_started()
         proof = synthetic_relay_broker_roundtrip()
         payload = {
-            "status": "ERROR" if self.bad_frame else "PASSED", "stage": "CLEANUP",
+            "status": "ERROR" if self.bad_frame else "PASSED", "stage": "CLEANUP", "substage": None,
             "error_code": "cleanup_failed" if self.bad_frame else None,
             "process_counts": {"supervisor": 1, "broker_bwrap": 1, "relay_codex_bwrap": 1, "codex_cli": 1},
             "cleanup_ok": not self.bad_frame, "implementation_hash": EXECUTOR_IMPLEMENTATION_HASH,
@@ -214,6 +214,39 @@ def test_partial_failure_records_only_observed_started_processes(tmp_path):
     assert event["app_server_rpc_calls"] == 0 and event["ignored_usage"] is True
 
 
+def test_one_shot_returns_exact_supervisor_substage(tmp_path):
+    class RelayFailureSupervisor(NoIoSupervisor):
+        async def run(self, args, *, payload, timeout_seconds, on_started=None):
+            self.calls += 1
+            if on_started is not None:
+                on_started()
+            payload = {
+                "status": "ERROR",
+                "stage": "RELAY_CODEX_SPAWN",
+                "substage": "CODEX_BINARY_VALIDATE",
+                "error_code": "runtime_binary_sha_mismatch",
+                "process_counts": {"supervisor": 1, "broker_bwrap": 1, "relay_codex_bwrap": 0, "codex_cli": 0},
+                "cleanup_ok": True,
+                "implementation_hash": EXECUTOR_IMPLEMENTATION_HASH,
+                "request_count": 0,
+                "request_hash": None,
+                "response_hash": None,
+                "output_hash": None,
+                "sensitive_headers_removed": False,
+            }
+            return ProcessResult(exit_code=0, stdout=encode_supervisor_frame(payload), stderr="")
+
+    store, _, gate, _ = one_shot_gate(tmp_path, supervisor=RelayFailureSupervisor())
+    permit, window = arm_pair(gate)
+    result = asyncio.run(gate.run_one_shot(permit["permit_nonce"], window["canary_nonce"]))
+    assert result["status"] == ERROR
+    assert result["stage"] == "RELAY_CODEX_SPAWN"
+    assert result["substage"] == "CODEX_BINARY_VALIDATE"
+    assert result["error_code"] == "runtime_binary_sha_mismatch"
+    event = next(event for event in store.ledger_usage_events() if event.get("action") == "RUN")
+    assert event["local_processes"] == 2
+
+
 def test_claim_recovery_blocks_reexecution(tmp_path):
     store, _, gate, created = one_shot_gate(tmp_path)
     permit, window = arm_pair(gate)
@@ -240,3 +273,41 @@ def test_one_shot_endpoint_keeps_ipv4_host_origin_policy(tmp_path, monkeypatch):
     with TestClient(main.app) as client:
         denied = client.post("/api/isolation/wsl/codex-process-canary/one-shot", headers={"Origin": "http://testserver"}, json={})
         assert denied.status_code == 403
+
+
+def test_server_handoff_endpoint_accepts_empty_body_and_never_returns_nonce(tmp_path, monkeypatch):
+    from app import main
+
+    supervisor = NoIoSupervisor()
+    store, _, gate, created = one_shot_gate(tmp_path, supervisor=supervisor)
+    monkeypatch.setattr(main, "DATA_ROOT", tmp_path / "api-data")
+    with TestClient(main.app, base_url="http://127.0.0.1:8787") as client:
+        main.app.state.codex_canary_execution_permit_gate = gate
+        response = client.post(
+            "/api/isolation/wsl/codex-process-canary/execute-one-shot",
+            headers={"Origin": "http://127.0.0.1:8787"},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == PASSED
+    assert "permit_nonce" not in repr(body) and "canary_nonce" not in repr(body)
+    assert created == {"runner": 1, "executor": 1} and supervisor.calls == 1
+    assert store.codex_canary_execution_permit()["status"] == "CONSUMED"
+    assert store.codex_process_canary_window()["status"] == "CONSUMED"
+
+
+def test_server_handoff_rejects_request_body_without_creating_capability(tmp_path, monkeypatch):
+    from app import main
+
+    store, _, gate, created = one_shot_gate(tmp_path)
+    monkeypatch.setattr(main, "DATA_ROOT", tmp_path / "api-data")
+    with TestClient(main.app, base_url="http://127.0.0.1:8787") as client:
+        main.app.state.codex_canary_execution_permit_gate = gate
+        response = client.post(
+            "/api/isolation/wsl/codex-process-canary/execute-one-shot",
+            headers={"Origin": "http://127.0.0.1:8787"},
+            json={"permit_nonce": "not-accepted"},
+        )
+    assert response.status_code == 422
+    assert store.codex_canary_execution_permit()["status"] == "DISABLED"
+    assert created == {"runner": 0, "executor": 0}

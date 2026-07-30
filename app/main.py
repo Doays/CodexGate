@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,13 @@ from .capsule import create_evidence_capsule
 from .catalog import CatalogService
 from .bridge import BridgeService
 from .gateway import Gate
-from .isolation_wsl import LocalWSLCommandRunner, WSLBubblewrapIsolation, public_result as public_wsl_isolation_result
+from .isolation_wsl import (
+    LocalWSLCommandRunner,
+    OFFLINE_CANARY_MIN_REMAINING_SECONDS,
+    SAFE_CANDIDATE,
+    WSLBubblewrapIsolation,
+    public_result as public_wsl_isolation_result,
+)
 from .isolation_repro import IsolationReproService, public_repro_result
 from .wsl_codex_runtime import WSLCodexRuntime, public_runtime_result
 from .egress_contract import SealedEgressContractService, public_contract_preview, public_contract_result
@@ -393,6 +400,48 @@ def codex_process_canary_snapshot(request: Request) -> dict[str, Any]:
     return result
 
 
+def codex_process_canary_readiness(request: Request) -> dict[str, Any]:
+    """Return Offline Canary readiness without consulting app-server state."""
+    readiness = codex_canary_execution_permit_gate(request).ready()
+    # Always read the current isolation row for this request. These are
+    # sanitized lifecycle timestamps only; no probe payload is exposed.
+    isolation = gate(request).store.wsl_isolation_result()
+    issued_at = isolation.get("checked_at") if isinstance(isolation, dict) else None
+    expires_at = isolation.get("expires_at") if isinstance(isolation, dict) else None
+    remaining_seconds = 0
+    if isinstance(expires_at, str) and expires_at:
+        try:
+            expiry = datetime.fromisoformat(expires_at)
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            remaining_seconds = max(0, int((expiry - datetime.now(timezone.utc)).total_seconds()))
+        except ValueError:
+            remaining_seconds = 0
+    # The Offline one-shot is stricter than the generic proof reserve. It must
+    # bind only the current singleton SAFE_CANDIDATE with a full ten-minute
+    # server-sealed window left; a cached near-expiry row is never READY.
+    if not isinstance(isolation, dict) or isolation.get("status") != SAFE_CANDIDATE:
+        readiness = {**readiness, "status": "BLOCKED", "error_code": "isolation_not_safe_candidate"}
+    elif remaining_seconds <= OFFLINE_CANARY_MIN_REMAINING_SECONDS:
+        readiness = {**readiness, "status": "BLOCKED", "error_code": "isolation_expiring"}
+    return {
+        "status": readiness.get("status", "BLOCKED"),
+        "reason_code": readiness.get("error_code"),
+        "start_allowed": False,
+        "permit_ready": readiness.get("status") == "READY",
+        "runner_kind": readiness.get("runner_kind"),
+        "runner_version": readiness.get("runner_version"),
+        "runner_implementation_hash": readiness.get("runner_implementation_hash"),
+        "implementation_hash": readiness.get("implementation_hash"),
+        "binding_hash": readiness.get("binding_hash"),
+        "contract_hash": readiness.get("contract_hash"),
+        "issued_at": issued_at,
+        "expires_at": expires_at,
+        "remaining_seconds": remaining_seconds,
+        "offline_canary_min_remaining_seconds": OFFLINE_CANARY_MIN_REMAINING_SECONDS,
+    }
+
+
 def as_http_error(error: Exception) -> HTTPException:
     return HTTPException(status_code=400, detail=str(error))
 
@@ -633,13 +682,22 @@ async def codex_process_canary_status(request: Request):
         raise as_http_error(exc) from exc
 
 
+@app.get("/api/isolation/wsl/codex-process-canary/readiness")
+async def codex_process_canary_readiness_status(request: Request):
+    try:
+        return JSONResponse(codex_process_canary_readiness(request), headers={"Cache-Control": "no-store"})
+    except Exception as exc:
+        raise as_http_error(exc) from exc
+
+
 @app.post("/api/isolation/wsl/codex-process-canary/arm")
 async def arm_codex_process_canary(payload: CodexProcessCanaryArmRequest, request: Request):
     rejection = _enforce_execution_window_arm_request(request)
     if rejection is not None:
         return rejection
     try:
-        return await codex_canary_execution_permit_gate(request).arm(payload.permit_nonce)
+        result = await codex_canary_execution_permit_gate(request).arm(payload.permit_nonce)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
     except PolicyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -659,9 +717,26 @@ async def run_codex_process_canary_one_shot(payload: CodexProcessCanaryRequest, 
     if rejection is not None:
         return rejection
     try:
-        return await codex_canary_execution_permit_gate(request).run_one_shot(
+        result = await codex_canary_execution_permit_gate(request).run_one_shot(
             payload.permit_nonce, payload.canary_nonce,
         )
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+    except PolicyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/isolation/wsl/codex-process-canary/execute-one-shot")
+async def execute_codex_process_canary_one_shot(request: Request):
+    """One local click performs the complete server-side capability handoff."""
+    rejection = _enforce_execution_window_arm_request(request)
+    if rejection is not None:
+        return rejection
+    body = await request.body()
+    if body.strip():
+        raise HTTPException(status_code=422, detail="offline_canary_request_body_forbidden")
+    try:
+        result = await codex_canary_execution_permit_gate(request).execute_one_shot()
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
     except PolicyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -672,7 +747,11 @@ async def issue_codex_process_canary_permit(request: Request):
     if rejection is not None:
         return rejection
     try:
-        return await codex_canary_execution_permit_gate(request).issue()
+        freshness = codex_process_canary_readiness(request)
+        if freshness.get("status") != "READY":
+            raise PolicyError(str(freshness.get("reason_code") or "offline_canary_readiness_blocked"))
+        result = await codex_canary_execution_permit_gate(request).issue()
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
     except PolicyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -681,7 +760,9 @@ async def issue_codex_process_canary_permit(request: Request):
 async def wsl_isolation_probe(request: Request):
     try:
         # This local probe uses only fixed direct WSL/bwrap argv; it never opens app-server.
-        return public_wsl_isolation_result(await wsl_isolation(request).probe())
+        return public_wsl_isolation_result(
+            await wsl_isolation(request).probe(offline_canary_refresh=True)
+        )
     except Exception as exc:
         raise as_http_error(exc) from exc
 

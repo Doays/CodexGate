@@ -141,6 +141,87 @@ def test_permit_api_keeps_ipv4_origin_and_testserver_policy(tmp_path, monkeypatc
         assert denied.status_code == 403
 
 
+def test_offline_readiness_does_not_require_app_server_connection(monkeypatch, tmp_path):
+    from app import main
+
+    class ReadyGate:
+        def ready(self):
+            return {
+                "status": "READY",
+                "runner_kind": CANARY_RUNNER_KIND,
+                "runner_version": RUNNER_VERSION,
+                "runner_implementation_hash": RUNNER_IMPLEMENTATION_HASH,
+                "implementation_hash": RUNNER_IMPLEMENTATION_HASH,
+                "binding_hash": "a" * 64,
+                "contract_hash": "b" * 64,
+                "error_code": None,
+                "start_allowed": False,
+            }
+
+    monkeypatch.setattr(main, "DATA_ROOT", tmp_path / "api-data")
+    with TestClient(main.app, base_url="http://127.0.0.1:8787") as client:
+        now = datetime.now(timezone.utc)
+        main.app.state.gate.store.save_wsl_isolation_result({
+            "backend": "WSL2_BWRAP", "distro": "Ubuntu", "status": SAFE_CANDIDATE,
+            "checked_at": now.isoformat(), "expires_at": (now + timedelta(minutes=30)).isoformat(),
+            "config_hash": CONFIG_HASH, "tool_fingerprint": TOOL_FINGERPRINT, "cache_key": ISOLATION_KEY,
+            "probe_version": "wsl2-bwrap-v1", "tool_versions": {"wsl2": True, "bwrap_present": True},
+            "error_code": None, "inside_read_succeeded": True, "outside_data_denied": True,
+            "host_mount_denied": True, "capsule_write_denied": True, "tmp_write_succeeded": True,
+            "network_denied": True,
+        })
+        original = main.app.state.codex_canary_execution_permit_gate
+        main.app.state.codex_canary_execution_permit_gate = ReadyGate()
+        try:
+            response = client.get(
+                "/api/isolation/wsl/codex-process-canary/readiness",
+                headers={"Origin": "http://127.0.0.1:8787"},
+            )
+        finally:
+            main.app.state.codex_canary_execution_permit_gate = original
+    assert response.status_code == 200
+    assert response.json()["status"] == "READY"
+    assert response.json()["permit_ready"] is True
+    assert response.json()["remaining_seconds"] > response.json()["offline_canary_min_remaining_seconds"]
+    assert "connected" not in response.json()
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_offline_readiness_rejects_a_safe_candidate_at_or_below_server_minimum(monkeypatch, tmp_path):
+    from app import main
+
+    class ReadyGate:
+        def ready(self):
+            return {
+                "status": "READY", "runner_kind": CANARY_RUNNER_KIND,
+                "runner_version": RUNNER_VERSION, "runner_implementation_hash": RUNNER_IMPLEMENTATION_HASH,
+                "implementation_hash": RUNNER_IMPLEMENTATION_HASH, "binding_hash": "a" * 64,
+                "contract_hash": "b" * 64, "error_code": None, "start_allowed": False,
+            }
+
+    monkeypatch.setattr(main, "DATA_ROOT", tmp_path / "api-data")
+    with TestClient(main.app, base_url="http://127.0.0.1:8787") as client:
+        now = datetime.now(timezone.utc)
+        main.app.state.gate.store.save_wsl_isolation_result({
+            "backend": "WSL2_BWRAP", "distro": "Ubuntu", "status": SAFE_CANDIDATE,
+            "checked_at": now.isoformat(), "expires_at": (now + timedelta(minutes=10)).isoformat(),
+            "config_hash": CONFIG_HASH, "tool_fingerprint": TOOL_FINGERPRINT, "cache_key": ISOLATION_KEY,
+            "probe_version": "wsl2-bwrap-v1", "tool_versions": {"wsl2": True, "bwrap_present": True},
+            "error_code": None, "inside_read_succeeded": True, "outside_data_denied": True,
+            "host_mount_denied": True, "capsule_write_denied": True, "tmp_write_succeeded": True,
+            "network_denied": True,
+        })
+        original = main.app.state.codex_canary_execution_permit_gate
+        main.app.state.codex_canary_execution_permit_gate = ReadyGate()
+        try:
+            response = client.get("/api/isolation/wsl/codex-process-canary/readiness", headers={"Origin": "http://127.0.0.1:8787"})
+        finally:
+            main.app.state.codex_canary_execution_permit_gate = original
+    assert response.status_code == 200
+    assert response.json()["status"] == "BLOCKED"
+    assert response.json()["reason_code"] == "isolation_expiring"
+
+
 def test_permit_is_bound_to_current_sealed_identity(tmp_path):
     store, _, _, gate = ready_permit_gate(tmp_path)
     permit = asyncio.run(gate.issue())
@@ -172,3 +253,30 @@ def test_permit_storage_binding_rejects_changed_identity_fields(tmp_path, field,
         changed["canary_runner_version"] = f"sealed-offline-codex-{value[:16]}"
     with pytest.raises(PolicyError):
         store.issue_codex_canary_execution_permit(changed)
+
+
+def test_server_handoff_aborts_permit_when_window_arm_fails(tmp_path):
+    store, _, _, gate = ready_permit_gate(tmp_path)
+
+    async def fail_arm(_permit_nonce):
+        raise PolicyError("arm_failed")
+
+    gate.arm = fail_arm
+    with pytest.raises(PolicyError, match="server_handoff_failed"):
+        asyncio.run(gate.execute_one_shot())
+    permit = store.codex_canary_execution_permit()
+    assert permit["status"] == "ABORTED"
+    assert permit["error_code"] == "server_handoff_failed"
+
+
+def test_ui_uses_one_server_handoff_button_without_nonce_state():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    script = (root / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    template = (root / "app" / "templates" / "index.html").read_text(encoding="utf-8")
+    assert "execute-one-shot" in script
+    assert "codexProcessCanaryPermit" not in script
+    assert "codexProcessCanaryArm" not in script
+    assert "arm-codex-process-canary" not in template
+    assert "run-codex-process-canary-one-shot" in template

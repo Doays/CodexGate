@@ -32,6 +32,10 @@ FINAL_STATES = frozenset({
     UNSAFE_WRITE, UNSAFE_NETWORK, ERROR,
 })
 PROBE_TTL_SECONDS = 30 * 60
+# Offline Codex execution consumes a one-shot capability and must never reuse
+# a result that could expire during its preparation window. This is a sealed
+# server policy, not an API or UI supplied override.
+OFFLINE_CANARY_MIN_REMAINING_SECONDS = 10 * 60
 TIMEOUT_SECONDS = 15
 HOST_CHECK_TIMEOUT_SECONDS = 10
 DISTRO_QUERY_TIMEOUT_SECONDS = 30
@@ -290,7 +294,7 @@ class WSLBubblewrapIsolation:
         self.store = store
         self.runner = runner or LocalWSLCommandRunner()
 
-    async def probe(self) -> dict[str, Any]:
+    async def probe(self, *, offline_canary_refresh: bool = False) -> dict[str, Any]:
         # DATA_ROOT itself must never become a probe target when it overlaps a recovery root.
         if forbidden_workspace_reason(self.store.root):
             return self._base_result(
@@ -333,13 +337,14 @@ class WSLBubblewrapIsolation:
             stages=preflight.get("stages") if isinstance(preflight.get("stages"), list) else [],
             error_code=preflight.get("error_code"),
         )
+        minimum_remaining = OFFLINE_CANARY_MIN_REMAINING_SECONDS if offline_canary_refresh else 0
         if preflight.get("ok") and current_cache_key:
             cached = self.store.wsl_isolation_result(
                 config_hash,
                 tool_fingerprint=tool_fingerprint_value,
                 cache_key=current_cache_key,
             )
-            if self._reusable(cached, config_hash, tool_fingerprint_value, current_cache_key):
+            if self._reusable(cached, config_hash, tool_fingerprint_value, current_cache_key, minimum_remaining):
                 return {**cached, "reused": True, "environment_changed": False}
         elif not preflight.get("ok"):
             result = self._base_result(
@@ -366,7 +371,7 @@ class WSLBubblewrapIsolation:
                 tool_fingerprint=tool_fingerprint_value,
                 cache_key=current_cache_key,
             )
-            if self._reusable(cached, config_hash, tool_fingerprint_value, current_cache_key):
+            if self._reusable(cached, config_hash, tool_fingerprint_value, current_cache_key, minimum_remaining):
                 return {**cached, "reused": True, "environment_changed": False}
             started = time.monotonic()
             probing = self._base_result(
@@ -436,7 +441,10 @@ class WSLBubblewrapIsolation:
         }
 
     @staticmethod
-    def _reusable(record: dict[str, Any], config_hash: str, tool_fingerprint_value: str, current_cache_key: str) -> bool:
+    def _reusable(
+        record: dict[str, Any], config_hash: str, tool_fingerprint_value: str,
+        current_cache_key: str, minimum_remaining_seconds: int = 0,
+    ) -> bool:
         if (
             record.get("config_hash") != config_hash
             or record.get("tool_fingerprint") != tool_fingerprint_value
@@ -446,7 +454,10 @@ class WSLBubblewrapIsolation:
         ):
             return False
         try:
-            return datetime.fromisoformat(str(record["expires_at"])) > _now()
+            expires_at = datetime.fromisoformat(str(record["expires_at"]))
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            return (expires_at - _now()).total_seconds() >= minimum_remaining_seconds
         except (KeyError, TypeError, ValueError):
             return False
 

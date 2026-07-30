@@ -11,8 +11,6 @@ let wslEgressStatus = "UNCONFIGURED";
 let wslHarnessStatus = "BLOCKED";
 let actualWSLHarnessStatus = "NOT RUN";
 let actualWSLHarnessArm = null;
-let codexProcessCanaryPermit = null;
-let codexProcessCanaryArm = null;
 let stream = null;
 let planExpiryTimer = null;
 let currentBridge = null;
@@ -373,13 +371,28 @@ function renderCodexProcessCanary(result) {
   const code = result?.error_code ? ` Code: ${result.error_code}.` : "";
   statusNode.textContent = status;
   const claim = result?.execution_claim || { status: "DISABLED" };
-  detailNode.textContent = `Offline Codex canary ${status}; ${implementation}. Permit ${permit.status || "DISABLED"}.${permitRemaining} Canary window ${window.status || "DISABLED"}.${remaining} One-shot claim ${claim.status || "DISABLED"}.${code} One local click authorizes at most one fixed fake-response check with external model tokens 0; Runtime and live execution remain locked.`;
-  const permitButton = $("issue-codex-process-canary-permit");
-  const armButton = $("arm-codex-process-canary");
-  const runButton = $("run-codex-process-canary");
-  if (permitButton) permitButton.disabled = result?.permit_ready !== true || permit.status === "ARMED";
-  if (armButton) armButton.disabled = permit.status !== "ARMED" || window.status === "ARMED" || !codexProcessCanaryPermit;
-  if (runButton) runButton.disabled = permit.status !== "ARMED" || window.status !== "ARMED" || !codexProcessCanaryPermit || !codexProcessCanaryArm;
+  detailNode.textContent = `Offline Codex canary ${status}; ${implementation}. Server Permit ${permit.status || "DISABLED"}.${permitRemaining} Canary window ${window.status || "DISABLED"}.${remaining} One-shot claim ${claim.status || "DISABLED"}.${code} One local click performs the complete sealed handoff; external model tokens remain 0 and Runtime/live execution remain locked.`;
+  const runButton = $("run-codex-process-canary-one-shot");
+  if (runButton) {
+    runButton.disabled = result?.permit_ready !== true
+      || (result?.readiness !== true && !["READY", "DISABLED"].includes(status));
+  }
+}
+
+async function refreshOfflineCodexCanaryReadiness() {
+  try {
+    const readiness = await api("/api/isolation/wsl/codex-process-canary/readiness");
+    renderCodexProcessCanary({
+      ...readiness,
+      readiness: true,
+      execution_permit: { status: "DISABLED", remaining_seconds: 0 },
+      execution_window: { status: "DISABLED", remaining_seconds: 0 },
+      execution_claim: { status: "DISABLED" },
+    });
+    if (readiness.reason_code) say("Offline Canary readiness: " + readiness.reason_code + ".", true);
+  } catch (error) {
+    say(error.message, true);
+  }
 }
 
 async function runIsolationProbe() {
@@ -415,7 +428,28 @@ async function runWSLIsolationProbe() {
     say("Running fixed WSL2+bubblewrap canaries without an app-server or model turn...");
     const result = await api("/api/isolation/wsl/probe", { method: "POST" });
     renderWSLIsolation(result);
-    say(`WSL isolation probe recorded: ${result.status}. Live execution remains locked.`, result.status !== "SAFE_CANDIDATE");
+    // A successful probe is not readiness. Read the current DB-backed
+    // readiness exactly once, then continue only when every sealed proof is
+    // fresh and bound to the same environment.
+    if (result.status === "SAFE_CANDIDATE") {
+      const readiness = await api("/api/isolation/wsl/codex-process-canary/readiness");
+      renderCodexProcessCanary({
+        ...readiness,
+        readiness: true,
+        execution_permit: { status: "DISABLED", remaining_seconds: 0 },
+        execution_window: { status: "DISABLED", remaining_seconds: 0 },
+        execution_claim: { status: "DISABLED" },
+      });
+      const requiredRemaining = Number(readiness.offline_canary_min_remaining_seconds || 0);
+      if (readiness.status !== "READY" || Number(readiness.remaining_seconds || 0) <= requiredRemaining) {
+        const detail = readiness.reason_code === "isolation_expiring"
+          ? `issued_at=${readiness.issued_at || "unknown"}, expires_at=${readiness.expires_at || "unknown"}, remaining_seconds=${Number(readiness.remaining_seconds || 0)}`
+          : (readiness.reason_code || readiness.status || "readiness_blocked");
+        say(`Offline Canary readiness blocked: ${detail}.`, true);
+      }
+    } else {
+      say(`WSL isolation probe recorded: ${result.status}. Live execution remains locked.`, true);
+    }
   } catch (error) {
     say(error.message, true);
   } finally {
@@ -521,59 +555,17 @@ async function runActualWSLEgressHarness() {
   }
 }
 
-async function issueCodexProcessCanaryPermit() {
+async function runOfflineCodexOneShot() {
+  const button = $("run-codex-process-canary-one-shot");
+  if (button) button.disabled = true;
   try {
-    codexProcessCanaryPermit = await api("/api/isolation/wsl/codex-process-canary/permit", { method: "POST" });
-    codexProcessCanaryArm = null;
-    renderCodexProcessCanary(await api("/api/isolation/wsl/codex-process-canary"));
-    say("A local two-minute Offline Canary Permit is armed. It authorizes one canary-window request only; external model tokens remain 0.");
-  } catch (error) {
-    codexProcessCanaryPermit = null;
-    codexProcessCanaryArm = null;
-    say(error.message, true);
-  }
-}
-
-async function armCodexProcessCanary() {
-  if (!codexProcessCanaryPermit) return;
-  try {
-    codexProcessCanaryArm = await api("/api/isolation/wsl/codex-process-canary/arm", {
-      method: "POST",
-      body: JSON.stringify({ permit_nonce: codexProcessCanaryPermit.permit_nonce }),
-    });
-    renderCodexProcessCanary(await api("/api/isolation/wsl/codex-process-canary"));
-    say("A one-time offline Codex canary window is armed locally. Runtime and live execution remain locked.");
-  } catch (error) {
-    codexProcessCanaryArm = null;
-    codexProcessCanaryPermit = null;
-    say(error.message, true);
-  }
-}
-
-async function runCodexProcessCanary() {
-  if (!codexProcessCanaryPermit || !codexProcessCanaryArm) return;
-  const button = $("run-codex-process-canary");
-  try {
-    // Disable synchronously before the request so the browser cannot resend
-    // the same two one-time capabilities while the response is pending.
-    if (button) button.disabled = true;
-    // This is the only UI path that can request the sealed actual runner.
-    // It always clears both browser-side capabilities after one submission.
-    const result = await api("/api/isolation/wsl/codex-process-canary/one-shot", {
-      method: "POST",
-      body: JSON.stringify({
-        permit_nonce: codexProcessCanaryPermit.permit_nonce,
-        canary_nonce: codexProcessCanaryArm.canary_nonce,
-      }),
-    });
-    codexProcessCanaryPermit = null;
-    codexProcessCanaryArm = null;
+    const result = await api("/api/isolation/wsl/codex-process-canary/execute-one-shot", { method: "POST" });
     renderCodexProcessCanary(result);
+    say("Offline Canary completed once; external model tokens remain 0.");
   } catch (error) {
-    codexProcessCanaryPermit = null;
-    codexProcessCanaryArm = null;
+    // The server has already consumed or aborted its internal capabilities;
+    // never re-enable this one-shot button after any response.
     say(error.message, true);
-    renderCodexProcessCanary(await api("/api/isolation/wsl/codex-process-canary"));
   }
 }
 
@@ -1303,9 +1295,8 @@ $("create-wsl-egress-contract").onclick = createSealedEgressContract;
 $("run-wsl-egress-harness").onclick = runSealedEgressHarness;
 $("arm-actual-wsl-egress-harness").onclick = armActualWSLEgressHarness;
 $("run-actual-wsl-egress-harness").onclick = runActualWSLEgressHarness;
-$("issue-codex-process-canary-permit").onclick = issueCodexProcessCanaryPermit;
-$("arm-codex-process-canary").onclick = armCodexProcessCanary;
-$("run-codex-process-canary").onclick = runCodexProcessCanary;
+$("run-codex-process-canary-one-shot").onclick = runOfflineCodexOneShot;
+refreshOfflineCodexCanaryReadiness();
 for (const id of ["catalog-filter-status", "catalog-filter-kind", "catalog-filter-extension"]) $(id).addEventListener("change", () => refreshCatalogEntries().catch((error) => say(error.message, true)));
 renderBridge(null);
 restoreBridge();

@@ -27,6 +27,7 @@ from .codex_process_executor_wsl import (
     SUCCESS_MARKER,
     SUPERVISOR_CODE,
     WSLCodexProcessCanaryExecutor,
+    build_sealed_codex_argv,
     compute_executor_implementation,
 )
 from .codex_wire_contract import WIRE_CONTRACT_HASH, WIRE_CONTRACT_STATUS, fixture_stream_hash
@@ -146,6 +147,7 @@ class CanaryExecution:
     bwrap_processes: int = 0
     codex_processes: int = 0
     supervisor_stage: str | None = None
+    supervisor_substage: str | None = None
     cleanup_ok: bool | None = None
     # These are observed sealed-frame digests, never reconstructed output.
     output_hash: str | None = None
@@ -343,6 +345,7 @@ def build_canary_launch_spec(contract: Mapping[str, Any]) -> dict[str, Any]:
     config_bytes = canonical_provider_toml()
     if contract.get("provider_config_hash") != provider_config_hash(config_bytes):
         raise PolicyError("contract_provider_changed")
+    sealed_codex_argv = list(build_sealed_codex_argv())
     return {
         "broker": {"unshare_all": True, "clearenv": True, "tmpfs": ("/tmp", "/runtime-state"), "socket": "single_af_unix"},
         "relay_codex": {
@@ -350,9 +353,10 @@ def build_canary_launch_spec(contract: Mapping[str, Any]) -> dict[str, Any]:
             "clearenv": True,
             "work_read_only": True,
             "codex_home": "tmpfs",
-            "tmpfs": ("/tmp", "/runtime-state"),
+            "tmpfs": ("/tmp", "/runtime-state", "/runtime/codex-home"),
+            "sealed_config": "read_only_source_copy",
             "network": "sealed_loopback_only",
-            "argv": list(FIXED_CODEX_ARGV),
+            "argv": list(sealed_codex_argv),
             "endpoint": {"host": LOOPBACK_HOST, "port": LOOPBACK_PORT, "path": BROKER_REQUEST_PATH},
         },
         "contract_hash": contract.get("contract_hash"),
@@ -718,6 +722,7 @@ class SealedOfflineCodexProcessCanary:
         began = time.monotonic()
         result: dict[str, Any]
         execution: CanaryExecution | None = None
+        transient_diagnostic: dict[str, Any] = {}
         try:
             contract, error_code = self.contract_service.immutable_execution_contract()
             if contract is None:
@@ -780,9 +785,16 @@ class SealedOfflineCodexProcessCanary:
                 "actual_runner_policy_violation",
             } else (code if isinstance(code, str) and len(code) <= 80 and code.replace("_", "").isalnum() else "canary_policy_error"),
                 "stage": getattr(exc, "stage", None) or running.get("stage"),
+                "substage": getattr(exc, "substage", None),
                 "cleanup_ok": getattr(exc, "cleanup_ok", None), "stdout_bytes": getattr(exc, "stdout_bytes", 0),
                 "stderr_bytes": getattr(exc, "stderr_bytes", 0), "exit_code": getattr(exc, "exit_code", None),
                 "output_bytes": int(getattr(exc, "stdout_bytes", 0) or 0) + int(getattr(exc, "stderr_bytes", 0) or 0)}
+            delay = getattr(exc, "connection_delay_ms", None)
+            category = getattr(exc, "child_exit_category", None)
+            if isinstance(delay, int) and delay >= 0:
+                transient_diagnostic["connection_delay_ms"] = delay
+            if category in {"CODEX_HOME_WRITE_FAILED", "ARG0_INIT_FAILED", "CONFIG_LOAD_FAILED", "AUTH_REQUIRED", "CLI_USAGE_ERROR", "CHILD_EXIT_OTHER"}:
+                transient_diagnostic["child_exit_category"] = category
         except Exception:
             result = {**running, "status": ERROR, "error_code": "canary_error", "stage": "BOOT", "cleanup_ok": False}
         if execution is not None:
@@ -796,6 +808,7 @@ class SealedOfflineCodexProcessCanary:
                 "exit_code": execution.exit_code,
                 "stdout_bytes": execution.stdout_bytes, "stderr_bytes": execution.stderr_bytes,
                 "stage": execution.supervisor_stage or result.get("stage"),
+                "substage": execution.supervisor_substage or result.get("substage"),
                 "cleanup_ok": execution.cleanup_ok if execution.cleanup_ok is not None else execution.resources_cleaned,
                 "output_hash": execution.output_hash, "sensitive_headers_removed": execution.sensitive_headers_removed,
                 "marker_verified": execution.marker_verified,
@@ -804,11 +817,17 @@ class SealedOfflineCodexProcessCanary:
             **result, "finished_at": _now(), "local_duration_ms": max(0, round((time.monotonic() - began) * 1000)),
             "start_allowed": False,
         }
-        saved = self.store.finish_codex_process_canary(result)
+        persistable = dict(result)
+        persistable.pop("substage", None)
+        saved = self.store.finish_codex_process_canary(persistable)
         ledger_source = "LOCAL_ESTIMATE" if bool(getattr(active_runner, "is_fake", False)) else "LOCAL_OBSERVED"
         ledger_quality = "ESTIMATED" if ledger_source == "LOCAL_ESTIMATE" else "OBSERVED"
         self.store.record_codex_process_canary_ledger(saved, "RUN", source=ledger_source, quality=ledger_quality)
-        return public_canary_result(saved)
+        public = public_canary_result(saved)
+        if isinstance(result.get("substage"), str):
+            public["substage"] = result["substage"]
+        public.update(transient_diagnostic)
+        return public
 
     def _validate_execution(self, execution: CanaryExecution, active_runner: CodexProcessCanaryRunner) -> None:
         if (execution.runner_kind, execution.runner_version, execution.runner_implementation_hash) != (
@@ -876,6 +895,7 @@ class CodexCanaryExecutionPermitGate:
         self.store = store
         self.service = service
         self._permit_lock = asyncio.Lock()
+        self._one_shot_lock = asyncio.Lock()
 
     def _require_actual_runner(self) -> None:
         if not self.service.is_sealed_actual_runner_candidate():
@@ -925,6 +945,46 @@ class CodexCanaryExecutionPermitGate:
     async def run_one_shot(self, permit_nonce: str | None, canary_nonce: str | None) -> dict[str, Any]:
         """Select the sealed WSL runner for one already-authorized request."""
         return await self._run_consumed_capabilities(permit_nonce, canary_nonce, one_shot=True)
+
+    async def execute_one_shot(self) -> dict[str, Any]:
+        """Issue, arm, claim, and run without returning a browser nonce.
+
+        The capability values exist only as local coroutine variables.  The
+        entire handoff is singleflight per gate instance, while the existing
+        storage transactions continue to provide the durable one-use checks.
+        """
+        if self._one_shot_lock.locked():
+            raise PolicyError("codex_canary_execution_in_progress")
+        await self._one_shot_lock.acquire()
+        permit_nonce: str | None = None
+        window_nonce: str | None = None
+        permit_id: str | None = None
+        try:
+            binding = self._sealed_binding()
+            async with self._permit_lock:
+                permit = self.store.issue_codex_canary_execution_permit(
+                    binding, ttl_seconds=self.PERMIT_TTL_SECONDS,
+                )
+            permit_nonce = permit.get("permit_nonce")
+            permit_id = permit.get("permit_id")
+            if not isinstance(permit_nonce, str) or not isinstance(permit_id, str):
+                raise PolicyError("server_handoff_failed")
+            try:
+                window = await self.arm(permit_nonce)
+            except PolicyError as exc:
+                code = "execution_binding_changed" if str(exc) == "execution_binding_changed" else "server_handoff_failed"
+                self.store.abort_codex_canary_execution_permit(permit_id, code)
+                raise PolicyError(code) from exc
+            window_nonce = window.get("canary_nonce")
+            if not isinstance(window_nonce, str):
+                self.store.abort_codex_canary_execution_permit(permit_id, "server_handoff_failed")
+                raise PolicyError("server_handoff_failed")
+            return await self.run_one_shot(permit_nonce, window_nonce)
+        finally:
+            permit_nonce = None
+            window_nonce = None
+            permit_id = None
+            self._one_shot_lock.release()
 
     async def _run_consumed_capabilities(
         self,

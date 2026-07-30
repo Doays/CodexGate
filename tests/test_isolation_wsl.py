@@ -11,6 +11,7 @@ from app.gateway import Gate
 from app.isolation_wsl import (
     ERROR,
     MISCONFIGURED,
+    OFFLINE_CANARY_MIN_REMAINING_SECONDS,
     SAFE_CANDIDATE,
     UNAVAILABLE,
     UNSAFE_HOST_FS,
@@ -187,6 +188,29 @@ def test_same_config_ttl_is_reused_and_concurrent_probe_runs_once(tmp_path):
     assert third["reused"] is True
     assert sum("--unshare-all" in call for call in service.runner.calls) == 1
     assert store.wsl_isolation_result()["status"] == SAFE_CANDIDATE
+
+
+def test_offline_canary_refresh_bypasses_a_near_expiry_cache_once(tmp_path):
+    store, service = configured(tmp_path)
+    first = asyncio.run(service.probe())
+    stale = {
+        **first,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "expires_at": (datetime.now(timezone.utc) + timedelta(
+            seconds=OFFLINE_CANARY_MIN_REMAINING_SECONDS - 1
+        )).isoformat(),
+        "reused": False,
+    }
+    store.save_wsl_isolation_result(stale)
+    before = sum("--unshare-all" in call for call in service.runner.calls)
+    refreshed = asyncio.run(service.probe(offline_canary_refresh=True))
+    after = sum("--unshare-all" in call for call in service.runner.calls)
+    assert refreshed["status"] == SAFE_CANDIDATE
+    assert refreshed["reused"] is False
+    assert after == before + 1
+    assert datetime.fromisoformat(refreshed["expires_at"]) - datetime.now(timezone.utc) > timedelta(
+        seconds=OFFLINE_CANARY_MIN_REMAINING_SECONDS
+    )
 
 
 def test_orphaned_probing_record_is_recovered_once(tmp_path):

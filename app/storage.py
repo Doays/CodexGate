@@ -520,7 +520,7 @@ class Store:
                     repro_version TEXT NOT NULL,
                     repro_key TEXT NOT NULL,
                     repro_result_hash TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK (status IN ('ARMED', 'CONSUMED', 'EXPIRED')),
+                    status TEXT NOT NULL CHECK (status IN ('ARMED', 'CONSUMED', 'EXPIRED', 'ABORTED')),
                     issued_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
                     consumed_at TEXT,
@@ -717,6 +717,7 @@ class Store:
             self._migrate_sealed_egress_contract_instances(conn)
             self._migrate_egress_harness_runs(conn)
             self._migrate_egress_harness_arms(conn)
+            self._migrate_codex_canary_execution_permits(conn)
             self._migrate_codex_canary_execution_claims(conn)
 
     def _connection(self) -> sqlite3.Connection:
@@ -733,6 +734,67 @@ class Store:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(wsl_codex_runtime_results)")}
         if "identity_version" not in columns:
             conn.execute("ALTER TABLE wsl_codex_runtime_results ADD COLUMN identity_version TEXT")
+
+    @staticmethod
+    def _migrate_codex_canary_execution_permits(conn: sqlite3.Connection) -> None:
+        """Allow server-side handoff failures to be terminally ABORTED.
+
+        Older databases used a restrictive status check.  Rebuild only the
+        table definition when needed; all rows and nonce hashes are copied
+        byte-for-byte and no identity is backfilled.
+        """
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='codex_canary_execution_permits'"
+        ).fetchone()
+        sql = str(row[0] or '') if row else ''
+        if "'ABORTED'" in sql:
+            return
+        conn.execute("DROP INDEX IF EXISTS codex_canary_execution_permits_status")
+        conn.execute("ALTER TABLE codex_canary_execution_permits RENAME TO codex_canary_execution_permits_legacy")
+        conn.execute(
+            """CREATE TABLE codex_canary_execution_permits (
+                permit_id TEXT PRIMARY KEY,
+                nonce_hash TEXT NOT NULL UNIQUE,
+                binding_hash TEXT NOT NULL,
+                contract_id TEXT NOT NULL,
+                contract_hash TEXT NOT NULL,
+                runtime_identity_version TEXT NOT NULL,
+                runtime_fingerprint TEXT NOT NULL,
+                launch_spec_hash TEXT NOT NULL,
+                binary_sha256 TEXT NOT NULL,
+                isolation_config_hash TEXT NOT NULL,
+                tool_fingerprint TEXT NOT NULL,
+                isolation_cache_key TEXT NOT NULL,
+                harness_runner_kind TEXT NOT NULL,
+                harness_runner_version TEXT NOT NULL,
+                harness_implementation_hash TEXT NOT NULL,
+                canary_runner_kind TEXT NOT NULL,
+                canary_runner_version TEXT NOT NULL,
+                canary_implementation_hash TEXT NOT NULL,
+                repro_version TEXT NOT NULL,
+                repro_key TEXT NOT NULL,
+                repro_result_hash TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('ARMED', 'CONSUMED', 'EXPIRED', 'ABORTED')),
+                issued_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                consumed_at TEXT,
+                error_code TEXT
+            )"""
+        )
+        conn.execute(
+            """INSERT INTO codex_canary_execution_permits
+               SELECT permit_id, nonce_hash, binding_hash, contract_id, contract_hash,
+                      runtime_identity_version, runtime_fingerprint, launch_spec_hash,
+                      binary_sha256, isolation_config_hash, tool_fingerprint,
+                      isolation_cache_key, harness_runner_kind, harness_runner_version,
+                      harness_implementation_hash, canary_runner_kind,
+                      canary_runner_version, canary_implementation_hash, repro_version,
+                      repro_key, repro_result_hash, status, issued_at, expires_at,
+                      consumed_at, error_code
+                 FROM codex_canary_execution_permits_legacy"""
+        )
+        conn.execute("DROP TABLE codex_canary_execution_permits_legacy")
+        conn.execute("CREATE INDEX IF NOT EXISTS codex_canary_execution_permits_status ON codex_canary_execution_permits(status)")
 
     @staticmethod
     def _migrate_codex_canary_execution_claims(conn: sqlite3.Connection) -> None:
@@ -3811,6 +3873,22 @@ class Store:
                 (
                     _now(), error_code, hashlib.sha256(nonce.encode("ascii")).hexdigest(),
                 ),
+            )
+        if cursor.rowcount != 1:
+            raise PolicyError("codex_canary_permit_reused")
+
+    def abort_codex_canary_execution_permit(self, permit_id: str, error_code: str) -> None:
+        """Terminally abort a server-side handoff without exposing a nonce."""
+        if not isinstance(permit_id, str) or not re.fullmatch(r"[0-9a-f-]{36}", permit_id):
+            raise PolicyError("codex_canary_permit_invalid")
+        if not isinstance(error_code, str) or not re.fullmatch(r"[a-z0-9_]{1,80}", error_code):
+            raise PolicyError("codex_canary_permit_invalid")
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """UPDATE codex_canary_execution_permits
+                   SET status='ABORTED', consumed_at=COALESCE(consumed_at, ?), error_code=?
+                   WHERE permit_id=? AND status IN ('ARMED', 'CONSUMED')""",
+                (_now(), error_code, permit_id),
             )
         if cursor.rowcount != 1:
             raise PolicyError("codex_canary_permit_reused")
