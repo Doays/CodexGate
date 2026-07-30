@@ -1,4 +1,58 @@
-# Codex Gate
+# Codex Gate — 한국어 안내
+
+Codex Gate는 ChatGPT식 계획과 Codex 실행을 분리하는 **로컬 전용 제어면**입니다. 프로젝트 범위, 권한, 모델 선택, 실행 상태를 한 곳에서 검증하며 기본 실행 권한은 잠겨 있습니다.
+
+## 빠른 시작
+
+PowerShell에서 다음 순서로 실행합니다.
+
+```powershell
+cd C:\Users\82109\Documents\Codex\2026-07-26\dl\outputs\CodexGate
+python -m pip install -r requirements.txt
+.\run.ps1
+```
+
+브라우저에서 `http://127.0.0.1:8787`을 엽니다. 공식 시작 스크립트는 로컬 loopback 주소에만 바인딩합니다.
+
+개발 중 자동 reload가 필요하면 다음을 사용합니다.
+
+```powershell
+.\run_dev.ps1
+```
+
+## 설계 원칙
+
+- 기본 권한은 Read Only이며 Workspace Write와 일반 live 실행은 잠겨 있습니다.
+- Runtime identity, Isolation Canary, Repro, immutable Contract를 현재 결속으로 검증합니다.
+- 외부 네트워크·DNS·실제 모델 요청을 기본 경로에서 사용하지 않습니다.
+- Offline Codex Canary는 봉인된 loopback fake Responses API와 고정 wire contract만 대상으로 합니다.
+- Permit·Window·execution claim은 1회용이며 nonce 원문은 저장·로그·UI에 노출하지 않습니다.
+- 토큰 절감은 실제 provider usage가 없으면 `NOT_COMPARABLE`로 유지합니다.
+- 모든 민감한 경로, credential, prompt, response 원문은 API와 로그에 노출하지 않습니다.
+
+## 주요 검증 단계
+
+1. WSL/bwrap Isolation Canary로 읽기·쓰기·임시 파일·네트워크 경계를 확인합니다.
+2. 동일한 config/tool 결속의 Repro 결과를 확인합니다.
+3. 현재 Runtime identity와 Repro에 결속된 immutable Egress Contract를 계산합니다.
+4. Actual Harness 증명이 있을 때만 후속 Offline Canary 경로가 준비됩니다.
+5. Offline Canary는 명시적인 로컬 UI 클릭 한 번으로만 Permit → Window → one-shot 순서로 소비됩니다.
+
+## 검증 명령
+
+```powershell
+python -m pytest -q
+python -m pip check
+git diff --check
+```
+
+테스트는 실제 WSL·bwrap·Codex·외부 네트워크를 실행하지 않도록 Test I/O Fuse를 사용합니다. 운영 실행은 별도의 봉인된 공식 경로에서만 허용됩니다.
+
+> 아래 내용은 기존 상세 설계 및 운영 참고 문서입니다. 저장소의 기본 안내는 위 한국어 설명을 기준으로 합니다.
+
+---
+
+# Codex Gate (English reference)
 
 Codex Gate is a local control plane that separates ChatGPT-style planning from Codex execution. It keeps model choice, approval policy, workspace bounds, and run state under one UI.
 
