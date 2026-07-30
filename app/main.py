@@ -516,7 +516,15 @@ async def create_sealed_egress_contract(payload: EgressContractCreateRequest, re
     try:
         # Contract construction is pure local serialization and SQLite storage;
         # it starts neither a relay nor a Codex process.
-        return public_contract_result(sealed_egress_contract(request).create(payload.expected_preview_hash))
+        result = public_contract_result(sealed_egress_contract(request).create(payload.expected_preview_hash))
+        if result.get("status") == "BLOCKED" and result.get("error_code") in {
+            "preview_stale", "preview_hash_mismatch", "contract_binding_changed", "runtime_identity_missing",
+            "runtime_identity_incomplete", "isolation_expiring", "repro_binding_changed", "repro_missing",
+        }:
+            raise HTTPException(status_code=409, detail=result.get("error_code"))
+        return JSONResponse(result, status_code=201 if result.get("created") is True else 200)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise as_http_error(exc) from exc
 

@@ -2192,7 +2192,14 @@ class Store:
             ).fetchone()
             if row:
                 existing = self._decode_sealed_egress_contract_instance(row)
-                if existing["contract_hash"] != record["contract_hash"] or existing["preview_hash"] != record["preview_hash"]:
+                binding_fields = (
+                    "preview_hash", "current_binding_hash", "runtime_identity_version", "runtime_fingerprint",
+                    "launch_spec_hash", "isolation_cache_key", "isolation_config_hash", "isolation_tool_fingerprint",
+                    "binary_sha256", "provider_config_hash", "contract_policy_version", "status",
+                )
+                if existing["contract_hash"] != record["contract_hash"] or any(
+                    existing.get(field) != record.get(field) for field in binding_fields
+                ):
                     raise PolicyError("sealed egress immutable contract hash mismatch")
                 return {**existing, "reused": True}
             digest = sha256_json(record)
@@ -3994,7 +4001,13 @@ class Store:
     def ledger_usage_events(self) -> list[dict[str, Any]]:
         with self._connection() as conn:
             rows = conn.execute("SELECT payload, integrity_hash FROM ledger_usage_events ORDER BY occurred_at DESC, source_event_id DESC").fetchall()
-        return [{**json.loads(payload), "integrity_hash": integrity_hash} for payload, integrity_hash in rows]
+        events: list[dict[str, Any]] = []
+        for payload, integrity_hash in rows:
+            event = {**json.loads(payload), "integrity_hash": integrity_hash}
+            if event.get("event_type") == "SEALED_EGRESS_HARNESS":
+                event["legacy_estimate"] = event.get("source") == "LOCAL_ESTIMATE"
+            events.append(event)
+        return events
 
     def token_ledger_report(self) -> dict[str, Any]:
         usage_events = self.ledger_usage_events()
@@ -4034,12 +4047,22 @@ class Store:
             "app_server_rpc_calls": 0,
         }
         harness_events = [event for event in usage_events if event.get("event_type") == "SEALED_EGRESS_HARNESS"]
+        legacy_harness_events = [event for event in harness_events if event.get("legacy_estimate") is True]
+        observed_harness_events = [
+            event for event in harness_events
+            if event.get("source") == "LOCAL_OBSERVED" and event.get("quality") == "OBSERVED"
+            and event.get("legacy_estimate") is not True
+        ]
         report["sealed_egress_harness"] = {
             "executions": sum(int(event.get("local_executions") or 0) for event in harness_events),
-            "local_processes": sum(int(event.get("local_processes") or 0) for event in harness_events),
-            "local_duration_ms": sum(int(event.get("local_duration_ms") or 0) for event in harness_events),
+            "legacy_estimate": bool(legacy_harness_events),
+            "legacy_estimate_executions": sum(int(event.get("local_executions") or 0) for event in legacy_harness_events),
+            "observed_executions": sum(int(event.get("local_executions") or 0) for event in observed_harness_events),
+            "local_processes": sum(int(event.get("local_processes") or 0) for event in observed_harness_events),
+            "local_duration_ms": sum(int(event.get("local_duration_ms") or 0) for event in observed_harness_events),
             "tokens": 0,
             "app_server_rpc_calls": 0,
+            "measurement": "NOT_COMPARABLE",
         }
         return report
 

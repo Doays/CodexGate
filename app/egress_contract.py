@@ -322,12 +322,15 @@ def build_private_contract(
 
 def public_contract_result(result: Mapping[str, Any] | None) -> dict[str, Any]:
     if not isinstance(result, Mapping):
-        return {"status": UNCONFIGURED, "start_allowed": False, "endpoint_type": "UNCONFIGURED"}
+        return {"status": UNCONFIGURED, "start_allowed": False, "endpoint_type": "UNCONFIGURED", "created": False, "reused": False}
     fields = (
         "contract_id", "preview_hash", "status", "checked_at", "contract_hash", "endpoint_type", "relay_status",
-        "broker_status", "auth_status", "start_allowed", "error_code",
+        "broker_status", "auth_status", "start_allowed", "error_code", "created", "reused",
     )
-    return {field: result.get(field) for field in fields if field in result}
+    value = {field: result.get(field) for field in fields if field in result}
+    value.setdefault("created", False)
+    value.setdefault("reused", False)
+    return value
 
 
 def public_contract_preview(result: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -496,8 +499,10 @@ class SealedEgressContractService:
             "local_duration_ms": max(0, round((time.monotonic() - started) * 1000)),
         }
         saved = self.store.create_sealed_egress_contract_instance(result)
-        self.store.record_sealed_egress_contract_ledger(saved)
-        return saved
+        reused = bool(saved.get("reused"))
+        if not reused:
+            self.store.record_sealed_egress_contract_ledger(saved)
+        return {**saved, "created": not reused, "reused": reused}
 
     def current(self) -> dict[str, Any] | None:
         result = self.store.latest_sealed_egress_contract_instance()

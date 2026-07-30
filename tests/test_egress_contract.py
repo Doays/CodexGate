@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from fastapi.testclient import TestClient
 
 import app.egress_contract as egress_contract
 
@@ -211,7 +212,7 @@ def test_saved_and_public_contracts_never_include_toml_token_credentials_or_user
     assert "not-a-real-token" not in serialized
     assert set(public) == {
         "contract_id", "preview_hash", "status", "checked_at", "contract_hash", "endpoint_type", "relay_status",
-        "broker_status", "auth_status", "start_allowed", "error_code",
+        "broker_status", "auth_status", "start_allowed", "error_code", "created", "reused",
     }
 
 
@@ -292,9 +293,48 @@ def test_stale_preview_hash_is_rejected_and_latest_preview_is_idempotent(tmp_pat
     latest = service.preview()
     created = service.create(latest["preview_hash"])
     assert created["status"] == AUTH_UNCONFIGURED
+    assert created["created"] is True and created["reused"] is False
+    with store._connection() as conn:
+        before = conn.execute("SELECT contract_id, payload, integrity_hash FROM sealed_egress_contract_instances").fetchone()
     reused = service.create(latest["preview_hash"])
     assert reused["reused"] is True
+    assert reused["created"] is False
     assert reused["contract_hash"] == created["contract_hash"]
+    with store._connection() as conn:
+        after = conn.execute("SELECT contract_id, payload, integrity_hash FROM sealed_egress_contract_instances").fetchone()
+    assert before == after
+
+
+def test_contract_http_create_uses_201_for_new_and_200_for_reused(monkeypatch, tmp_path):
+    from app import main
+
+    monkeypatch.setattr(main, "DATA_ROOT", tmp_path / "api-data")
+    expected = "a" * 64
+
+    class StubService:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, preview_hash):
+            self.calls += 1
+            reused = self.calls > 1
+            return {
+                "contract_id": "contract-1", "preview_hash": preview_hash, "status": AUTH_UNCONFIGURED,
+                "checked_at": "2026-07-30T00:00:00+00:00", "contract_hash": expected,
+                "endpoint_type": "LOOPBACK_HTTP_V1", "relay_status": "RELAY_MISSING",
+                "broker_status": "BROKER_MISSING", "auth_status": AUTH_UNCONFIGURED,
+                "start_allowed": False, "error_code": "auth_unconfigured",
+                "created": not reused, "reused": reused,
+            }
+
+    service = StubService()
+    monkeypatch.setattr(main, "sealed_egress_contract", lambda request: service)
+    headers = {"Host": "127.0.0.1:8787", "Origin": "http://127.0.0.1:8787"}
+    with TestClient(main.app, base_url="http://127.0.0.1:8787") as client:
+        first = client.post("/api/isolation/wsl/egress-contract", headers=headers, json={"expected_preview_hash": expected})
+        second = client.post("/api/isolation/wsl/egress-contract", headers=headers, json={"expected_preview_hash": expected})
+    assert first.status_code == 201 and first.json()["created"] is True and first.json()["reused"] is False
+    assert second.status_code == 200 and second.json()["created"] is False and second.json()["reused"] is True
 
 
 def test_binding_changes_require_a_new_preview_and_do_not_modify_old_instance(tmp_path):

@@ -320,8 +320,9 @@ function renderSealedEgressContract(result) {
   const relay = result?.relay_status || "RELAY_MISSING";
   const broker = result?.broker_status || "BROKER_MISSING";
   const auth = result?.auth_status || "AUTH_UNCONFIGURED";
+  const lifecycle = result?.reused ? " Existing Contract reused." : result?.created ? " New Contract created." : "";
   const code = result?.error_code ? ` Code: ${result.error_code}.` : "";
-  detailNode.textContent = `Endpoint ${endpoint}; contract hash ${contract}; relay ${relay}; broker ${broker}; auth ${auth}.${code} Network and Codex start remain locked.`;
+  detailNode.textContent = `Endpoint ${endpoint}; contract hash ${contract}; relay ${relay}; broker ${broker}; auth ${auth}.${lifecycle}${code} Network and Codex start remain locked.`;
 }
 
 function renderSealedEgressHarness(result) {
@@ -473,7 +474,8 @@ async function createSealedEgressContract() {
     renderSealedEgressHarness(await api("/api/isolation/wsl/egress-harness"));
     renderActualWSLEgressHarness(await api("/api/isolation/wsl/egress-harness/actual"));
     renderCodexProcessCanary(await api("/api/isolation/wsl/codex-process-canary"));
-    say(`Sealed egress contract: ${result.status}. Authentication and all starts remain locked.`, result.status !== "AUTH_UNCONFIGURED");
+    const lifecycle = result.reused ? "Existing Contract reused." : result.created ? "New Contract created." : "";
+    say(`Sealed egress contract: ${result.status}. ${lifecycle} Authentication and all starts remain locked.`, result.status !== "AUTH_UNCONFIGURED");
   } catch (error) {
     say(error.message, true);
   } finally {

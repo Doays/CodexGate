@@ -415,6 +415,7 @@ def build_report(runs: list[Mapping[str, Any]], baselines: list[Mapping[str, Any
             "source_event_id": event.get("source_event_id"),
             "run_id": event.get("run_id"),
             "comparison_key": event.get("comparison_key"),
+            "legacy_estimate": event.get("legacy_estimate", False),
             "web_packet_bytes": event.get("web_packet_bytes"),
             "evidence_bytes": event.get("evidence_bytes"),
             "source_bytes": event.get("source_bytes"),

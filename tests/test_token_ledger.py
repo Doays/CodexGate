@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 
-from app.policy import PolicyError
+from app.policy import PolicyError, sha256_json
 from app.storage import Store
 from app.token_ledger import compare_records, normalize_baseline_payload, normalize_run_record, normalize_usage_event
 
@@ -141,6 +142,45 @@ def test_local_source_quality_contract_is_strict_and_observed_is_explicit():
         normalize_usage_event({**base, "source": "LOCAL_OBSERVED", "quality": "ESTIMATED"})
     observed = normalize_usage_event({**base, "source": "LOCAL_OBSERVED", "quality": "OBSERVED"})
     assert observed["source"] == "LOCAL_OBSERVED" and observed["quality"] == "OBSERVED"
+
+
+def test_legacy_harness_event_is_labeled_without_counting_as_observed(tmp_path):
+    store = Store(tmp_path / "data")
+    event = store.record_egress_harness_ledger({
+        "status": "PASSED", "contract_hash": "a" * 64, "runner_kind": "WSL_SUPERVISOR",
+        "runner_version": "sealed-egress-wsl-v1", "runner_implementation_hash": "b" * 64,
+        "local_processes": 3, "local_duration_ms": 9,
+    })
+    with sqlite3.connect(store.db_path) as conn:
+        row = conn.execute("SELECT payload FROM ledger_usage_events WHERE source_event_id=?", (event["source_event_id"],)).fetchone()
+        payload = json.loads(row[0])
+        payload.update({"source": "LOCAL_ESTIMATE", "quality": "OBSERVED"})
+        conn.execute(
+            "UPDATE ledger_usage_events SET source='LOCAL_ESTIMATE', quality='OBSERVED', payload=?, integrity_hash=? WHERE source_event_id=?",
+            (json.dumps(payload, sort_keys=True, separators=(",", ":")), sha256_json(payload), event["source_event_id"]),
+        )
+        before = conn.execute("SELECT payload, integrity_hash FROM ledger_usage_events WHERE source_event_id=?", (event["source_event_id"],)).fetchone()
+    report = store.token_ledger_report()
+    listed = next(item for item in store.ledger_usage_events() if item["source_event_id"] == event["source_event_id"])
+    assert listed["legacy_estimate"] is True
+    assert report["sealed_egress_harness"]["legacy_estimate"] is True
+    assert report["sealed_egress_harness"]["local_processes"] == 0
+    with sqlite3.connect(store.db_path) as conn:
+        after = conn.execute("SELECT payload, integrity_hash FROM ledger_usage_events WHERE source_event_id=?", (event["source_event_id"],)).fetchone()
+    assert before == after
+
+
+def test_new_local_observed_harness_event_is_counted_separately(tmp_path):
+    store = Store(tmp_path / "data")
+    store.record_egress_harness_ledger({
+        "status": "PASSED", "contract_hash": "c" * 64, "runner_kind": "WSL_SUPERVISOR",
+        "runner_version": "sealed-egress-wsl-v1", "runner_implementation_hash": "d" * 64,
+        "local_processes": 2, "local_duration_ms": 11,
+    })
+    report = store.token_ledger_report()["sealed_egress_harness"]
+    assert report["legacy_estimate"] is False
+    assert report["observed_executions"] == 1 and report["local_processes"] == 2
+    assert report["local_duration_ms"] == 11 and report["measurement"] == "NOT_COMPARABLE"
 
 
 def test_imports_reject_negative_cached_secret_and_absolute_path():
