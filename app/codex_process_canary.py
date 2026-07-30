@@ -1,8 +1,8 @@
 """Sealed, offline Codex-process canary.
 
-The real runner boundary is specified here but deliberately disabled in the
-application.  Unit tests use :class:`FakeCodexProcessCanaryRunner`, which is
-purely in-memory and never starts WSL, bubblewrap, Codex, or a socket.
+The ordinary Canary endpoint remains disabled.  Only a persisted, running
+one-shot claim can materialize the sealed WSL executor; unit tests inject a
+no-I/O supervisor and never start WSL, bubblewrap, Codex, or a socket.
 """
 from __future__ import annotations
 
@@ -14,6 +14,20 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Protocol
 
+from .codex_process_executor_wsl import (
+    BROKER_CHILD_CODE,
+    EXECUTOR_IMPLEMENTATION_HASH,
+    EXECUTOR_VERSION,
+    FIXED_CODEX_ARGV,
+    FIXED_FAKE_RESPONSE,
+    FIXED_PROMPT,
+    RELAY_CODEX_CHILD_CODE,
+    REQUIRED_EXEC_OPTIONS,
+    SUCCESS_MARKER,
+    SUPERVISOR_CODE,
+    WSLCodexProcessCanaryExecutor,
+    compute_executor_implementation,
+)
 from .egress_contract import AUTH_UNCONFIGURED, canonical_provider_toml, provider_config_hash, validate_sealed_execution_proof
 from .egress_harness import WSL_RUNNER_KIND
 from .egress_harness_wsl import RUNNER_IMPLEMENTATION_HASH as HARNESS_IMPLEMENTATION_HASH
@@ -37,24 +51,6 @@ FAKE_CANARY_RUNNER_KIND = "FAKE_CODEX_CANARY"
 WINDOW_TTL_SECONDS = 120
 PROCESS_TIMEOUT_SECONDS = 45
 PROCESS_OUTPUT_LIMIT_BYTES = 16 * 1024
-SUCCESS_MARKER = "CODEXGATE_OFFLINE_CANARY_OK"
-
-# These are private process inputs.  They are only represented outside this
-# module by SHA-256 digests and must never be returned from an API or stored.
-FIXED_PROMPT = "Return exactly the offline CodexGate canary marker."
-FIXED_FAKE_RESPONSE = {
-    "id": "sealed-offline-canary",
-    "object": "response",
-    "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": SUCCESS_MARKER}]}],
-}
-FIXED_CODEX_ARGV = ("exec", "--json", "--skip-git-repo-check", "--sandbox", "read-only")
-REQUIRED_EXEC_OPTIONS = frozenset({"--json", "--skip-git-repo-check", "--sandbox", "read-only"})
-
-# The eventual fixed child programs are data rather than user-provided source.
-# Keeping them as bytes makes all implementation inputs independently sealed.
-BROKER_CHILD_CODE = b"codexgate-offline-broker-v1"
-RELAY_CODEX_CHILD_CODE = b"codexgate-offline-relay-codex-v1"
-SUPERVISOR_CODE = b"codexgate-offline-codex-supervisor-v1"
 
 
 def _digest(value: bytes | str) -> str:
@@ -76,20 +72,32 @@ def build_runner_implementation_hash(
     argv: tuple[str, ...] = FIXED_CODEX_ARGV,
     fake_response: Mapping[str, Any] = FIXED_FAKE_RESPONSE,
 ) -> str:
-    """Seal every private execution input without returning any raw value."""
-    return sha256_json({
-        "policy_version": CANARY_POLICY_VERSION,
-        "broker_child_sha256": _digest(broker_code),
-        "relay_codex_child_sha256": _digest(relay_codex_code),
-        "supervisor_sha256": _digest(supervisor_code),
-        "argv_template_sha256": sha256_json(list(argv)),
-        "fake_response_sha256": sha256_json(dict(fake_response)),
-        "prompt_sha256": _digest(FIXED_PROMPT),
-    })
+    """Expose the executor seal through the existing Canary API.
+
+    One canonical computation covers the actual supervisor/child argv as
+    well as the fixed prompt and fake response.  Tests can perturb any input
+    without creating a process.
+    """
+    from .codex_process_executor_wsl import (
+        BROKER_CHILD_ARGV_TEMPLATE,
+        RELAY_CODEX_CHILD_ARGV_TEMPLATE,
+        SUPERVISOR_ARGV_TEMPLATE,
+    )
+    return compute_executor_implementation(
+        supervisor_code=supervisor_code,
+        broker_child_code=broker_code,
+        relay_codex_child_code=relay_codex_code,
+        broker_argv=BROKER_CHILD_ARGV_TEMPLATE,
+        relay_codex_argv=RELAY_CODEX_CHILD_ARGV_TEMPLATE,
+        supervisor_argv=SUPERVISOR_ARGV_TEMPLATE,
+        codex_argv=argv,
+        prompt=FIXED_PROMPT,
+        fake_response=fake_response,
+    )[0]
 
 
-RUNNER_IMPLEMENTATION_HASH = build_runner_implementation_hash()
-RUNNER_VERSION = f"sealed-offline-codex-{RUNNER_IMPLEMENTATION_HASH[:16]}"
+RUNNER_IMPLEMENTATION_HASH = EXECUTOR_IMPLEMENTATION_HASH
+RUNNER_VERSION = EXECUTOR_VERSION
 
 
 def _now() -> str:
@@ -129,6 +137,9 @@ class CanaryExecution:
     runner_kind: str = CANARY_RUNNER_KIND
     runner_version: str = RUNNER_VERSION
     runner_implementation_hash: str = RUNNER_IMPLEMENTATION_HASH
+    supervisor_processes: int = 0
+    bwrap_processes: int = 0
+    codex_processes: int = 0
 
 
 class CodexProcessCanaryRunner(Protocol):
@@ -175,14 +186,14 @@ class WSLCodexProcessCanaryRunner(DisabledCodexProcessCanaryRunner):
     no-I/O executor to exercise the exact same identity and accounting path.
     """
 
-    def __init__(self, executor_factory: Callable[[], CodexProcessCanaryExecutor] | None = None):
+    def __init__(self, executor_factory: Callable[[str], CodexProcessCanaryExecutor] | None = None):
         self._executor_factory = executor_factory
         self.executor_creations = 0
         self.one_shot_calls = 0
 
     @property
     def execution_available(self) -> bool:
-        """An executor is still absent in the production Phase 4.2 wiring."""
+        """Only a post-claim factory can make the sealed executor available."""
         return self._executor_factory is not None
 
     async def run_one_shot(
@@ -208,9 +219,9 @@ class WSLCodexProcessCanaryRunner(DisabledCodexProcessCanaryRunner):
         self.one_shot_calls += 1
         if self._executor_factory is None:
             raise PolicyError("codex_canary_execution_disabled")
-        executor = self._executor_factory()
+        executor = self._executor_factory(claim["execution_claim_id"])
         self.executor_creations += 1
-        if not callable(getattr(executor, "run", None)):
+        if not isinstance(executor, WSLCodexProcessCanaryExecutor) or not bool(getattr(executor, "is_production_executor", False)):
             raise PolicyError("actual_runner_policy_violation")
         return await executor.run(binding, launch_spec)
 
@@ -501,10 +512,9 @@ class SealedOfflineCodexProcessCanary:
     async def arm_from_execution_permit(self, permit_binding: Mapping[str, str]) -> dict[str, Any]:
         """Create the existing Canary window only after a Permit validation.
 
-        The sealed production runner remains disabled in this release.  The
-        Permit gate is the sole caller allowed to bypass that readiness check
-        for the purpose of minting a one-use window; it does not enable the
-        runner or start a child process.
+        The Permit gate is the sole caller allowed to bypass ordinary endpoint
+        readiness for the purpose of minting a one-use window; it does not
+        enable a general runner or start a child process.
         """
         async with self._arm_lock:
             binding = self._binding(allow_disabled_runner=True)
@@ -646,7 +656,7 @@ class SealedOfflineCodexProcessCanary:
         except Exception:
             self.store.finish_codex_canary_execution_claim(claim_id, ERROR, "canary_error")
             raise
-        final_status = PASSED if result.get("status") == PASSED else ERROR
+        final_status = result.get("status") if result.get("status") in {PASSED, POLICY_VIOLATION, ERROR} else ERROR
         self.store.finish_codex_canary_execution_claim(claim_id, final_status, result.get("error_code"))
         return result
 
@@ -676,6 +686,7 @@ class SealedOfflineCodexProcessCanary:
             "request_count": 0, "request_hash": None, "response_hash": None, "config_hash": binding["config_hash"],
             "prompt_hash": EXPECTED_PROMPT_HASH, "expected_output_hash": EXPECTED_OUTPUT_HASH,
             "exit_code": None, "output_bytes": 0, "local_processes": 0, "local_duration_ms": 0,
+            "supervisor_processes": 0, "bwrap_processes": 0, "codex_processes": 0,
             "runner_kind": runner_kind, "runner_version": runner_version,
             "runner_implementation_hash": runner_implementation_hash, "implementation_hash": runner_implementation_hash,
             "start_allowed": False,
@@ -698,29 +709,49 @@ class SealedOfflineCodexProcessCanary:
                 )
             else:
                 execution = await asyncio.wait_for(active_runner.run(binding, launch_spec), timeout=PROCESS_TIMEOUT_SECONDS)
-            self._validate_execution(execution, active_runner)
+            try:
+                self._validate_execution(execution, active_runner)
+            except PolicyError as exc:
+                # A supervisor can have started even when its frame, cleanup,
+                # or policy result fails.  Preserve only numeric observed
+                # counters for the Ledger; never retain its output.
+                exc.local_processes = execution.local_processes
+                exc.supervisor_processes = execution.supervisor_processes
+                exc.bwrap_processes = execution.bwrap_processes
+                exc.codex_processes = execution.codex_processes
+                raise
             result = {
                 **running, "status": PASSED, "request_count": execution.request_count,
                 "request_hash": execution.request_hash, "response_hash": execution.response_hash,
                 "config_hash": execution.config_hash, "prompt_hash": execution.prompt_hash,
                 "expected_output_hash": execution.expected_output_hash, "exit_code": execution.exit_code,
                 "output_bytes": execution.stdout_bytes + execution.stderr_bytes, "local_processes": execution.local_processes,
+                "supervisor_processes": execution.supervisor_processes, "bwrap_processes": execution.bwrap_processes,
+                "codex_processes": execution.codex_processes,
                 "error_code": None,
             }
         except asyncio.TimeoutError:
             result = {**running, "status": ERROR, "error_code": "canary_timeout"}
         except PolicyError as exc:
             code = str(exc)
+            observed_counts = {
+                "local_processes": max(0, int(getattr(exc, "local_processes", 0) or 0)),
+                "supervisor_processes": max(0, int(getattr(exc, "supervisor_processes", 0) or 0)),
+                "bwrap_processes": max(0, int(getattr(exc, "bwrap_processes", 0) or 0)),
+                "codex_processes": max(0, int(getattr(exc, "codex_processes", 0) or 0)),
+            }
             status = POLICY_VIOLATION if code in {
                 "canary_request_policy_violation", "canary_tool_policy_violation", "canary_model_policy_violation",
                 "canary_websocket_policy_violation", "canary_header_policy_violation", "canary_implementation_mismatch",
+                "actual_runner_policy_violation",
             } else ERROR
-            result = {**running, "status": status, "error_code": code if code in {
+            result = {**running, **observed_counts, "status": status, "error_code": code if code in {
                 "canary_timeout", "canary_output_limit", "canary_marker_invalid", "canary_exit_invalid",
                 "canary_process_termination_failed", "canary_resource_cleanup_failed", "canary_request_policy_violation",
                 "canary_tool_policy_violation", "canary_model_policy_violation", "canary_websocket_policy_violation",
                 "canary_header_policy_violation",
                 "canary_implementation_mismatch", "canary_runner_identity_mismatch",
+                "actual_runner_policy_violation",
             } else "canary_policy_error"}
         except Exception:
             result = {**running, "status": ERROR, "error_code": "canary_error"}
@@ -729,6 +760,9 @@ class SealedOfflineCodexProcessCanary:
                 "request_count": execution.request_count,
                 "output_bytes": execution.stdout_bytes + execution.stderr_bytes,
                 "local_processes": execution.local_processes,
+                "supervisor_processes": execution.supervisor_processes,
+                "bwrap_processes": execution.bwrap_processes,
+                "codex_processes": execution.codex_processes,
                 "exit_code": execution.exit_code,
             })
         result = {

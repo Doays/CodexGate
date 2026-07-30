@@ -476,6 +476,18 @@ def build_report(runs: list[Mapping[str, Any]], baselines: list[Mapping[str, Any
             int(event.get("local_processes") or 0)
             for event in local_only if event.get("quality") == "OBSERVED"
         ),
+        "supervisor_processes": sum(
+            int(event.get("supervisor_processes") or 0)
+            for event in local_only if event.get("quality") == "OBSERVED"
+        ),
+        "bwrap_processes": sum(
+            int(event.get("bwrap_processes") or 0)
+            for event in local_only if event.get("quality") == "OBSERVED"
+        ),
+        "codex_processes": sum(
+            int(event.get("codex_processes") or 0)
+            for event in local_only if event.get("quality") == "OBSERVED"
+        ),
         "observed_duration_ms": sum(
             int(event.get("local_duration_ms") or 0)
             for event in local_only if event.get("quality") == "OBSERVED"

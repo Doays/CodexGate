@@ -199,6 +199,31 @@ runner class. Any actual future spawn records only the count that started and
 monotonic duration as `LOCAL_OBSERVED`; provider tokens stay null, fake usage
 is ignored, and external-model and app-server-RPC counters remain zero.
 
+### Sealed Offline Codex Canary Production Executor Phase 4.3
+
+Phase 4.3 replaces that absent factory implementation with a fresh sealed WSL
+supervisor executor, but it remains reachable only after the immutable
+one-shot claim has changed to `RUNNING`. The factory accepts only the claim
+UUID; it has no singleton, fallback executor, user argv, prompt, model, path,
+or environment input. The executor rechecks the Runtime identity, immutable
+Contract, actual Harness proof, fresh Canary/Repro binding, and runner seal
+before it derives any fixed argv. A changed binding or implementation seal is
+blocked before a supervisor can start.
+
+The review spec and supervisor use the same shared broker, relay/Codex, and
+WSL argv templates. Both bubblewrap children use `--unshare-all` and
+`--clearenv`; `/work` has only a fixed read-only fixture, while CODEX_HOME,
+HOME, `/tmp`, and runtime state are execution-private tmpfs areas. `/mnt`,
+Windows paths, Source Roots, DATA_ROOT, and user HOME are absent. The
+ephemeral token is created only in the execution process and is never stored
+or logged. The first real supervisor spawn atomically records `spawn_count=1`;
+its sanitized frame is fail-closed on timeout, output/frame/cleanup failure,
+or leftovers. Ledger events distinguish supervisor, bubblewrap, and Codex
+counts, use only observed local metrics, keep provider-token fields null, and
+continue to report zero external requests and app-server RPCs. This phase's
+tests use a no-I/O supervisor double only; Runtime start and every normal live
+permission remain locked.
+
 - Only `127.0.0.1` and `localhost` are accepted as `Host`
 - If `Origin` is present, it must match the same local origin
 - `project_id` must be a safe slug or UUID
@@ -283,3 +308,16 @@ requires the hash in the POST body. Authentication remains unconfigured and
 all starts remain locked.
 
 If no successful live run has been recorded, the report shows `실제 토큰 절감 미측정`.
+
+## Phase 4.3 test I/O fuse
+
+The pytest session installs a fail-fast fuse before collection. Real
+`subprocess.run`, `Popen`, `asyncio.create_subprocess_exec`, `os.system`, and
+application socket connect/bind calls raise the sanitized
+`unexpected_real_io_in_test` error before an operating-system resource is
+created. Phase 4.3 tests therefore inject only no-I/O supervisors; the
+production executor remains lazy and is never constructed before a sealed
+RUNNING claim. Windows junction helper calls are emulated inside the test
+temporary directory without starting PowerShell. The incident audit is kept
+outside the repository in `TEST_REAL_IO_INCIDENT.json` and contains no raw
+arguments, paths, output, process identifiers, or socket identifiers.

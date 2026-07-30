@@ -36,6 +36,7 @@ from .egress_harness_wsl import (
     WSLEgressHarnessRunner,
     WSL_EGRESS_RUNNER_VERSION,
 )
+from .codex_process_executor_wsl import production_executor_factory
 from .codex_process_canary import (
     CANARY_RUNNER_KIND,
     CodexCanaryExecutionPermitGate,
@@ -283,12 +284,14 @@ async def lifespan(app: FastAPI):
     app.state.actual_wsl_egress_harness_gate = ActualWSLHarnessGate(
         store, app.state.actual_wsl_egress_harness_service,
     )
-    # The production runner is a lazy factory: no runner object or process
-    # executor exists until the one-shot endpoint has atomically consumed a
-    # Permit and Canary-window pair.  The default factory still has no
-    # executor, so this release cannot start WSL or Codex.
+    # The production runner/executor chain is lazy: neither object exists
+    # until the one-shot transaction is claimed and the claim is RUNNING.
+    # The executor still receives only that sealed claim ID; it has no
+    # fallback runner, user-supplied argv, prompt, model, or environment.
+    codex_executor_factory = production_executor_factory(store)
     app.state.codex_process_canary_service = SealedOfflineCodexProcessCanary(
-        store, app.state.sealed_egress_contract_service, runner_factory=WSLCodexProcessCanaryRunner,
+        store, app.state.sealed_egress_contract_service,
+        runner_factory=lambda: WSLCodexProcessCanaryRunner(codex_executor_factory),
     )
     app.state.codex_canary_execution_permit_gate = CodexCanaryExecutionPermitGate(
         store, app.state.codex_process_canary_service,

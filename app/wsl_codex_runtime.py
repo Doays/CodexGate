@@ -109,6 +109,22 @@ def _runtime_config_hash(distro: str, binary_path: str) -> str:
     return sha256_json({"runtime_policy_version": RUNTIME_POLICY_VERSION, "distro": distro, "binary_path": binary_path})
 
 
+def sealed_runtime_execution_policy() -> dict[str, Any]:
+    """The reusable in-memory mount/environment policy for sealed children.
+
+    This intentionally contains no configured binary path or host path.  It
+    is shared by the future process executor so review specs cannot drift
+    from the Runtime Phase 0 policy.
+    """
+    return {
+        "read_only_binds": list(SEALED_READ_ONLY_BINDS),
+        "tmpfs": ["/tmp", "/runtime-state", "/home"],
+        "environment": {"PATH": "/usr/bin:/bin", "HOME": "/home/codex", "TMPDIR": "/tmp", "LANG": "C.UTF-8"},
+        "cwd": "/work",
+        "network": "blocked",
+    }
+
+
 def build_sealed_launch_spec(binary_path: str, isolation_cache_key: str | None = None) -> dict[str, Any]:
     """Create a private immutable spec; callers must never expose it verbatim."""
     binary_path = validate_wsl_codex_binary_path(binary_path)

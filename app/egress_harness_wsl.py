@@ -71,6 +71,15 @@ _FIXED_ENV_ARGS: tuple[str, ...] = (
 )
 _PYTHON_C_ARGS: tuple[str, ...] = ("/usr/bin/python3", "-I", "-S", "-u", "-c")
 
+
+def sealed_bwrap_environment_args() -> tuple[str, ...]:
+    """Return the sole fixed clear-environment allowlist for sealed children.
+
+    The caller may choose a fixed sandbox HOME separately, but no inherited
+    Windows or WSL environment variable is ever appended to these args.
+    """
+    return _FIXED_ENV_ARGS
+
 BROKER_CHILD_ARGV_TEMPLATE: tuple[str, ...] = BWRAP_COMMON_ARGS + (
     "--dir", "/home/broker", "--dir", "/runtime", "--dir", "/runtime/broker",
     "--bind", "{EXECUTION_SOCKET_DIR}", "/runtime/broker",

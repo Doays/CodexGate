@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
+import base64
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -24,53 +25,62 @@ from app.codex_process_canary import (
     SealedOfflineCodexProcessCanary,
     WSLCodexProcessCanaryRunner,
 )
-from app.isolation_wsl import SAFE_CANDIDATE
+from app.codex_process_executor_wsl import (
+    EXECUTOR_IMPLEMENTATION_HASH,
+    EXPECTED_CONFIG_HASH as EXECUTOR_CONFIG_HASH,
+    EXPECTED_OUTPUT_HASH as EXECUTOR_OUTPUT_HASH,
+    EXPECTED_PROMPT_HASH as EXECUTOR_PROMPT_HASH,
+    EXPECTED_REQUEST_HASH as EXECUTOR_REQUEST_HASH,
+    EXPECTED_RESPONSE_HASH as EXECUTOR_RESPONSE_HASH,
+    SUPERVISOR_FRAME_PREFIX,
+    WSLCodexProcessCanaryExecutor,
+)
+from app.isolation_wsl import ProcessResult, SAFE_CANDIDATE
+from app.policy import canonical_json
 from app.policy import PolicyError
 
 from tests.test_codex_process_canary import CONFIG_HASH, ISOLATION_KEY, ready_canary
 
 
-class NoIoExecutor:
-    """A deterministic test double; it never starts a child process."""
+class NoIoSupervisor:
+    """A WSL command runner double; it never creates a child process."""
 
-    def __init__(self, *, processes: int = 2, marker: str = SUCCESS_MARKER):
-        self.processes = processes
-        self.marker = marker
+    def __init__(self, *, bad_frame: bool = False):
+        self.bad_frame = bad_frame
         self.calls = 0
 
-    async def run(self, binding, launch_spec) -> CanaryExecution:
+    def find_wsl(self):
+        return "wsl.exe"
+
+    async def run(self, args, *, timeout_seconds, on_started=None):
         self.calls += 1
-        return CanaryExecution(
-            request_count=1,
-            request_hash=EXPECTED_REQUEST_HASH,
-            response_hash=EXPECTED_RESPONSE_HASH,
-            config_hash=EXPECTED_CONFIG_HASH,
-            prompt_hash=EXPECTED_PROMPT_HASH,
-            expected_output_hash=EXPECTED_OUTPUT_HASH,
-            exit_code=0,
-            stdout_bytes=len(self.marker.encode("utf-8")),
-            stderr_bytes=0,
-            local_processes=self.processes,
-            marker=self.marker,
-            runner_kind=CANARY_RUNNER_KIND,
-            runner_version=RUNNER_VERSION,
-            runner_implementation_hash=RUNNER_IMPLEMENTATION_HASH,
-        )
+        if on_started is not None:
+            on_started()
+        payload = {
+            "schema_version": "1", "status": "PASSED", "executor_implementation_hash": EXECUTOR_IMPLEMENTATION_HASH,
+            "request_count": 1, "request_hash": EXECUTOR_REQUEST_HASH, "response_hash": EXECUTOR_RESPONSE_HASH,
+            "config_hash": EXECUTOR_CONFIG_HASH, "prompt_hash": EXECUTOR_PROMPT_HASH,
+            "expected_output_hash": EXECUTOR_OUTPUT_HASH, "marker_hash": EXECUTOR_OUTPUT_HASH,
+            "supervisor_processes": 1, "bwrap_processes": 2, "codex_processes": 1,
+            "resources_cleaned": not self.bad_frame, "children_terminated": True, "sensitive_headers_removed": True,
+        }
+        encoded = base64.urlsafe_b64encode(canonical_json(payload).encode("utf-8")).rstrip(b"=").decode("ascii")
+        return ProcessResult(exit_code=0, stdout=f"{SUPERVISOR_FRAME_PREFIX}{encoded}\n", stderr="")
 
 
-def one_shot_gate(tmp_path, *, executor: NoIoExecutor | None = None, changed_runner_hash: str | None = None):
+def one_shot_gate(tmp_path, *, supervisor: NoIoSupervisor | None = None, changed_runner_hash: str | None = None):
     store, contracts, _, _ = ready_canary(tmp_path)
     created = {"runner": 0, "executor": 0}
 
-    def make_executor():
+    def make_executor(claim_id):
         created["executor"] += 1
-        if executor is None:
+        if supervisor is None:
             raise AssertionError("executor must not be created")
-        return executor
+        return WSLCodexProcessCanaryExecutor(store, claim_id, supervisor)
 
     def make_runner():
         created["runner"] += 1
-        runner = WSLCodexProcessCanaryRunner(make_executor if executor is not None else None)
+        runner = WSLCodexProcessCanaryRunner(make_executor if supervisor is not None else None)
         if changed_runner_hash is not None:
             runner.runner_implementation_hash = changed_runner_hash
             runner.runner_version = f"sealed-offline-codex-{changed_runner_hash[:16]}"
@@ -95,13 +105,13 @@ def test_default_endpoint_path_is_still_disabled_without_runner_materialization(
 
 
 def test_one_shot_claim_precedes_runner_and_executor_creation(tmp_path):
-    executor = NoIoExecutor()
-    store, _, gate, created = one_shot_gate(tmp_path, executor=executor)
+    supervisor = NoIoSupervisor()
+    store, _, gate, created = one_shot_gate(tmp_path, supervisor=supervisor)
     permit, window = arm_pair(gate)
     assert created == {"runner": 0, "executor": 0}
     result = asyncio.run(gate.run_one_shot(permit["permit_nonce"], window["canary_nonce"]))
     assert result["status"] == PASSED
-    assert created == {"runner": 1, "executor": 1} and executor.calls == 1
+    assert created == {"runner": 1, "executor": 1} and supervisor.calls == 1
     claim = store.codex_canary_execution_claim()
     assert claim["status"] == PASSED and claim["runner_implementation_hash"] == RUNNER_IMPLEMENTATION_HASH
     assert permit["permit_nonce"] not in repr(claim) and window["canary_nonce"] not in repr(claim)
@@ -121,8 +131,8 @@ def test_one_shot_requires_both_capabilities(tmp_path, permit_nonce, window_nonc
 
 
 def test_one_shot_consumes_pair_once_under_concurrency(tmp_path):
-    executor = NoIoExecutor()
-    _, _, gate, created = one_shot_gate(tmp_path, executor=executor)
+    supervisor = NoIoSupervisor()
+    _, _, gate, created = one_shot_gate(tmp_path, supervisor=supervisor)
     permit, window = arm_pair(gate)
 
     async def twice():
@@ -135,7 +145,7 @@ def test_one_shot_consumes_pair_once_under_concurrency(tmp_path):
     outcomes = asyncio.run(twice())
     assert sum(isinstance(value, dict) and value.get("status") == PASSED for value in outcomes) == 1
     assert sum(isinstance(value, PolicyError) and "reused" in str(value) for value in outcomes) == 1
-    assert created == {"runner": 1, "executor": 1} and executor.calls == 1
+    assert created == {"runner": 1, "executor": 1} and supervisor.calls == 1
 
 
 def test_binding_change_consumes_capabilities_without_spawn(tmp_path):
@@ -179,23 +189,25 @@ def test_claim_transaction_rechecks_current_identity_before_consuming(tmp_path):
 
 
 def test_wrong_actual_implementation_blocks_before_executor_spawn(tmp_path):
-    executor = NoIoExecutor()
-    _, _, gate, created = one_shot_gate(tmp_path, executor=executor, changed_runner_hash="a" * 64)
+    supervisor = NoIoSupervisor()
+    _, _, gate, created = one_shot_gate(tmp_path, supervisor=supervisor, changed_runner_hash="a" * 64)
     permit, window = arm_pair(gate)
     with pytest.raises(PolicyError, match="actual_runner_policy_violation"):
         asyncio.run(gate.run_one_shot(permit["permit_nonce"], window["canary_nonce"]))
-    assert created == {"runner": 1, "executor": 0} and executor.calls == 0
+    assert created == {"runner": 1, "executor": 0} and supervisor.calls == 0
 
 
 def test_partial_failure_records_only_observed_started_processes(tmp_path):
-    executor = NoIoExecutor(processes=1, marker="wrong")
-    store, _, gate, _ = one_shot_gate(tmp_path, executor=executor)
+    supervisor = NoIoSupervisor(bad_frame=True)
+    store, _, gate, _ = one_shot_gate(tmp_path, supervisor=supervisor)
     permit, window = arm_pair(gate)
     result = asyncio.run(gate.run_one_shot(permit["permit_nonce"], window["canary_nonce"]))
     assert result["status"] == ERROR
+    assert result["error_code"] == "canary_resource_cleanup_failed"
     event = next(event for event in store.ledger_usage_events() if event.get("action") == "RUN")
     assert event["source"] == "LOCAL_OBSERVED" and event["quality"] == "OBSERVED"
-    assert event["local_processes"] == 1 and event["local_duration_ms"] >= 0
+    assert event["local_processes"] == 4 and event["local_duration_ms"] >= 0
+    assert (event["supervisor_processes"], event["bwrap_processes"], event["codex_processes"]) == (1, 2, 1)
     assert event["provider_total_tokens"] is None and event["external_model_requests"] == 0
     assert event["app_server_rpc_calls"] == 0 and event["ignored_usage"] is True
 
