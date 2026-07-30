@@ -498,6 +498,36 @@ class Store:
                 )"""
             )
             conn.execute(
+                """CREATE TABLE IF NOT EXISTS codex_canary_execution_permits (
+                    permit_id TEXT PRIMARY KEY,
+                    nonce_hash TEXT NOT NULL UNIQUE,
+                    binding_hash TEXT NOT NULL,
+                    contract_id TEXT NOT NULL,
+                    contract_hash TEXT NOT NULL,
+                    runtime_identity_version TEXT NOT NULL,
+                    runtime_fingerprint TEXT NOT NULL,
+                    launch_spec_hash TEXT NOT NULL,
+                    binary_sha256 TEXT NOT NULL,
+                    isolation_config_hash TEXT NOT NULL,
+                    tool_fingerprint TEXT NOT NULL,
+                    isolation_cache_key TEXT NOT NULL,
+                    harness_runner_kind TEXT NOT NULL,
+                    harness_runner_version TEXT NOT NULL,
+                    harness_implementation_hash TEXT NOT NULL,
+                    canary_runner_kind TEXT NOT NULL,
+                    canary_runner_version TEXT NOT NULL,
+                    canary_implementation_hash TEXT NOT NULL,
+                    repro_version TEXT NOT NULL,
+                    repro_key TEXT NOT NULL,
+                    repro_result_hash TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('ARMED', 'CONSUMED', 'EXPIRED')),
+                    issued_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    consumed_at TEXT,
+                    error_code TEXT
+                )"""
+            )
+            conn.execute(
                 """CREATE TABLE IF NOT EXISTS wsl_isolation_probe_results (
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                     backend TEXT NOT NULL,
@@ -655,6 +685,7 @@ class Store:
             conn.execute("CREATE INDEX IF NOT EXISTS egress_execution_windows_status ON egress_execution_windows(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS codex_process_canary_runs_status ON codex_process_canary_runs(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS codex_process_canary_windows_status ON codex_process_canary_windows(status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS codex_canary_execution_permits_status ON codex_canary_execution_permits(status)")
             self._migrate_route_plan_uses(conn)
             self._migrate_route_plans(conn)
             self._migrate_bridge_nonces(conn)
@@ -3030,6 +3061,281 @@ class Store:
                    WHERE status='ARMED'"""
             )
         return int(cursor.rowcount)
+
+    _CODEX_CANARY_PERMIT_FIELDS = (
+        "binding_hash", "contract_id", "contract_hash", "runtime_identity_version", "runtime_fingerprint",
+        "launch_spec_hash", "binary_sha256", "isolation_config_hash", "tool_fingerprint", "isolation_cache_key",
+        "harness_runner_kind", "harness_runner_version", "harness_implementation_hash",
+        "canary_runner_kind", "canary_runner_version", "implementation_hash",
+        "repro_version", "repro_key", "repro_result_hash",
+    )
+    _CODEX_CANARY_PERMIT_HASH_FIELDS = frozenset({
+        "binding_hash", "contract_hash", "runtime_fingerprint", "launch_spec_hash", "binary_sha256",
+        "isolation_config_hash", "tool_fingerprint", "isolation_cache_key", "harness_implementation_hash",
+        "implementation_hash", "repro_key", "repro_result_hash",
+    })
+
+    @classmethod
+    def _validate_codex_canary_execution_permit_binding(cls, binding: Mapping[str, Any]) -> dict[str, str]:
+        if not isinstance(binding, Mapping) or any(
+            not isinstance(binding.get(field), str) or not binding.get(field)
+            for field in cls._CODEX_CANARY_PERMIT_FIELDS
+        ):
+            raise PolicyError("codex_canary_permit_binding_invalid")
+        value = {field: str(binding[field]) for field in cls._CODEX_CANARY_PERMIT_FIELDS}
+        if value["binding_hash"] != sha256_json({key: binding[key] for key in binding if key != "binding_hash"}):
+            raise PolicyError("codex_canary_permit_binding_invalid")
+        if any(not re.fullmatch(r"[0-9a-f]{64}", value[field]) for field in cls._CODEX_CANARY_PERMIT_HASH_FIELDS):
+            raise PolicyError("codex_canary_permit_binding_invalid")
+        try:
+            uuid.UUID(value["contract_id"])
+        except (ValueError, TypeError) as exc:
+            raise PolicyError("codex_canary_permit_binding_invalid") from exc
+        if value["runtime_identity_version"] != RUNTIME_IDENTITY_VERSION:
+            raise PolicyError("codex_canary_permit_binding_invalid")
+        if value["canary_runner_kind"] != "WSL_CODEX_CANARY":
+            raise PolicyError("actual_runner_policy_violation")
+        return value
+
+    @staticmethod
+    def _codex_canary_execution_permit_public(record: Mapping[str, Any]) -> dict[str, Any]:
+        fields = (
+            "permit_id", "binding_hash", "contract_hash", "canary_runner_kind", "canary_runner_version",
+            "canary_implementation_hash", "status", "issued_at", "expires_at", "consumed_at", "error_code",
+        )
+        value = {field: record.get(field) for field in fields}
+        if value.get("status") == "ARMED":
+            try:
+                remaining = max(0, round((datetime.fromisoformat(str(value["expires_at"])) - datetime.now(timezone.utc)).total_seconds()))
+            except (TypeError, ValueError):
+                remaining = 0
+            value["remaining_seconds"] = remaining
+        return value
+
+    @classmethod
+    def _codex_canary_execution_permit_row(cls, row: tuple[Any, ...]) -> dict[str, Any]:
+        fields = (
+            "permit_id", "binding_hash", "contract_id", "contract_hash", "runtime_identity_version",
+            "runtime_fingerprint", "launch_spec_hash", "binary_sha256", "isolation_config_hash",
+            "tool_fingerprint", "isolation_cache_key", "harness_runner_kind", "harness_runner_version",
+            "harness_implementation_hash", "canary_runner_kind", "canary_runner_version",
+            "canary_implementation_hash", "repro_version", "repro_key", "repro_result_hash", "status",
+            "issued_at", "expires_at", "consumed_at", "error_code",
+        )
+        return dict(zip(fields, row))
+
+    def issue_codex_canary_execution_permit(
+        self, binding: Mapping[str, Any], *, ttl_seconds: int = 120, now: datetime | None = None,
+    ) -> dict[str, Any]:
+        value = self._validate_codex_canary_execution_permit_binding(binding)
+        if not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool) or ttl_seconds != 120:
+            raise PolicyError("codex_canary_permit_ttl_invalid")
+        issued = now or datetime.now(timezone.utc)
+        if issued.tzinfo is None:
+            raise PolicyError("codex_canary_permit_time_invalid")
+        nonce = secrets.token_urlsafe(32)
+        record = {
+            "permit_id": str(uuid.uuid4()), **value, "canary_implementation_hash": value["implementation_hash"],
+            "status": "ARMED", "issued_at": issued.isoformat(), "expires_at": (issued + timedelta(seconds=ttl_seconds)).isoformat(),
+            "consumed_at": None, "error_code": None,
+        }
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """UPDATE codex_canary_execution_permits
+                   SET status='EXPIRED', error_code=COALESCE(error_code, 'codex_canary_permit_expired')
+                   WHERE status='ARMED' AND expires_at<=?""", (record["issued_at"],)
+            )
+            if conn.execute("SELECT 1 FROM codex_canary_execution_permits WHERE status='ARMED' LIMIT 1").fetchone():
+                raise PolicyError("codex_canary_permit_already_armed")
+            conn.execute(
+                """INSERT INTO codex_canary_execution_permits (
+                    permit_id, nonce_hash, binding_hash, contract_id, contract_hash, runtime_identity_version,
+                    runtime_fingerprint, launch_spec_hash, binary_sha256, isolation_config_hash, tool_fingerprint,
+                    isolation_cache_key, harness_runner_kind, harness_runner_version, harness_implementation_hash,
+                    canary_runner_kind, canary_runner_version, canary_implementation_hash, repro_version, repro_key,
+                    repro_result_hash, status, issued_at, expires_at, consumed_at, error_code
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ARMED', ?, ?, NULL, NULL)""",
+                (
+                    record["permit_id"], hashlib.sha256(nonce.encode("ascii")).hexdigest(), record["binding_hash"],
+                    record["contract_id"], record["contract_hash"], record["runtime_identity_version"],
+                    record["runtime_fingerprint"], record["launch_spec_hash"], record["binary_sha256"],
+                    record["isolation_config_hash"], record["tool_fingerprint"], record["isolation_cache_key"],
+                    record["harness_runner_kind"], record["harness_runner_version"], record["harness_implementation_hash"],
+                    record["canary_runner_kind"], record["canary_runner_version"], record["canary_implementation_hash"],
+                    record["repro_version"], record["repro_key"], record["repro_result_hash"], record["issued_at"], record["expires_at"],
+                ),
+            )
+        return {**self._codex_canary_execution_permit_public(record), "permit_nonce": nonce}
+
+    def codex_canary_execution_permit(self) -> dict[str, Any]:
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT permit_id, binding_hash, contract_id, contract_hash, runtime_identity_version,
+                          runtime_fingerprint, launch_spec_hash, binary_sha256, isolation_config_hash,
+                          tool_fingerprint, isolation_cache_key, harness_runner_kind, harness_runner_version,
+                          harness_implementation_hash, canary_runner_kind, canary_runner_version,
+                          canary_implementation_hash, repro_version, repro_key, repro_result_hash, status,
+                          issued_at, expires_at, consumed_at, error_code
+                   FROM codex_canary_execution_permits ORDER BY issued_at DESC LIMIT 1"""
+            ).fetchone()
+        if not row:
+            return {"status": "DISABLED", "remaining_seconds": 0}
+        return self._codex_canary_execution_permit_public(self._codex_canary_execution_permit_row(row))
+
+    def recover_armed_codex_canary_execution_permits(self) -> int:
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """UPDATE codex_canary_execution_permits
+                   SET status='EXPIRED', error_code=COALESCE(error_code, 'codex_canary_permit_restart_expired')
+                   WHERE status='ARMED'"""
+            )
+        return int(cursor.rowcount)
+
+    @staticmethod
+    def _require_codex_canary_nonce(nonce: str | None, error_code: str) -> str:
+        if not isinstance(nonce, str) or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", nonce):
+            raise PolicyError(error_code)
+        return nonce
+
+    @classmethod
+    def _permit_matches_binding(cls, record: Mapping[str, Any], binding: Mapping[str, Any]) -> bool:
+        value = cls._validate_codex_canary_execution_permit_binding(binding)
+        return all(
+            record.get("canary_implementation_hash" if field == "implementation_hash" else field) == value[field]
+            for field in cls._CODEX_CANARY_PERMIT_FIELDS
+        )
+
+    def validate_codex_canary_execution_permit(self, nonce: str | None, binding: Mapping[str, Any]) -> dict[str, Any]:
+        nonce = self._require_codex_canary_nonce(nonce, "codex_canary_permit_required")
+        self._validate_codex_canary_execution_permit_binding(binding)
+        current = datetime.now(timezone.utc)
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """SELECT permit_id, binding_hash, contract_id, contract_hash, runtime_identity_version,
+                          runtime_fingerprint, launch_spec_hash, binary_sha256, isolation_config_hash,
+                          tool_fingerprint, isolation_cache_key, harness_runner_kind, harness_runner_version,
+                          harness_implementation_hash, canary_runner_kind, canary_runner_version,
+                          canary_implementation_hash, repro_version, repro_key, repro_result_hash, status,
+                          issued_at, expires_at, consumed_at, error_code
+                   FROM codex_canary_execution_permits WHERE nonce_hash=?""",
+                (hashlib.sha256(nonce.encode("ascii")).hexdigest(),),
+            ).fetchone()
+            if not row:
+                raise PolicyError("codex_canary_permit_invalid")
+            record = self._codex_canary_execution_permit_row(row)
+            if record["status"] != "ARMED" or record["consumed_at"] is not None:
+                raise PolicyError("codex_canary_permit_reused")
+            if str(record["expires_at"]) <= current.isoformat():
+                conn.execute(
+                    """UPDATE codex_canary_execution_permits SET status='EXPIRED', error_code='codex_canary_permit_expired'
+                       WHERE permit_id=? AND status='ARMED'""", (record["permit_id"],)
+                )
+                raise PolicyError("codex_canary_permit_expired")
+            if not self._permit_matches_binding(record, binding):
+                conn.execute(
+                    """UPDATE codex_canary_execution_permits SET status='CONSUMED', consumed_at=?, error_code='execution_binding_changed'
+                       WHERE permit_id=? AND status='ARMED' AND consumed_at IS NULL""",
+                    (current.isoformat(), record["permit_id"]),
+                )
+                raise PolicyError("execution_binding_changed")
+        return self._codex_canary_execution_permit_public(record)
+
+    def consume_codex_canary_execution_permit_and_window(
+        self, permit_nonce: str | None, canary_nonce: str | None,
+    ) -> dict[str, Any]:
+        permit_nonce = self._require_codex_canary_nonce(permit_nonce, "codex_canary_permit_required")
+        canary_nonce = self._require_codex_canary_nonce(canary_nonce, "codex_canary_nonce_required")
+        current = datetime.now(timezone.utc)
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            permit_row = conn.execute(
+                """SELECT permit_id, binding_hash, contract_id, contract_hash, runtime_identity_version,
+                          runtime_fingerprint, launch_spec_hash, binary_sha256, isolation_config_hash,
+                          tool_fingerprint, isolation_cache_key, harness_runner_kind, harness_runner_version,
+                          harness_implementation_hash, canary_runner_kind, canary_runner_version,
+                          canary_implementation_hash, repro_version, repro_key, repro_result_hash, status,
+                          issued_at, expires_at, consumed_at, error_code
+                   FROM codex_canary_execution_permits WHERE nonce_hash=?""",
+                (hashlib.sha256(permit_nonce.encode("ascii")).hexdigest(),),
+            ).fetchone()
+            window_row = conn.execute(
+                """SELECT window_id, binding_hash, contract_hash, runner_kind, runner_version, runner_implementation_hash,
+                          status, issued_at, expires_at, consumed_at, error_code
+                   FROM codex_process_canary_windows WHERE nonce_hash=?""",
+                (hashlib.sha256(canary_nonce.encode("ascii")).hexdigest(),),
+            ).fetchone()
+            if not permit_row:
+                raise PolicyError("codex_canary_permit_invalid")
+            if not window_row:
+                raise PolicyError("codex_canary_nonce_invalid")
+            permit = self._codex_canary_execution_permit_row(permit_row)
+            window_fields = ("window_id", "binding_hash", "contract_hash", "runner_kind", "runner_version", "runner_implementation_hash", "status", "issued_at", "expires_at", "consumed_at", "error_code")
+            window = dict(zip(window_fields, window_row))
+            if permit["status"] != "ARMED" or permit["consumed_at"] is not None:
+                raise PolicyError("codex_canary_permit_reused")
+            if window["status"] != "ARMED" or window["consumed_at"] is not None:
+                raise PolicyError("codex_canary_nonce_reused")
+            if str(permit["expires_at"]) <= current.isoformat():
+                conn.execute("UPDATE codex_canary_execution_permits SET status='EXPIRED', error_code='codex_canary_permit_expired' WHERE permit_id=? AND status='ARMED'", (permit["permit_id"],))
+                raise PolicyError("codex_canary_permit_expired")
+            if str(window["expires_at"]) <= current.isoformat():
+                conn.execute("UPDATE codex_process_canary_windows SET status='EXPIRED', error_code='canary_window_expired' WHERE window_id=? AND status='ARMED'", (window["window_id"],))
+                raise PolicyError("codex_canary_window_expired")
+            matches = (
+                permit["binding_hash"] == window["binding_hash"]
+                and permit["contract_hash"] == window["contract_hash"]
+                and permit["canary_runner_kind"] == window["runner_kind"]
+                and permit["canary_runner_version"] == window["runner_version"]
+                and permit["canary_implementation_hash"] == window["runner_implementation_hash"]
+            )
+            consumed_at = current.isoformat()
+            if not matches:
+                conn.execute("UPDATE codex_canary_execution_permits SET status='CONSUMED', consumed_at=?, error_code='execution_binding_changed' WHERE permit_id=? AND status='ARMED'", (consumed_at, permit["permit_id"]))
+                conn.execute("UPDATE codex_process_canary_windows SET status='CONSUMED', consumed_at=?, error_code='execution_binding_changed' WHERE window_id=? AND status='ARMED'", (consumed_at, window["window_id"]))
+                raise PolicyError("execution_binding_changed")
+            permit_cursor = conn.execute(
+                """UPDATE codex_canary_execution_permits SET status='CONSUMED', consumed_at=?
+                   WHERE permit_id=? AND status='ARMED' AND consumed_at IS NULL""", (consumed_at, permit["permit_id"])
+            )
+            window_cursor = conn.execute(
+                """UPDATE codex_process_canary_windows SET status='CONSUMED', consumed_at=?
+                   WHERE window_id=? AND status='ARMED' AND consumed_at IS NULL""", (consumed_at, window["window_id"])
+            )
+            if permit_cursor.rowcount != 1 or window_cursor.rowcount != 1:
+                raise PolicyError("codex_canary_nonce_reused")
+        return {
+            "permit": self._codex_canary_execution_permit_public({**permit, "status": "CONSUMED", "consumed_at": consumed_at}),
+            "window": self._codex_process_canary_window_public({**window, "status": "CONSUMED", "consumed_at": consumed_at}),
+            "binding_hash": permit["binding_hash"],
+        }
+
+    def invalidate_codex_canary_execution_permit(self, nonce: str | None, error_code: str) -> None:
+        nonce = self._require_codex_canary_nonce(nonce, "codex_canary_permit_required")
+        if not re.fullmatch(r"[a-z0-9_]{1,80}", error_code):
+            raise PolicyError("codex_canary_permit_invalid")
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """UPDATE codex_canary_execution_permits
+                   SET status='CONSUMED', consumed_at=?, error_code=?
+                   WHERE nonce_hash=? AND status='ARMED' AND consumed_at IS NULL""",
+                (
+                    _now(), error_code, hashlib.sha256(nonce.encode("ascii")).hexdigest(),
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise PolicyError("codex_canary_permit_reused")
+
+    def mark_codex_canary_execution_permit_blocked(self, permit_id: str, error_code: str) -> None:
+        if not isinstance(permit_id, str) or not re.fullmatch(r"[0-9a-f-]{36}", permit_id) or not re.fullmatch(r"[a-z0-9_]{1,80}", error_code):
+            raise PolicyError("codex_canary_permit_invalid")
+        with self._connection() as conn:
+            conn.execute(
+                """UPDATE codex_canary_execution_permits SET error_code=?
+                   WHERE permit_id=? AND status='CONSUMED'""", (error_code, permit_id)
+            )
 
     def record_codex_process_canary_ledger(
         self, result: Mapping[str, Any], action: str, *, source: str | None = None, quality: str | None = None

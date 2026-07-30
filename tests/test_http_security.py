@@ -36,6 +36,15 @@ def test_testserver_stays_forbidden_and_local_actual_route_is_fail_closed(tmp_pa
             json={},
         )
         assert response.status_code == 409
+        permitless = local_client.post("/api/isolation/wsl/codex-process-canary/arm", json={})
+        assert permitless.status_code == 403
+        permitless = local_client.post(
+            "/api/isolation/wsl/codex-process-canary/arm",
+            headers={"Origin": "http://127.0.0.1:8787"}, json={},
+        )
+        assert permitless.status_code == 409
+    with TestClient(app_main.app) as default_client:
+        assert default_client.post("/api/isolation/wsl/codex-process-canary/permit", json={}).status_code == 403
 
 
 def test_foreign_origin_is_rejected(client):

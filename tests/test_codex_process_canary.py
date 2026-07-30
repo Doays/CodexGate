@@ -317,8 +317,8 @@ def test_api_keeps_canary_disabled_and_preserves_local_host_origin_gate(tmp_path
     with TestClient(main.app, base_url="http://127.0.0.1:8787") as client:
         result = client.get("/api/isolation/wsl/codex-process-canary")
         assert result.status_code == 200 and result.json()["status"] == "DISABLED"
-        arm = client.post("/api/isolation/wsl/codex-process-canary/arm", headers={"Origin": "http://127.0.0.1:8787"})
-        assert arm.status_code == 409 and arm.json()["detail"] == "codex_canary_execution_disabled"
+        arm = client.post("/api/isolation/wsl/codex-process-canary/arm", headers={"Origin": "http://127.0.0.1:8787"}, json={})
+        assert arm.status_code == 409 and arm.json()["detail"] == "codex_canary_permit_required"
     with TestClient(main.app) as client:
         denied = client.post("/api/isolation/wsl/codex-process-canary/arm", headers={"Origin": "http://testserver"})
         assert denied.status_code == 403

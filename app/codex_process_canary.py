@@ -317,8 +317,8 @@ class SealedOfflineCodexProcessCanary:
         if self.runner_kind not in {CANARY_RUNNER_KIND, FAKE_CANARY_RUNNER_KIND} or not isinstance(self.runner_version, str) or not _is_hash(self.runner_implementation_hash):
             raise PolicyError("codex_canary_runner_invalid")
 
-    def _binding(self) -> dict[str, str]:
-        if not bool(getattr(self.runner, "enabled", False)):
+    def _binding(self, *, allow_disabled_runner: bool = False) -> dict[str, str]:
+        if not bool(getattr(self.runner, "enabled", False)) and not allow_disabled_runner:
             raise PolicyError("codex_canary_execution_disabled")
         if not REQUIRED_EXEC_OPTIONS <= set(getattr(self.runner, "supported_options", frozenset())):
             raise PolicyError("codex_canary_required_option_missing")
@@ -389,6 +389,22 @@ class SealedOfflineCodexProcessCanary:
             self.store.record_codex_process_canary_ledger(window, "ARM")
             return window
 
+    async def arm_from_execution_permit(self, permit_binding: Mapping[str, str]) -> dict[str, Any]:
+        """Create the existing Canary window only after a Permit validation.
+
+        The sealed production runner remains disabled in this release.  The
+        Permit gate is the sole caller allowed to bypass that readiness check
+        for the purpose of minting a one-use window; it does not enable the
+        runner or start a child process.
+        """
+        async with self._arm_lock:
+            binding = self._binding(allow_disabled_runner=True)
+            if binding.get("binding_hash") != permit_binding.get("binding_hash"):
+                raise PolicyError("execution_binding_changed")
+            window = self.store.issue_codex_process_canary_window(binding, ttl_seconds=WINDOW_TTL_SECONDS)
+            self.store.record_codex_process_canary_ledger(window, "ARM")
+            return window
+
     async def run(self, canary_nonce: str | None) -> dict[str, Any]:
         # Claim happens before validation/execution.  A failed request cannot
         # leave the capability reusable.
@@ -413,6 +429,47 @@ class SealedOfflineCodexProcessCanary:
         lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
             existing = self.store.codex_process_canary_result(current["contract_hash"], self.runner_kind, self.runner_version, self.runner_implementation_hash)
+            if isinstance(existing, Mapping) and existing.get("status") == PASSED:
+                return public_canary_result({**existing, "reused": True})
+            return await self._run_once(current)
+
+    def record_blocked_execution_attempt(self, claimed_window: Mapping[str, Any], error_code: str) -> None:
+        """Record a pre-spawn denial as an observed zero-process metric."""
+        blocked = {
+            **claimed_window,
+            "status": BLOCKED,
+            "local_processes": 0,
+            "local_duration_ms": 0,
+            "implementation_hash": self.runner_implementation_hash,
+        }
+        self.store.record_codex_process_canary_ledger(
+            blocked, "BLOCKED", source="LOCAL_OBSERVED", quality="OBSERVED",
+        )
+        window_id = claimed_window.get("window_id")
+        if isinstance(window_id, str):
+            self.store.mark_codex_process_canary_window_blocked(window_id, error_code)
+
+    async def run_claimed_execution_permit(
+        self, claimed_window: Mapping[str, Any], expected_binding: Mapping[str, str],
+    ) -> dict[str, Any]:
+        """Run only after the Permit and Canary window have been atomically consumed."""
+        try:
+            current = self._binding(allow_disabled_runner=True)
+        except PolicyError as exc:
+            self.record_blocked_execution_attempt(claimed_window, "execution_binding_changed")
+            raise PolicyError("execution_binding_changed") from exc
+        if current.get("binding_hash") != expected_binding.get("binding_hash"):
+            self.record_blocked_execution_attempt(claimed_window, "execution_binding_changed")
+            raise PolicyError("execution_binding_changed")
+        if not bool(getattr(self.runner, "enabled", False)):
+            self.record_blocked_execution_attempt(claimed_window, "codex_canary_execution_disabled")
+            raise PolicyError("codex_canary_execution_disabled")
+        key = f"{self.store.db_path}:{current['contract_hash']}:{self.runner_implementation_hash}"
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            existing = self.store.codex_process_canary_result(
+                current["contract_hash"], self.runner_kind, self.runner_version, self.runner_implementation_hash,
+            )
             if isinstance(existing, Mapping) and existing.get("status") == PASSED:
                 return public_canary_result({**existing, "reused": True})
             return await self._run_once(current)
@@ -525,3 +582,87 @@ class SealedOfflineCodexProcessCanary:
 
     def window_status(self) -> dict[str, Any]:
         return self.store.codex_process_canary_window()
+
+
+class CodexCanaryExecutionPermitGate:
+    """One-use local Permit in front of the sealed Offline Canary window.
+
+    A Permit is a narrower capability than a Runtime start: it can authorize
+    only this fixed Offline Canary's existing arm/window protocol.  It neither
+    changes global runner state nor opens an egress or live-run path.
+    """
+
+    PERMIT_TTL_SECONDS = 120
+
+    def __init__(self, store, service: SealedOfflineCodexProcessCanary):
+        self.store = store
+        self.service = service
+        self._permit_lock = asyncio.Lock()
+
+    def _require_actual_runner(self) -> None:
+        if (
+            not isinstance(self.service.runner, WSLCodexProcessCanaryRunner)
+            or self.service.runner_kind != CANARY_RUNNER_KIND
+            or bool(getattr(self.service.runner, "is_fake", False))
+            or self.service.runner_version != RUNNER_VERSION
+            or self.service.runner_implementation_hash != RUNNER_IMPLEMENTATION_HASH
+        ):
+            raise PolicyError("actual_runner_policy_violation")
+
+    def _sealed_binding(self) -> dict[str, str]:
+        self._require_actual_runner()
+        return self.service._binding(allow_disabled_runner=True)
+
+    def ready(self) -> dict[str, Any]:
+        try:
+            binding = self._sealed_binding()
+        except PolicyError as exc:
+            return {"status": BLOCKED, "start_allowed": False, "error_code": str(exc)}
+        return {
+            "status": READY,
+            "start_allowed": False,
+            "binding_hash": binding["binding_hash"],
+            "runner_kind": self.service.runner_kind,
+            "runner_version": self.service.runner_version,
+            "runner_implementation_hash": self.service.runner_implementation_hash,
+            "implementation_hash": self.service.runner_implementation_hash,
+            "error_code": None,
+        }
+
+    async def issue(self) -> dict[str, Any]:
+        async with self._permit_lock:
+            binding = self._sealed_binding()
+            return self.store.issue_codex_canary_execution_permit(binding, ttl_seconds=self.PERMIT_TTL_SECONDS)
+
+    async def arm(self, permit_nonce: str | None) -> dict[str, Any]:
+        if not isinstance(permit_nonce, str) or not permit_nonce:
+            raise PolicyError("codex_canary_permit_required")
+        binding = self._sealed_binding()
+        self.store.validate_codex_canary_execution_permit(permit_nonce, binding)
+        try:
+            return await self.service.arm_from_execution_permit(binding)
+        except PolicyError as exc:
+            if str(exc) == "execution_binding_changed":
+                self.store.invalidate_codex_canary_execution_permit(permit_nonce, "execution_binding_changed")
+            raise
+
+    async def run(self, permit_nonce: str | None, canary_nonce: str | None) -> dict[str, Any]:
+        # Both capabilities are claimed before any new binding check or runner
+        # selection.  Thus failures cannot leave an authorization reusable.
+        claimed = self.store.consume_codex_canary_execution_permit_and_window(permit_nonce, canary_nonce)
+        permit = claimed["permit"]
+        window = claimed["window"]
+        try:
+            current = self._sealed_binding()
+        except PolicyError as exc:
+            self.service.record_blocked_execution_attempt(window, "execution_binding_changed")
+            self.store.mark_codex_canary_execution_permit_blocked(permit["permit_id"], "execution_binding_changed")
+            raise PolicyError("execution_binding_changed") from exc
+        if current["binding_hash"] != claimed["binding_hash"]:
+            self.service.record_blocked_execution_attempt(window, "execution_binding_changed")
+            self.store.mark_codex_canary_execution_permit_blocked(permit["permit_id"], "execution_binding_changed")
+            raise PolicyError("execution_binding_changed")
+        return await self.service.run_claimed_execution_permit(window, current)
+
+    def permit_status(self) -> dict[str, Any]:
+        return self.store.codex_canary_execution_permit()

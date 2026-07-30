@@ -11,6 +11,7 @@ let wslEgressStatus = "UNCONFIGURED";
 let wslHarnessStatus = "BLOCKED";
 let actualWSLHarnessStatus = "NOT RUN";
 let actualWSLHarnessArm = null;
+let codexProcessCanaryPermit = null;
 let codexProcessCanaryArm = null;
 let stream = null;
 let planExpiryTimer = null;
@@ -364,16 +365,20 @@ function renderCodexProcessCanary(result) {
   const detailNode = $("codex-process-canary-result");
   if (!statusNode || !detailNode) return;
   const status = result?.status || "DISABLED";
+  const permit = result?.execution_permit || { status: "DISABLED", remaining_seconds: 0 };
   const window = result?.execution_window || { status: "DISABLED", remaining_seconds: 0 };
+  const permitRemaining = permit.status === "ARMED" ? ` ${permit.remaining_seconds || 0}s remaining.` : "";
   const remaining = window.status === "ARMED" ? ` ${window.remaining_seconds || 0}s remaining.` : "";
   const implementation = result?.implementation_hash ? "implementation sealed" : "implementation not runnable";
   const code = result?.error_code ? ` Code: ${result.error_code}.` : "";
   statusNode.textContent = status;
-  detailNode.textContent = `Offline Codex canary ${status}; ${implementation}. Window ${window.status || "DISABLED"}.${remaining}${code} It verifies one fixed fake response only and never unlocks Runtime or live execution.`;
+  detailNode.textContent = `Offline Codex canary ${status}; ${implementation}. Permit ${permit.status || "DISABLED"}.${permitRemaining} Canary window ${window.status || "DISABLED"}.${remaining}${code} One local click authorizes at most one fixed fake-response check with external model tokens 0; Runtime and live execution remain locked.`;
+  const permitButton = $("issue-codex-process-canary-permit");
   const armButton = $("arm-codex-process-canary");
   const runButton = $("run-codex-process-canary");
-  if (armButton) armButton.disabled = status !== "READY" || window.status === "ARMED";
-  if (runButton) runButton.disabled = window.status !== "ARMED" || !codexProcessCanaryArm;
+  if (permitButton) permitButton.disabled = result?.permit_ready !== true || permit.status === "ARMED";
+  if (armButton) armButton.disabled = permit.status !== "ARMED" || window.status === "ARMED" || !codexProcessCanaryPermit;
+  if (runButton) runButton.disabled = permit.status !== "ARMED" || window.status !== "ARMED" || !codexProcessCanaryPermit || !codexProcessCanaryArm;
 }
 
 async function runIsolationProbe() {
@@ -515,27 +520,50 @@ async function runActualWSLEgressHarness() {
   }
 }
 
-async function armCodexProcessCanary() {
+async function issueCodexProcessCanaryPermit() {
   try {
-    codexProcessCanaryArm = await api("/api/isolation/wsl/codex-process-canary/arm", { method: "POST" });
+    codexProcessCanaryPermit = await api("/api/isolation/wsl/codex-process-canary/permit", { method: "POST" });
+    codexProcessCanaryArm = null;
     renderCodexProcessCanary(await api("/api/isolation/wsl/codex-process-canary"));
-    say("A one-time offline Codex canary window is armed locally. Runtime and live execution remain locked.");
+    say("A local two-minute Offline Canary Permit is armed. It authorizes one canary-window request only; external model tokens remain 0.");
   } catch (error) {
+    codexProcessCanaryPermit = null;
     codexProcessCanaryArm = null;
     say(error.message, true);
   }
 }
 
+async function armCodexProcessCanary() {
+  if (!codexProcessCanaryPermit) return;
+  try {
+    codexProcessCanaryArm = await api("/api/isolation/wsl/codex-process-canary/arm", {
+      method: "POST",
+      body: JSON.stringify({ permit_nonce: codexProcessCanaryPermit.permit_nonce }),
+    });
+    renderCodexProcessCanary(await api("/api/isolation/wsl/codex-process-canary"));
+    say("A one-time offline Codex canary window is armed locally. Runtime and live execution remain locked.");
+  } catch (error) {
+    codexProcessCanaryArm = null;
+    codexProcessCanaryPermit = null;
+    say(error.message, true);
+  }
+}
+
 async function runCodexProcessCanary() {
-  if (!codexProcessCanaryArm) return;
+  if (!codexProcessCanaryPermit || !codexProcessCanaryArm) return;
   try {
     const result = await api("/api/isolation/wsl/codex-process-canary", {
       method: "POST",
-      body: JSON.stringify({ canary_nonce: codexProcessCanaryArm.canary_nonce }),
+      body: JSON.stringify({
+        permit_nonce: codexProcessCanaryPermit.permit_nonce,
+        canary_nonce: codexProcessCanaryArm.canary_nonce,
+      }),
     });
+    codexProcessCanaryPermit = null;
     codexProcessCanaryArm = null;
     renderCodexProcessCanary(result);
   } catch (error) {
+    codexProcessCanaryPermit = null;
     codexProcessCanaryArm = null;
     say(error.message, true);
     renderCodexProcessCanary(await api("/api/isolation/wsl/codex-process-canary"));
@@ -1268,6 +1296,7 @@ $("create-wsl-egress-contract").onclick = createSealedEgressContract;
 $("run-wsl-egress-harness").onclick = runSealedEgressHarness;
 $("arm-actual-wsl-egress-harness").onclick = armActualWSLEgressHarness;
 $("run-actual-wsl-egress-harness").onclick = runActualWSLEgressHarness;
+$("issue-codex-process-canary-permit").onclick = issueCodexProcessCanaryPermit;
 $("arm-codex-process-canary").onclick = armCodexProcessCanary;
 $("run-codex-process-canary").onclick = runCodexProcessCanary;
 for (const id of ["catalog-filter-status", "catalog-filter-kind", "catalog-filter-extension"]) $(id).addEventListener("change", () => refreshCatalogEntries().catch((error) => say(error.message, true)));
