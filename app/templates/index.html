@@ -18,6 +18,40 @@
       <span class="pill">Ultra 잠금</span>
     </section>
 
+    <section id="conversation" class="chat-shell" aria-label="대화형 작업 공간">
+      <div class="chat-header">
+        <div>
+          <p class="chat-kicker">대화형 작업 공간</p>
+          <h2>무엇을 도와드릴까요?</h2>
+          <p class="chat-subtitle">작업을 자연어로 설명하면 먼저 로컬 사전 분석을 준비합니다. 실제 실행은 항상 별도의 승인과 봉인된 계획을 거칩니다.</p>
+        </div>
+        <span id="chat-mode" class="chat-mode">읽기 전용</span>
+      </div>
+      <div id="chat-messages" class="chat-messages" aria-live="polite">
+        <article class="chat-message assistant">
+          <div class="chat-avatar">CG</div>
+          <div class="chat-bubble">
+            <p>안녕하세요. 저는 Codex Gate입니다. 프로젝트 폴더와 원하는 작업을 알려주시면 위험도, 관련 파일, 예상 컨텍스트를 먼저 확인하겠습니다.</p>
+            <div class="chat-suggestions" role="list">
+              <button class="chat-suggestion" type="button" data-prompt="이 프로젝트의 구조와 테스트 상태를 먼저 분석해줘.">프로젝트 먼저 분석</button>
+              <button class="chat-suggestion" type="button" data-prompt="읽기 전용으로 변경 범위와 위험 요소를 검토해줘.">변경 범위 검토</button>
+              <button class="chat-suggestion" type="button" data-prompt="현재 프로젝트에서 테스트가 필요한 부분을 찾아줘.">테스트 대상 찾기</button>
+            </div>
+          </div>
+        </article>
+      </div>
+      <form id="chat-composer" class="chat-composer">
+        <textarea id="chat-input" rows="2" placeholder="Codex에게 작업을 설명하세요…" aria-label="작업 입력"></textarea>
+        <div class="chat-composer-footer">
+          <span>Enter로 줄을 바꿀 수 있습니다. 분석은 로컬에서만 시작됩니다.</span>
+          <div class="chat-composer-actions">
+            <button id="chat-attach" class="button ghost" type="button" disabled title="파일 첨부는 정본 작업 폴더 설정 후 지원됩니다.">파일 첨부 준비 중</button>
+            <button id="chat-send" class="button accent" type="submit">보내기</button>
+          </div>
+        </div>
+      </form>
+    </section>
+
     <section class="grid primary-grid">
       <article class="panel project-panel">
         <div class="panel-title"><span>01</span><h2>프로젝트</h2></div>

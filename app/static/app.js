@@ -71,6 +71,48 @@ function say(message, isError = false) {
   node.style.color = isError ? "#ff9b8e" : "";
 }
 
+function appendChatMessage(role, message) {
+  const root = $("chat-messages");
+  if (!root || !message) return;
+  const article = document.createElement("article");
+  article.className = `chat-message ${role}`;
+  const avatar = document.createElement("div");
+  avatar.className = "chat-avatar";
+  avatar.textContent = role === "user" ? "나" : "CG";
+  const bubble = document.createElement("div");
+  bubble.className = "chat-bubble";
+  const paragraph = document.createElement("p");
+  paragraph.textContent = message;
+  bubble.appendChild(paragraph);
+  article.append(avatar, bubble);
+  root.appendChild(article);
+  root.scrollTop = root.scrollHeight;
+}
+
+function chatReply(message) {
+  appendChatMessage("assistant", message);
+}
+
+async function submitChat(event) {
+  event?.preventDefault();
+  const input = $("chat-input");
+  const text = input?.value.trim();
+  if (!text) {
+    say("먼저 작업 내용을 입력하세요.", true);
+    input?.focus();
+    return;
+  }
+  appendChatMessage("user", text);
+  $("task").value = text;
+  input.value = "";
+  invalidateRoutePlan();
+  chatReply("작업 내용을 확인했습니다. 로컬 사전 분석을 실행해 위험도와 관련 파일을 확인하겠습니다.");
+  const result = await makePreflight();
+  if (result) {
+    chatReply(`사전 분석이 끝났습니다. 위험도 ${result.risk}, 관련 파일 ${result.candidate_files}개, 예상 컨텍스트 ${Number(result.estimated_context || 0).toLocaleString()}토큰입니다. 아래 작업 카드에서 범위와 권한을 조정할 수 있습니다.`);
+  }
+}
+
 async function api(url, options = {}) {
   const response = await fetch(url, {
     headers: { "Content-Type": "application/json" },
@@ -297,6 +339,9 @@ async function connect() {
         : "연결되었습니다. 스키마 점검이 끝날 때까지 작업 폴더 쓰기는 잠겨 있습니다.",
       !data.workspace_write_available,
     );
+    chatReply(data.workspace_write_available
+      ? "Codex 연결이 완료되었습니다. 작업 폴더 쓰기 상태도 준비되어 있습니다."
+      : "Codex 연결이 완료되었습니다. 안전을 위해 작업 폴더 쓰기는 아직 잠겨 있습니다.");
   } catch (error) {
     say(error.message, true);
   }
@@ -612,10 +657,12 @@ async function runOfflineCodexOneShot() {
     const result = await api("/api/isolation/wsl/codex-process-canary/execute-one-shot", { method: "POST", headers: {} });
     renderCodexProcessCanary(result);
     say("오프라인 Canary를 1회 완료했습니다. 외부 모델 토큰은 계속 0입니다.");
+    chatReply(`오프라인 Canary 결과: ${statusLabel(result.status)}. 외부 모델 토큰은 0이며 봉인된 로컬 검증만 수행했습니다.`);
   } catch (error) {
     // The server has already consumed or aborted its internal capabilities;
     // never re-enable this one-shot button after any response.
     say(error.message, true);
+    chatReply(`오프라인 Canary를 완료하지 못했습니다: ${error.message}`);
   }
 }
 
@@ -755,8 +802,11 @@ async function makePreflight() {
     $("git-status").textContent = `Git 상태: ${data.git_status}`;
     $("web-packet").value = data.web_packet;
     say("사전 분석 패킷을 생성했습니다.");
+    return data;
   } catch (error) {
     say(error.message, true);
+    chatReply(`사전 분석을 완료하지 못했습니다: ${error.message}`);
+    return null;
   }
 }
 
@@ -1331,6 +1381,34 @@ async function exportTokenLedger(format) {
   } catch (error) {
     say(error.message, true);
   }
+}
+$("connect").onclick = connect;
+$("preflight").onclick = () => makePreflight();
+$("router-preview").onclick = previewRouter;
+$("copy-packet").onclick = copyPacket;
+$("create-plan").onclick = createRoutePlan;
+$("create-capsule").onclick = createCapsule;
+$("execute").onclick = execute;
+$("interrupt").onclick = interrupt;
+$("bridge-start").onclick = startBridge;
+$("bridge-action").onclick = bridgeAction;
+$("catalog-register").onclick = registerCatalogSource;
+$("catalog-scan").onclick = () => scanCatalog(false);
+$("catalog-resume").onclick = () => scanCatalog(true);
+$("catalog-cancel").onclick = cancelCatalog;
+$("catalog-probe").onclick = runFormatProbe;
+$("chat-composer").addEventListener("submit", submitChat);
+$("chat-input").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+    event.preventDefault();
+    $("chat-composer").requestSubmit();
+  }
+});
+for (const suggestion of document.querySelectorAll(".chat-suggestion")) {
+  suggestion.addEventListener("click", () => {
+    $("chat-input").value = suggestion.dataset.prompt || "";
+    $("chat-input").focus();
+  });
 }
 $("ledger-refresh").onclick = refreshTokenLedger;
 $("ledger-import").onclick = importTokenLedgerBaseline;
