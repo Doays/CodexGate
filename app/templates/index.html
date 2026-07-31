@@ -9,13 +9,13 @@
 <body>
   <main class="shell">
     <header class="topbar">
-      <div><p class="eyebrow">LOCAL CONTROL PLANE</p><h1>Codex Gate</h1></div>
+      <div><p class="eyebrow">로컬 제어판</p><h1>Codex Gate</h1></div>
       <div class="connection"><span id="connection-dot" class="dot"></span><span><span id="connection-text">Codex 연결 전</span><small id="codex-meta"></small></span><button id="connect" class="button ghost">연결</button></div>
     </header>
 
     <section class="intro">
-      <p>웹 GPT는 판단하고, Codex는 새 스레드에서 실행합니다. 이 화면은 모델·범위·예산을 통제합니다.</p>
-      <span class="pill">Ultra LOCKED</span>
+      <p>웹 GPT는 판단하고 Codex는 새 스레드에서 실행합니다. 이 화면에서 모델, 작업 범위, 예산을 통제합니다.</p>
+      <span class="pill">Ultra 잠금</span>
     </section>
 
     <section class="grid primary-grid">
@@ -28,7 +28,7 @@
       <article class="panel task-panel">
         <div class="panel-title"><span>02</span><h2>작업 카드</h2></div>
         <label>원하는 작업<textarea id="task" rows="5" placeholder="예: API timeout 재현 테스트를 추가하고 원인을 조사해줘."></textarea></label>
-        <div class="row"><label>권한<select id="permission"><option value="read-only">Read Only</option><option value="workspace-write">Workspace Write</option></select></label>
+        <div class="row"><label>권한<select id="permission"><option value="read-only">읽기 전용</option><option value="workspace-write">작업 폴더 쓰기</option></select></label>
         <label>계획 예산<input id="planned-budget" value="Route Plan 생성 후 표시" readonly></label></div>
         <button id="preflight" class="button wide">로컬 사전 분석</button>
       </article>
@@ -43,114 +43,106 @@
       <article class="panel routing-panel">
         <div class="panel-title"><span>04</span><h2>Codex 라우팅</h2></div>
         <div class="row"><label>카탈로그 모델<select id="model" disabled><option>먼저 연결</option></select></label><label>카탈로그 추론 강도<select id="effort" disabled><option>—</option></select></label></div>
-        <p class="hint">표시 전용입니다. 실행 모델·강도는 결정 JSON으로 만든 Route Plan에서만 가져옵니다. Ultra는 표시하지 않습니다.</p>
+        <p class="hint">표시 전용입니다. 실행 모델과 강도는 결정 JSON으로 만든 Route Plan에서만 가져옵니다. Ultra는 표시하지 않습니다.</p>
       </article>
     </section>
 
     <section class="grid account-grid">
       <article class="panel">
-        <div class="panel-title"><span>05</span><h2>계정 한도</h2><span id="account-state" class="status">UNKNOWN</span></div>
-        <div class="metrics"><div><small>계정 상태</small><strong id="account-auth">UNKNOWN</strong></div><div><small>사용률</small><strong id="account-used">UNKNOWN</strong></div><div><small>리셋 시각</small><strong id="account-reset">UNKNOWN</strong></div></div>
+        <div class="panel-title"><span>05</span><h2>계정 한도</h2><span id="account-state" class="status">확인 전</span></div>
+        <div class="metrics"><div><small>계정 상태</small><strong id="account-auth">확인 전</strong></div><div><small>사용률</small><strong id="account-used">확인 전</strong></div><div><small>리셋 시각</small><strong id="account-reset">확인 전</strong></div></div>
         <p id="account-meta" class="hint">계정 전체 rate limit은 모델별 잔여량이 아닙니다.</p>
-        <p id="usage-meta" class="hint">일별 토큰 사용량: UNKNOWN</p>
+        <p id="usage-meta" class="hint">일별 토큰 사용량: 확인 전</p>
       </article>
       <article class="panel">
         <div class="panel-title"><span>06</span><h2>모델 카탈로그</h2></div>
         <p class="hint">모델 상태는 수동 상태이며 계정 전체 한도와 독립적입니다.</p>
-        <div class="catalog-scroll"><table class="catalog-table"><thead><tr><th>모델</th><th>Efforts (server order)</th><th>Speed tiers</th><th>수동 상태</th></tr></thead><tbody id="model-catalog"></tbody></table></div>
+        <div class="catalog-scroll"><table class="catalog-table"><thead><tr><th>모델</th><th>추론 강도 (서버 순서)</th><th>속도 등급</th><th>수동 상태</th></tr></thead><tbody id="model-catalog"></tbody></table></div>
       </article>
     </section>
 
     <section id="token-ledger-panel" class="panel ledger-panel">
-      <div class="panel-title"><span>LEDGER</span><h2>Token Savings Ledger</h2><span id="ledger-summary-status" class="status">NO DATA</span></div>
-      <p id="ledger-summary-message" class="hint">실제 토큰 절감 미측정</p>
+      <div class="panel-title"><span>원장</span><h2>토큰 절감 원장</h2><span id="ledger-summary-status" class="status">데이터 없음</span></div>
+      <p id="ledger-summary-message" class="hint">실제 토큰 절감은 아직 측정되지 않았습니다.</p>
       <div class="metrics five ledger-metrics">
-        <div><small>Baseline processed</small><strong id="ledger-baseline-processed">—</strong></div>
-        <div><small>Actual processed</small><strong id="ledger-actual-processed">—</strong></div>
-        <div><small>Processed savings</small><strong id="ledger-processed-savings">—</strong></div>
-        <div><small>Model turns</small><strong id="ledger-model-turns">—</strong></div>
-        <div><small>Retries</small><strong id="ledger-retries">—</strong></div>
+        <div><small>기준 처리 토큰</small><strong id="ledger-baseline-processed">—</strong></div>
+        <div><small>실제 처리 토큰</small><strong id="ledger-actual-processed">—</strong></div>
+        <div><small>처리 절감량</small><strong id="ledger-processed-savings">—</strong></div>
+        <div><small>모델 턴 수</small><strong id="ledger-model-turns">—</strong></div>
+        <div><small>재시도 수</small><strong id="ledger-retries">—</strong></div>
       </div>
       <div class="row ledger-actions">
-        <button id="ledger-refresh" class="button" type="button">Refresh ledger</button>
-        <button id="ledger-export-json" class="button ghost" type="button">Export JSON</button>
-        <button id="ledger-export-md" class="button ghost" type="button">Export Markdown</button>
+        <button id="ledger-refresh" class="button" type="button">원장 새로고침</button>
+        <button id="ledger-export-json" class="button ghost" type="button">JSON 내보내기</button>
+        <button id="ledger-export-md" class="button ghost" type="button">Markdown 내보내기</button>
       </div>
-      <label>Import baseline JSON<textarea id="ledger-baseline-input" rows="6" spellcheck="false" placeholder='{"comparison_key":"...","success_criteria_hash":"..."}'></textarea></label>
-      <div class="row ledger-actions">
-        <button id="ledger-import" class="button wide" type="button">Import baseline</button>
-      </div>
-      <div class="catalog-scroll"><table class="catalog-table"><thead><tr><th>Comparison key</th><th>Status</th><th>Baseline</th><th>Actual</th><th>Savings</th><th>Turns</th><th>Retries</th></tr></thead><tbody id="ledger-comparisons"></tbody></table></div>
+      <label>기준선 JSON 가져오기<textarea id="ledger-baseline-input" rows="6" spellcheck="false" placeholder='{"comparison_key":"...","success_criteria_hash":"..."}'></textarea></label>
+      <div class="row ledger-actions"><button id="ledger-import" class="button wide" type="button">기준선 가져오기</button></div>
+      <div class="catalog-scroll"><table class="catalog-table"><thead><tr><th>비교 키</th><th>상태</th><th>기준선</th><th>실제값</th><th>절감량</th><th>턴 수</th><th>재시도</th></tr></thead><tbody id="ledger-comparisons"></tbody></table></div>
       <pre id="ledger-report" class="plan-reasons"></pre>
     </section>
 
     <section class="panel">
-      <div class="panel-title"><span>ISOLATION</span><h2>Read isolation probe</h2><span id="isolation-status" class="status">UNKNOWN</span></div>
-      <p id="isolation-result" class="hint">The probe reports `ERROR`, `UNSAFE_FULL_DISK_READ`, or `SAFE_CANDIDATE`; live execution stays locked in this release.</p>
-      <button id="run-isolation-probe" class="button wide" type="button">Test Read Only isolation (no model turn)</button>
+      <div class="panel-title"><span>격리</span><h2>읽기 격리 점검</h2><span id="isolation-status" class="status">확인 전</span></div>
+      <p id="isolation-result" class="hint">점검 결과는 ERROR, UNSAFE_FULL_DISK_READ, SAFE_CANDIDATE 중 하나입니다. 이 버전에서는 실제 실행을 계속 잠가 둡니다.</p>
+      <button id="run-isolation-probe" class="button wide" type="button">읽기 전용 격리 점검 (모델 턴 없음)</button>
     </section>
 
     <section class="panel wsl-isolation-panel">
-      <div class="panel-title"><span>WSL2</span><h2>bubblewrap Read Only preflight</h2><span id="wsl-isolation-status" class="status">UNCONFIGURED</span></div>
-      <p id="wsl-isolation-result" class="hint">Choose a WSL2 distribution explicitly. The fixed bwrap canary checks remain preflight-only and never unlock live execution.</p>
+      <div class="panel-title"><span>WSL2</span><h2>bubblewrap 읽기 전용 사전 점검</h2><span id="wsl-isolation-status" class="status">미설정</span></div>
+      <p id="wsl-isolation-result" class="hint">WSL2 배포판을 직접 선택하세요. 고정 bwrap 카나리 점검은 사전 점검으로만 동작하며 실제 실행을 절대 열지 않습니다.</p>
       <div class="row wsl-isolation-actions">
-        <label>WSL distribution<input id="wsl-isolation-distro" maxlength="128" autocomplete="off" placeholder="Ubuntu"></label>
-        <button id="save-wsl-isolation-config" class="button ghost" type="button">Save distribution</button>
-        <button id="run-wsl-isolation-probe" class="button" type="button">Run WSL2+bwrap probe</button>
-        <button id="run-wsl-isolation-repro" class="button ghost" type="button">Repeat fixed check (10x)</button>
+        <label>WSL 배포판<input id="wsl-isolation-distro" maxlength="128" autocomplete="off" placeholder="Ubuntu"></label>
+        <button id="save-wsl-isolation-config" class="button ghost" type="button">배포판 저장</button>
+        <button id="run-wsl-isolation-probe" class="button" type="button">WSL2+bwrap 점검 실행</button>
+        <button id="run-wsl-isolation-repro" class="button ghost" type="button">고정 점검 반복 (10회)</button>
       </div>
-      <p class="hint">Checks only the selected distribution, `/usr/bin/python3`, and `bwrap`; the sandbox binds the Capsule as read-only at `/work`, leaves Windows mounts unbound, and keeps the run button locked.</p>
-      <p id="wsl-isolation-repro-result" class="hint">Repeatability check is available only after SAFE_CANDIDATE; live runs remain locked.</p>
+      <p class="hint">선택한 배포판, `/usr/bin/python3`, `bwrap`만 확인합니다. 샌드박스는 Capsule을 `/work`에 읽기 전용으로 연결하고 Windows 마운트는 연결하지 않으며 실행 버튼은 계속 잠급니다.</p>
+      <p id="wsl-isolation-repro-result" class="hint">반복성 점검은 SAFE_CANDIDATE 이후에만 사용할 수 있으며 실제 실행은 계속 잠겨 있습니다.</p>
       <div class="wsl-runtime-panel">
-        <div class="panel-title"><span>SEALED RUNTIME</span><h2>WSL Codex Phase 0</h2><span id="wsl-runtime-status" class="status">UNCONFIGURED</span></div>
-        <p id="wsl-runtime-result" class="hint">Configure one allowlisted WSL-native binary. This phase validates metadata only; egress and all Codex starts remain blocked.</p>
+        <div class="panel-title"><span>봉인 런타임</span><h2>WSL Codex 0단계</h2><span id="wsl-runtime-status" class="status">미설정</span></div>
+        <p id="wsl-runtime-result" class="hint">허용 목록에 있는 WSL 네이티브 바이너리 하나를 설정하세요. 이 단계는 메타데이터만 검증하며 외부 통신과 모든 Codex 시작은 차단됩니다.</p>
         <div class="row wsl-isolation-actions">
-          <label>WSL Codex binary<input id="wsl-runtime-binary" maxlength="512" autocomplete="off" placeholder="allowlisted WSL-native binary"></label>
-          <button id="save-wsl-runtime-config" class="button ghost" type="button">Save binary</button>
-          <button id="run-wsl-runtime-preflight" class="button" type="button">Validate sealed runtime</button>
+          <label>WSL Codex 바이너리<input id="wsl-runtime-binary" maxlength="512" autocomplete="off" placeholder="허용 목록의 WSL 네이티브 바이너리"></label>
+          <button id="save-wsl-runtime-config" class="button ghost" type="button">바이너리 저장</button>
+          <button id="run-wsl-runtime-preflight" class="button" type="button">봉인 런타임 검증</button>
         </div>
-        <p class="hint">Shown: configured state, version match, runtime fingerprint, isolation match, and egress blocking only. Paths, argv, environment values, and credentials are never displayed.</p>
+        <p class="hint">설정 여부, 버전 일치, 런타임 지문, 격리 일치, 외부 통신 차단 여부만 표시합니다. 경로, argv, 환경값, 자격 증명은 표시하지 않습니다.</p>
       </div>
       <div class="wsl-egress-panel">
-        <div class="panel-title"><span>SEALED EGRESS</span><h2>Contract Phase 1</h2><span id="wsl-egress-status" class="status">UNCONFIGURED</span></div>
-        <p id="wsl-egress-result" class="hint">Create only the immutable custom-provider and broker contract. No relay, socket, network, authentication, or Codex process starts in this phase.</p>
-        <div class="row wsl-isolation-actions">
-          <button id="create-wsl-egress-contract" class="button ghost" type="button">Create sealed egress contract</button>
-        </div>
-        <p class="hint">The contract permits one loopback Responses endpoint and one future Unix-socket broker boundary. Authentication remains unconfigured and all starts stay locked.</p>
+        <div class="panel-title"><span>봉인 외부 통신</span><h2>계약 1단계</h2><span id="wsl-egress-status" class="status">미설정</span></div>
+        <p id="wsl-egress-result" class="hint">변경할 수 없는 사용자 지정 공급자와 브로커 계약만 생성합니다. 이 단계에서는 릴레이, 소켓, 네트워크, 인증, Codex 프로세스를 시작하지 않습니다.</p>
+        <div class="row wsl-isolation-actions"><button id="create-wsl-egress-contract" class="button ghost" type="button">봉인 외부 통신 계약 생성</button></div>
+        <p class="hint">계약은 루프백 Responses 엔드포인트 하나와 향후 Unix 소켓 브로커 경계 하나만 허용합니다. 인증은 미설정 상태로 유지되며 모든 시작은 잠겨 있습니다.</p>
       </div>
       <div class="wsl-harness-panel">
-        <div class="panel-title"><span>LOCAL HARNESS</span><h2>Phase 3.1 proof gate</h2><span id="wsl-harness-status" class="status">FAKE BLOCKED</span></div>
-        <p id="wsl-harness-result" class="hint">FAKE results have a separate runner identity and can never serve as actual WSL proof.</p>
+        <div class="panel-title"><span>로컬 하니스</span><h2>3.1단계 증명 관문</h2><span id="wsl-harness-status" class="status">가짜 실행 차단</span></div>
+        <p id="wsl-harness-result" class="hint">가짜 결과는 별도 실행기 신원을 가지며 실제 WSL 증명으로 사용할 수 없습니다.</p>
+        <div class="row wsl-isolation-actions"><button id="run-wsl-egress-harness" class="button ghost" type="button" disabled>결정적 가짜 하니스 실행</button></div>
+        <div class="panel-title"><span>실제 실행기</span><h2>1회용 WSL 실행 창</h2><span id="actual-wsl-harness-status" class="status">WSL 미실행</span></div>
+        <p id="actual-wsl-harness-result" class="hint">신선한 Canary, SAFE_REPRODUCIBLE 10/10/10, 변경 불가 Contract, 정확한 실행기 해시 검증을 모두 통과한 뒤에만 로컬 IPv4 루프백 클릭으로 2분짜리 창 하나를 만들 수 있습니다. 다음 요청이 두 nonce를 모두 소비하며 런타임과 실제 실행은 계속 잠겨 있습니다.</p>
         <div class="row wsl-isolation-actions">
-          <button id="run-wsl-egress-harness" class="button ghost" type="button" disabled>Run deterministic fake harness</button>
-        </div>
-        <div class="panel-title"><span>ACTUAL RUNNER</span><h2>One-time WSL execution window</h2><span id="actual-wsl-harness-status" class="status">WSL NOT RUN</span></div>
-        <p id="actual-wsl-harness-result" class="hint">A local IPv4 loopback click can create one two-minute window only after fresh Canary, matching SAFE_REPRODUCIBLE 10/10/10, immutable Contract, and exact runner hash validation. The next request consumes both nonces; Runtime and live execution remain locked.</p>
-        <div class="row wsl-isolation-actions">
-          <button id="arm-actual-wsl-egress-harness" class="button ghost" type="button" disabled>Open one-time WSL window</button>
-          <button id="run-actual-wsl-egress-harness" class="button window-run" type="button" disabled>Run actual WSL once</button>
+          <button id="arm-actual-wsl-egress-harness" class="button ghost" type="button" disabled>1회용 WSL 창 열기</button>
+          <button id="run-actual-wsl-egress-harness" class="button window-run" type="button" disabled>실제 WSL 1회 실행</button>
         </div>
         <div class="wsl-codex-canary-panel">
-          <div class="panel-title"><span>OFFLINE CODEX</span><h2>Sealed Process Canary</h2><span id="codex-process-canary-status" class="status">DISABLED</span></div>
-          <p id="codex-process-canary-result" class="hint">The default path remains disabled. One explicit local IPv4 loopback click performs the sealed Permit, Canary window, and one-shot claim entirely on the server for an external-model-token-0 fake-response check only. Runtime and live execution stay locked.</p>
-          <div class="row wsl-isolation-actions">
-            <button id="run-codex-process-canary-one-shot" class="button window-run" type="button" disabled>Offline Canary 1회 실행</button>
-          </div>
+          <div class="panel-title"><span>오프라인 Codex</span><h2>봉인 프로세스 Canary</h2><span id="codex-process-canary-status" class="status">비활성</span></div>
+          <p id="codex-process-canary-result" class="hint">기본 경로는 계속 비활성입니다. 명시적인 로컬 IPv4 루프백 클릭 한 번으로 서버 내부에서 봉인 Permit, Canary 창, 1회용 청구를 수행하고 외부 모델 토큰 0인 가짜 응답만 확인합니다. 런타임과 실제 실행은 계속 잠겨 있습니다.</p>
+          <div class="row wsl-isolation-actions"><button id="run-codex-process-canary-one-shot" class="button window-run" type="button" disabled>오프라인 Canary 1회 실행</button></div>
         </div>
       </div>
     </section>
 
     <section class="panel router-preview-panel">
-      <div class="panel-title"><span>07</span><h2>자동 하향 라우터 미리보기</h2><span class="status">PREVIEW ONLY</span></div>
+      <div class="panel-title"><span>07</span><h2>자동 하향 라우터 미리보기</h2><span class="status">미리보기 전용</span></div>
       <div class="row preview-controls">
         <label>작업 등급<select id="router-task-class"><option value="T0">T0 · Spark</option><option value="T1" selected>T1 · Spark / mini</option><option value="T2">T2 · mini / Luna</option><option value="T3">T3 · 5.4 / Terra</option><option value="T4">T4 · Terra / 5.4</option><option value="T5">T5 · Sol / 5.5</option></select></label>
-        <label>위험도<select id="router-risk"><option value="low">low</option><option value="medium" selected>medium</option><option value="high">high</option></select></label>
+        <label>위험도<select id="router-risk"><option value="low">낮음</option><option value="medium" selected>중간</option><option value="high">높음</option></select></label>
         <label>독립 축 수<input id="router-axes" type="number" min="0" max="20" value="0"></label>
       </div>
-      <div class="preview-flags"><label><input id="router-parallel" type="checkbox"> parallel audit</label><label><input id="router-ultra-approval" type="checkbox"> Ultra 명시 승인</label></div>
+      <div class="preview-flags"><label><input id="router-parallel" type="checkbox"> 병렬 감사</label><label><input id="router-ultra-approval" type="checkbox"> Ultra 명시 승인</label></div>
       <button id="router-preview" class="button wide">웹 GPT 추천 상한 기준 미리보기</button>
-      <p class="hint">계정 상태·사전 분석 파일 수·테스트 여부를 함께 반영합니다. 표시 결과는 실제 thread/start·turn/start의 모델 또는 추론 강도를 바꾸지 않습니다.</p>
+      <p class="hint">계정 상태, 사전 분석 파일 수, 테스트 여부를 함께 반영합니다. 표시 결과는 실제 thread/start·turn/start의 모델 또는 추론 강도를 바꾸지 않습니다.</p>
       <div id="router-result" class="router-result" aria-live="polite"></div>
     </section>
 
@@ -162,85 +154,60 @@
       </article>
       <article class="panel">
         <div class="panel-title"><span>09</span><h2>결정 JSON</h2></div>
-        <textarea id="decision" rows="12" spellcheck="false" placeholder='웹 GPT의 JSON을 붙여넣으세요.'></textarea>
-        <button id="create-plan" class="button wide" disabled>불변 Route Plan 생성</button>
+        <textarea id="decision" rows="12" spellcheck="false" placeholder="웹 GPT의 JSON을 붙여넣으세요."></textarea>
+        <button id="create-plan" class="button wide" disabled>변경 불가 Route Plan 생성</button>
         <p class="hint">risk, parallel_audit, independent_axes와 정확한 allowed_files 범위, validation evidence를 검증합니다.</p>
       </article>
     </section>
 
     <section id="web-gpt-bridge" class="panel bridge-panel">
-      <div class="panel-title"><span>BRIDGE</span><h2>Manual Web GPT Bridge</h2><span id="bridge-status" class="status bridge-flag idle">NOT STARTED</span></div>
-      <p class="hint">One clear action at a time. The app only copies a packet after your click and only reads the clipboard after your click. It never controls the Web GPT page.</p>
-      <label>Optional ChatGPT conversation URL<input id="bridge-chat-url" type="url" placeholder="https://chatgpt.com/..."></label>
+      <div class="panel-title"><span>브리지</span><h2>수동 웹 GPT 브리지</h2><span id="bridge-status" class="status bridge-flag idle">시작 전</span></div>
+      <p class="hint">한 번에 하나의 작업만 수행합니다. 클릭한 뒤에만 패킷을 복사하고, 클릭한 뒤에만 클립보드를 읽습니다. 웹 GPT 페이지를 자동으로 조작하지 않습니다.</p>
+      <label>선택 사항: ChatGPT 대화 URL<input id="bridge-chat-url" type="url" placeholder="https://chatgpt.com/..."></label>
       <dl class="bridge-details">
-        <div><dt>Current phase</dt><dd id="bridge-phase">—</dd></div>
-        <div><dt>From</dt><dd id="bridge-source">Local</dd></div>
-        <div><dt>To</dt><dd id="bridge-destination">Web GPT</dd></div>
-        <div><dt>Packet type</dt><dd id="bridge-type">—</dd></div>
-        <div><dt>Do now</dt><dd id="bridge-now">Start a bridge task.</dd></div>
-        <div><dt>Next</dt><dd id="bridge-next">Copy the architecture packet.</dd></div>
+        <div><dt>현재 단계</dt><dd id="bridge-phase">—</dd></div><div><dt>출발지</dt><dd id="bridge-source">로컬</dd></div><div><dt>도착지</dt><dd id="bridge-destination">웹 GPT</dd></div><div><dt>패킷 유형</dt><dd id="bridge-type">—</dd></div><div><dt>지금 할 일</dt><dd id="bridge-now">브리지 작업을 시작하세요.</dd></div><div><dt>다음 단계</dt><dd id="bridge-next">아키텍처 패킷을 복사하세요.</dd></div>
       </dl>
-      <details id="bridge-packet-details" class="bridge-packet hidden"><summary>Packet body (collapsed by default)</summary><textarea id="bridge-packet" rows="10" readonly></textarea></details>
-      <textarea id="bridge-manual-response" class="hidden" rows="10" spellcheck="false" placeholder="Paste the Web GPT response packet here only after clipboard read fails."></textarea>
+      <details id="bridge-packet-details" class="bridge-packet hidden"><summary>패킷 본문 (기본 접힘)</summary><textarea id="bridge-packet" rows="10" readonly></textarea></details>
+      <textarea id="bridge-manual-response" class="hidden" rows="10" spellcheck="false" placeholder="클립보드 읽기에 실패한 경우에만 웹 GPT 응답 패킷을 붙여넣으세요."></textarea>
       <div id="bridge-evidence" class="bridge-evidence hidden" aria-live="polite"></div>
       <div id="bridge-review-fields" class="hidden">
-        <label>Actual result summary (JSON)<textarea id="bridge-result" rows="4" spellcheck="false" placeholder='{"summary":"local result"}'></textarea></label>
-        <label>Local validation summary (JSON)<textarea id="bridge-validation" rows="4" spellcheck="false" placeholder='{"tests":"not run"}'></textarea></label>
+        <label>실제 결과 요약 (JSON)<textarea id="bridge-result" rows="4" spellcheck="false" placeholder='{"summary":"로컬 결과"}'></textarea></label>
+        <label>로컬 검증 요약 (JSON)<textarea id="bridge-validation" rows="4" spellcheck="false" placeholder='{"tests":"실행 안 함"}'></textarea></label>
       </div>
-      <div class="bridge-actions"><button id="bridge-start" class="button bridge-send" type="button">Start architecture bridge</button><button id="bridge-action" class="button wide hidden" type="button"></button></div>
-      <p id="bridge-message" class="hint" aria-live="polite">No Bridge task is active.</p>
-      <p id="bridge-recent" class="hint">Checking for unfinished Bridge tasks…</p>
+      <div class="bridge-actions"><button id="bridge-start" class="button bridge-send" type="button">아키텍처 브리지 시작</button><button id="bridge-action" class="button wide hidden" type="button"></button></div>
+      <p id="bridge-message" class="hint" aria-live="polite">진행 중인 브리지 작업이 없습니다.</p>
+      <p id="bridge-recent" class="hint">완료되지 않은 브리지 작업을 확인하는 중…</p>
     </section>
 
     <section id="route-plan" class="panel route-plan hidden">
-      <div class="panel-title"><span>PLAN</span><h2>불변 Route Plan</h2><span id="plan-status" class="status">HOLD</span></div>
+      <div class="panel-title"><span>계획</span><h2>변경 불가 Route Plan</h2><span id="plan-status" class="status">보류</span></div>
       <dl class="plan-details">
-        <div><dt>Plan ID</dt><dd id="plan-id">—</dd></div>
-        <div><dt>Decision SHA-256</dt><dd id="plan-hash">—</dd></div>
-        <div><dt>Expires</dt><dd id="plan-expiry">—</dd></div>
-        <div><dt>Final route</dt><dd id="plan-final">—</dd></div>
-        <div><dt>Plan budget</dt><dd id="plan-budget">—</dd></div>
-        <div><dt>Planned scope</dt><dd id="plan-scope">—</dd></div>
-        <div><dt>Validation evidence</dt><dd id="plan-validation">—</dd></div>
+        <div><dt>계획 ID</dt><dd id="plan-id">—</dd></div><div><dt>결정 SHA-256</dt><dd id="plan-hash">—</dd></div><div><dt>만료 시각</dt><dd id="plan-expiry">—</dd></div><div><dt>최종 라우팅</dt><dd id="plan-final">—</dd></div><div><dt>계획 예산</dt><dd id="plan-budget">—</dd></div><div><dt>계획 범위</dt><dd id="plan-scope">—</dd></div><div><dt>검증 증거</dt><dd id="plan-validation">—</dd></div>
       </dl>
       <pre id="plan-reasons" class="plan-reasons"></pre>
-      <div class="panel-title"><span>CAPSULE</span><h2>Evidence Capsule</h2><span id="capsule-status" class="status">NOT CREATED</span></div>
-      <dl class="plan-details">
-        <div><dt>Evidence files</dt><dd id="capsule-files">0</dd></div>
-        <div><dt>Captured size</dt><dd id="capsule-size">0 bytes</dd></div>
-        <div><dt>Line ranges</dt><dd id="capsule-ranges">None</dd></div>
-      </dl>
+      <div class="panel-title"><span>캡슐</span><h2>증거 캡슐</h2><span id="capsule-status" class="status">생성 전</span></div>
+      <dl class="plan-details"><div><dt>증거 파일</dt><dd id="capsule-files">0</dd></div><div><dt>수집 크기</dt><dd id="capsule-size">0바이트</dd></div><div><dt>줄 범위</dt><dd id="capsule-ranges">없음</dd></div></dl>
       <pre id="capsule-reasons" class="plan-reasons"></pre>
-      <button id="create-capsule" class="button wide" type="button">Create Evidence Capsule</button>
+      <button id="create-capsule" class="button wide" type="button">증거 캡슐 생성</button>
     </section>
 
     <section id="asset-catalog" class="panel catalog-panel">
-      <div class="panel-title"><span>CATALOG</span><h2>Asset Catalog — metadata only</h2><span id="catalog-scan-status" class="status">IDLE</span></div>
-      <p class="hint">Register a local source explicitly. Phase 1 records names and filesystem metadata only; it never reads file bodies, hashes whole files, parses assets, or sends catalog entries to Web GPT.</p>
-      <div class="row">
-        <label>Source alias<input id="catalog-alias" maxlength="120" placeholder="Game data"></label>
-        <label>Local Source Root<input id="catalog-root" maxlength="4096" placeholder="D:\\GameData" spellcheck="false"></label>
-      </div>
-      <div class="row catalog-actions"><button id="catalog-register" class="button" type="button">Register source</button><button id="catalog-scan" class="button" type="button" disabled>Start scan</button><button id="catalog-resume" class="button ghost" type="button" disabled>Resume</button><button id="catalog-cancel" class="button danger" type="button" disabled>Cancel</button></div>
-      <p id="catalog-progress" class="hint">No source selected.</p>
-      <div class="row catalog-filters">
-        <label>Status<input id="catalog-filter-status" placeholder="ADDED"></label>
-        <label>Kind<input id="catalog-filter-kind" placeholder="texture"></label>
-        <label>Extension<input id="catalog-filter-extension" placeholder=".png"></label>
-      </div>
-      <div class="catalog-scroll"><table class="catalog-table"><thead><tr><th>Select</th><th>Source</th><th>Relative path</th><th>Kind</th><th>Size</th><th>Status</th><th>Entry ID</th></tr></thead><tbody id="catalog-entries"></tbody></table></div>
-      <div class="row catalog-actions format-probe-actions"><button id="catalog-probe" class="button" type="button" disabled>Run targeted format probe</button><span id="catalog-probe-summary" class="hint">Select up to 50 catalog entries. Phase 2 samples only limited file regions and never parses the whole file.</span></div>
-      <div class="catalog-scroll"><table class="catalog-table"><thead><tr><th>Source</th><th>Relative path</th><th>Detected format</th><th>Confidence</th><th>Extension</th><th>Next inspector</th><th>Bytes read</th><th>Status</th></tr></thead><tbody id="format-probe-results"></tbody></table></div>
+      <div class="panel-title"><span>카탈로그</span><h2>자산 카탈로그 — 메타데이터만</h2><span id="catalog-scan-status" class="status">대기</span></div>
+      <p class="hint">로컬 원본을 직접 등록하세요. 1단계에서는 이름과 파일 시스템 메타데이터만 기록하며 파일 본문을 읽거나 전체 파일을 해시하거나 자산을 분석하거나 카탈로그 항목을 웹 GPT로 보내지 않습니다.</p>
+      <div class="row"><label>원본 별칭<input id="catalog-alias" maxlength="120" placeholder="게임 데이터"></label><label>로컬 원본 루트<input id="catalog-root" maxlength="4096" placeholder="D:\\GameData" spellcheck="false"></label></div>
+      <div class="row catalog-actions"><button id="catalog-register" class="button" type="button">원본 등록</button><button id="catalog-scan" class="button" type="button" disabled>스캔 시작</button><button id="catalog-resume" class="button ghost" type="button" disabled>재개</button><button id="catalog-cancel" class="button danger" type="button" disabled>취소</button></div>
+      <p id="catalog-progress" class="hint">선택된 원본이 없습니다.</p>
+      <div class="row catalog-filters"><label>상태<input id="catalog-filter-status" placeholder="ADDED"></label><label>종류<input id="catalog-filter-kind" placeholder="texture"></label><label>확장자<input id="catalog-filter-extension" placeholder=".png"></label></div>
+      <div class="catalog-scroll"><table class="catalog-table"><thead><tr><th>선택</th><th>원본</th><th>상대 경로</th><th>종류</th><th>크기</th><th>상태</th><th>항목 ID</th></tr></thead><tbody id="catalog-entries"></tbody></table></div>
+      <div class="row catalog-actions format-probe-actions"><button id="catalog-probe" class="button" type="button" disabled>대상 형식 점검 실행</button><span id="catalog-probe-summary" class="hint">카탈로그 항목을 최대 50개 선택하세요. 2단계에서는 파일의 제한된 영역만 샘플링하며 전체 파일을 분석하지 않습니다.</span></div>
+      <div class="catalog-scroll"><table class="catalog-table"><thead><tr><th>원본</th><th>상대 경로</th><th>감지 형식</th><th>신뢰도</th><th>확장자</th><th>다음 검사기</th><th>읽은 바이트</th><th>상태</th></tr></thead><tbody id="format-probe-results"></tbody></table></div>
     </section>
 
     <section class="action-bar"><div id="message" role="status">Codex를 연결하고 작업 카드를 작성하세요.</div><button id="execute" class="button accent" disabled>새 Codex 스레드에서 실행</button></section>
-
     <section id="run-panel" class="panel run-panel hidden">
-      <div class="panel-title"><span>RUN</span><h2>실행 감시</h2><span id="run-status" class="status">starting</span></div>
+      <div class="panel-title"><span>실행</span><h2>실행 감시</h2><span id="run-status" class="status">시작 중</span></div>
       <div class="metrics five"><div><small>처리 토큰</small><strong id="run-tokens">0 / —</strong></div><div><small>도구 호출</small><strong id="run-tools">0 / —</strong></div><div><small>변경 파일</small><strong id="run-files">0 / —</strong></div><div><small>실패 명령</small><strong id="run-failures">0</strong></div><div><small>모델</small><strong id="run-model">—</strong></div></div>
-      <section id="approvals" class="approvals hidden" aria-live="polite"></section>
-      <div class="event-log" id="events"></div>
-      <button id="interrupt" class="button danger">즉시 종료</button>
+      <section id="approvals" class="approvals hidden" aria-live="polite"></section><div class="event-log" id="events"></div><button id="interrupt" class="button danger">즉시 중단</button>
     </section>
   </main>
   <script src="/static/app.js"></script>

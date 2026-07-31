@@ -18,6 +18,53 @@ let bridgeManualMode = null;
 let currentCatalogSource = null;
 let selectedCatalogEntries = new Set();
 
+const STATUS_LABELS = {
+  UNKNOWN: "확인 전",
+  UNCONFIGURED: "미설정",
+  DISABLED: "비활성",
+  READY: "준비됨",
+  PASSED: "통과",
+  HOLD: "보류",
+  ERROR: "오류",
+  BLOCKED: "차단됨",
+  "FAKE BLOCKED": "가짜 실행 차단",
+  "WSL NOT RUN": "WSL 미실행",
+  SAFE_CANDIDATE: "안전 후보",
+  SAFE_REPRODUCIBLE: "안전 재현 가능",
+  EGRESS_UNCONFIGURED: "외부 통신 미설정",
+  AUTH_UNCONFIGURED: "인증 미설정",
+  AVAILABLE: "사용 가능",
+  LIMITED: "제한됨",
+  DEPLETED: "소진됨",
+  ARMED: "대기 장착",
+  CONSUMED: "소비됨",
+  PREVIEW: "미리보기",
+  NOT_COMPARABLE: "비교 불가",
+  MAPPED: "매핑됨",
+  NOT_CREATED: "생성 전",
+  "NO DATA": "데이터 없음",
+  ACTIVE: "활성",
+  IDLE: "대기",
+  SCANNING: "스캔 중",
+  FAILED: "실패",
+  INTERRUPTED: "중단됨",
+  "NOT STARTED": "시작 전",
+  starting: "시작 중",
+  running: "실행 중",
+  completed: "완료",
+  failed: "실패",
+  interrupted: "중단됨",
+  interrupting: "중단 중",
+};
+
+function statusLabel(value) {
+  return STATUS_LABELS[value] || value || "확인 전";
+}
+
+function countLabel(count, singular, plural = `${singular}들`) {
+  return `${count}${count === 1 ? singular : plural}`;
+}
+
 function say(message, isError = false) {
   const node = $("message");
   node.textContent = message;
@@ -31,7 +78,7 @@ async function api(url, options = {}) {
   });
   const data = await response.json();
   if (!response.ok) {
-    throw new Error(data.detail || "Request failed.");
+    throw new Error(data.detail || "요청에 실패했습니다.");
   }
   return data;
 }
@@ -66,7 +113,7 @@ function loadModels(choices) {
   model.replaceChildren();
 
   if (!choices.length) {
-    model.appendChild(option("", "No models connected", true));
+    model.appendChild(option("", "연결된 모델 없음", true));
     model.disabled = true;
     loadEfforts();
     return;
@@ -87,7 +134,7 @@ function loadEfforts() {
   effort.replaceChildren();
 
   if (!efforts.length) {
-    effort.appendChild(option("", "No supported efforts", true));
+    effort.appendChild(option("", "지원되는 추론 강도 없음", true));
     effort.disabled = true;
     return;
   }
@@ -100,7 +147,7 @@ function loadEfforts() {
 }
 
 function formatReset(value) {
-  if (typeof value !== "number") return "UNKNOWN";
+  if (typeof value !== "number") return "확인 전";
   return new Date(value * 1000).toLocaleString();
 }
 
@@ -116,17 +163,17 @@ function renderAccount(overview) {
   const limits = overview?.rate_limits || {};
   const primary = limits.rateLimits?.primary || null;
   const usage = overview?.usage || {};
-  const used = typeof primary?.usedPercent === "number" ? `${primary.usedPercent}%` : "UNKNOWN";
-  $("account-state").textContent = overview?.account_state || "UNKNOWN";
-  $("account-auth").textContent = `${account.auth_mode || "UNKNOWN"} / ${account.plan_type || "UNKNOWN"}`;
+  const used = typeof primary?.usedPercent === "number" ? `${primary.usedPercent}%` : "확인 전";
+  $("account-state").textContent = statusLabel(overview?.account_state);
+  $("account-auth").textContent = `${account.auth_mode || "확인 전"} / ${account.plan_type || "확인 전"}`;
   $("account-used").textContent = used;
   $("account-reset").textContent = formatReset(primary?.resetsAt);
-  $("account-meta").textContent = `계정 rate-limit: ${limits.status || "UNKNOWN"}; 이메일: ${account.email_masked || "not stored"}; 모델별 잔여량이 아닙니다.`;
+  $("account-meta").textContent = `계정 rate-limit: ${statusLabel(limits.status)}; 이메일: ${account.email_masked || "저장하지 않음"}; 모델별 잔여량이 아닙니다.`;
   const daily = Array.isArray(usage.daily) ? usage.daily : [];
   const tokens = daily.reduce((total, entry) => total + (Number.isFinite(entry.tokens) ? entry.tokens : 0), 0);
   $("usage-meta").textContent = usage.status === "AVAILABLE"
-    ? `일별 토큰 사용량 ${daily.length}일 / ${tokens.toLocaleString()} tokens (일별 요약만 저장)`
-    : "일별 토큰 사용량: UNKNOWN";
+    ? `일별 토큰 사용량 ${daily.length}일 / ${tokens.toLocaleString()}토큰 (일별 요약만 저장)`
+    : "일별 토큰 사용량: 확인 전";
 }
 
 function renderCatalog(entries) {
@@ -135,12 +182,12 @@ function renderCatalog(entries) {
   for (const entry of entries || []) {
     const row = document.createElement("tr");
     appendCell(row, `${entry.display_name || entry.id} (${entry.id})`);
-    appendCell(row, (entry.efforts || []).join(" → ") || "UNKNOWN");
+    appendCell(row, (entry.efforts || []).join(" → ") || "확인 전");
     appendCell(row, (entry.speed_tiers || []).map((tier) => tier.name || tier.id).join(", ") || "—");
     const statusCell = document.createElement("td");
     const select = document.createElement("select");
     for (const state of ["AVAILABLE", "LIMITED", "DEPLETED", "UNKNOWN", "DISABLED"]) {
-      select.appendChild(option(state, state, state === entry.status));
+      select.appendChild(option(state, statusLabel(state), state === entry.status));
     }
     select.onchange = async () => {
       try {
@@ -149,7 +196,7 @@ function renderCatalog(entries) {
           body: JSON.stringify({ status: select.value }),
         });
         renderCatalog(data.model_catalog);
-        say(`Manual model status updated: ${entry.id} → ${select.value}`);
+      say(`모델 ${entry.id}의 수동 상태를 ${statusLabel(select.value)}(으)로 변경했습니다.`);
       } catch (error) {
         select.value = entry.status;
         say(error.message, true);
@@ -179,14 +226,14 @@ function renderRoutePreview(result) {
   const row = document.createElement("tr");
   const recommendation = result.recommendation || {};
   const final = result.final || {};
-  appendCell(row, result.status || "UNKNOWN");
+  appendCell(row, statusLabel(result.status));
   appendCell(row, `${recommendation.model || "—"} / ${recommendation.effort || "—"}`);
-  appendCell(row, final.model ? `${final.model} / ${final.effort}` : "HOLD");
-  appendCell(row, (result.candidate_ladder || []).map((candidate) => `${candidate.model}${candidate.effort ? `/${candidate.effort}` : ""} [${candidate.status}]: ${candidate.selection_reason}`).join("\n") || "—");
-  appendCell(row, [...(result.downgrade_reasons || []), ...(result.hold_reasons || []), ...(result.warnings || [])].join(" ") || "No change.");
+  appendCell(row, final.model ? `${final.model} / ${final.effort}` : "보류");
+  appendCell(row, (result.candidate_ladder || []).map((candidate) => `${candidate.model}${candidate.effort ? `/${candidate.effort}` : ""} [${statusLabel(candidate.status)}]: ${candidate.selection_reason}`).join("\n") || "—");
+  appendCell(row, [...(result.downgrade_reasons || []), ...(result.hold_reasons || []), ...(result.warnings || [])].join(" ") || "변경 없음.");
   const policy = result.policy_input || {};
   const maximum = result.account_usage_evidence?.maximum_used_percent;
-  appendCell(row, `계정 ${result.account_state || "UNKNOWN"}${typeof maximum === "number" ? ` (${maximum}%)` : ""}\n파일 ${policy.file_count ?? "—"}\n테스트 ${policy.has_tests ? "있음" : "없음"}\n${policy.read_only ? "Read Only" : "Write"}`);
+  appendCell(row, `계정 ${statusLabel(result.account_state)}${typeof maximum === "number" ? ` (${maximum}%)` : ""}\n파일 ${policy.file_count ?? "—"}\n테스트 ${policy.has_tests ? "있음" : "없음"}\n${policy.read_only ? "읽기 전용" : "쓰기"}`);
   body.appendChild(row);
   table.append(head, body);
   root.appendChild(table);
@@ -211,7 +258,7 @@ async function previewRouter() {
       }),
     });
     renderRoutePreview(data);
-    say(data.status === "HOLD" ? "Router preview is HOLD; no execution settings changed." : "Router preview generated; execution settings remain unchanged.", data.status === "HOLD");
+    say(data.status === "HOLD" ? "라우터 미리보기가 보류되었습니다. 실행 설정은 변경되지 않았습니다." : "라우터 미리보기를 생성했습니다. 실행 설정은 변경되지 않았습니다.", data.status === "HOLD");
   } catch (error) {
     say(error.message, true);
   }
@@ -219,7 +266,7 @@ async function previewRouter() {
 
 async function connect() {
   try {
-    say("Connecting to Codex app-server...");
+    say("Codex app-server에 연결하는 중입니다…");
     const data = await api("/api/connect", { method: "POST" });
     loadModels(data.choices);
     renderAccount(data.account_usage);
@@ -233,8 +280,8 @@ async function connect() {
     renderCodexProcessCanary(data.codex_process_canary);
     renderTokenLedger(data.token_ledger || {});
     $("connection-dot").classList.add("live");
-    $("connection-text").textContent = `${data.choices.length} models connected`;
-    $("codex-meta").textContent = `${data.codex_version || "version unavailable"} · ${data.codex_path || "path unavailable"}`;
+    $("connection-text").textContent = `${data.choices.length}개 모델 연결됨`;
+    $("codex-meta").textContent = `${data.codex_version || "버전 확인 불가"} · ${data.codex_path || "경로 확인 불가"}`;
     const writeOption = [...$("permission").options].find((option) => option.value === "workspace-write");
     if (writeOption) {
       writeOption.disabled = !data.workspace_write_available;
@@ -246,8 +293,8 @@ async function connect() {
     updateExecuteState();
     say(
       data.workspace_write_available
-        ? "Connected. Workspace Write is ready."
-        : "Connected. Workspace Write remains locked while schema checks are pending.",
+        ? "연결되었습니다. 작업 폴더 쓰기가 준비되었습니다."
+        : "연결되었습니다. 스키마 점검이 끝날 때까지 작업 폴더 쓰기는 잠겨 있습니다.",
       !data.workspace_write_available,
     );
   } catch (error) {
@@ -261,25 +308,25 @@ function planIsExecutable() {
 
 function renderIsolation(result) {
   isolationStatus = result?.status || "UNKNOWN";
-  $("isolation-status").textContent = isolationStatus;
-  let outside = "outside read failed or was not confirmed";
+  $("isolation-status").textContent = statusLabel(isolationStatus);
+  let outside = "외부 읽기가 실패했거나 확인되지 않음";
   if (result?.outside_read_succeeded === true) {
-    outside = "outside read succeeded";
+    outside = "외부 읽기 성공";
   } else if (result?.outside_denied_explicitly === true) {
-    outside = "outside read was explicitly denied";
+    outside = "외부 읽기가 명시적으로 거부됨";
   }
-  const errorCode = result?.error_code ? `; code=${result.error_code}` : "";
-  $("isolation-result").textContent = `${isolationStatus}; ${outside}${errorCode}. Live runs stay locked in this release.`;
+  const errorCode = result?.error_code ? `; 오류 코드=${result.error_code}` : "";
+  $("isolation-result").textContent = `상태: ${statusLabel(isolationStatus)} (${isolationStatus}); ${outside}${errorCode}. 이 버전에서는 실제 실행이 잠겨 있습니다.`;
   updateExecuteState();
 }
 
 function renderWSLIsolation(result) {
   wslIsolationStatus = result?.status || "UNCONFIGURED";
-  $("wsl-isolation-status").textContent = wslIsolationStatus;
+  $("wsl-isolation-status").textContent = statusLabel(wslIsolationStatus);
   if (result?.distro) $("wsl-isolation-distro").value = result.distro;
-  const environmentText = result?.environment_changed ? " Environment changed; cached result was invalidated." : "";
-  const code = result?.error_code ? ` Code: ${result.error_code}.` : "";
-  $("wsl-isolation-result").textContent = `${wslIsolationStatus}.${code}${environmentText} Live runs remain locked in this release.`;
+  const environmentText = result?.environment_changed ? " 환경이 바뀌어 캐시 결과를 무효화했습니다." : "";
+  const code = result?.error_code ? ` 오류 코드: ${result.error_code}.` : "";
+  $("wsl-isolation-result").textContent = `상태: ${statusLabel(wslIsolationStatus)} (${wslIsolationStatus}).${code}${environmentText} 이 버전에서는 실제 실행이 잠겨 있습니다.`;
   updateExecuteState();
   const reproButton = $("run-wsl-isolation-repro");
   if (reproButton) reproButton.disabled = wslIsolationStatus !== "SAFE_CANDIDATE";
@@ -291,7 +338,7 @@ function renderWSLRepro(result) {
   const status = result?.status || "UNKNOWN";
   const completed = Number(result?.completed_runs || 0);
   const success = Number(result?.success_count || 0);
-  node.textContent = `Repeatability: ${success}/${completed || 10} successful; final status ${status}. Live runs remain locked.`;
+  node.textContent = `반복성 점검: ${success}/${completed || 10}회 성공; 최종 상태 ${statusLabel(status)} (${status}). 실제 실행은 잠겨 있습니다.`;
 }
 
 function renderWSLCodexRuntime(result) {
@@ -299,13 +346,13 @@ function renderWSLCodexRuntime(result) {
   const statusNode = $("wsl-runtime-status");
   const detailNode = $("wsl-runtime-result");
   if (!statusNode || !detailNode) return;
-  statusNode.textContent = wslRuntimeStatus;
-  const configured = result?.binary_configured === true ? "configured" : "not configured";
-  const version = result?.version_match === true ? "matches 0.145.0" : "not matched";
-  const isolation = result?.isolation_match === true ? "matches WSL isolation" : "isolation not matched";
-  const fingerprint = result?.runtime_fingerprint ? "recorded" : "not available";
-  const code = result?.error_code ? ` Code: ${result.error_code}.` : "";
-  detailNode.textContent = `Binary ${configured}; version ${version}; runtime fingerprint ${fingerprint}; ${isolation}; egress remains blocked.${code} Codex start stays locked.`;
+  statusNode.textContent = statusLabel(wslRuntimeStatus);
+  const configured = result?.binary_configured === true ? "설정됨" : "설정되지 않음";
+  const version = result?.version_match === true ? "0.145.0 일치" : "불일치";
+  const isolation = result?.isolation_match === true ? "WSL 격리 일치" : "WSL 격리 불일치";
+  const fingerprint = result?.runtime_fingerprint ? "기록됨" : "확인 불가";
+  const code = result?.error_code ? ` 오류 코드: ${result.error_code}.` : "";
+  detailNode.textContent = `바이너리 ${configured}; 버전 ${version}; 런타임 지문 ${fingerprint}; ${isolation}; 외부 통신은 차단되어 있습니다.${code} Codex 시작은 잠겨 있습니다.`;
 }
 
 function renderSealedEgressContract(result) {
@@ -313,15 +360,15 @@ function renderSealedEgressContract(result) {
   const statusNode = $("wsl-egress-status");
   const detailNode = $("wsl-egress-result");
   if (!statusNode || !detailNode) return;
-  statusNode.textContent = wslEgressStatus;
-  const endpoint = result?.endpoint_type || "UNCONFIGURED";
-  const contract = result?.contract_hash ? "recorded" : "not recorded";
+  statusNode.textContent = statusLabel(wslEgressStatus);
+  const endpoint = result?.endpoint_type || "미설정";
+  const contract = result?.contract_hash ? "기록됨" : "기록되지 않음";
   const relay = result?.relay_status || "RELAY_MISSING";
   const broker = result?.broker_status || "BROKER_MISSING";
   const auth = result?.auth_status || "AUTH_UNCONFIGURED";
-  const lifecycle = result?.reused ? " Existing Contract reused." : result?.created ? " New Contract created." : "";
-  const code = result?.error_code ? ` Code: ${result.error_code}.` : "";
-  detailNode.textContent = `Endpoint ${endpoint}; contract hash ${contract}; relay ${relay}; broker ${broker}; auth ${auth}.${lifecycle}${code} Network and Codex start remain locked.`;
+  const lifecycle = result?.reused ? " 기존 계약을 재사용했습니다." : result?.created ? " 새 계약을 생성했습니다." : "";
+  const code = result?.error_code ? ` 오류 코드: ${result.error_code}.` : "";
+  detailNode.textContent = `엔드포인트 ${endpoint}; 계약 해시 ${contract}; 릴레이 ${relay}; 브로커 ${broker}; 인증 ${auth}.${lifecycle}${code} 네트워크와 Codex 시작은 잠겨 있습니다.`;
 }
 
 function renderSealedEgressHarness(result) {
@@ -329,11 +376,11 @@ function renderSealedEgressHarness(result) {
   const statusNode = $("wsl-harness-status");
   const detailNode = $("wsl-harness-result");
   if (!statusNode || !detailNode) return;
-  statusNode.textContent = `FAKE ${wslHarnessStatus}`;
-  const hash = result?.contract_hash ? "immutable contract matched" : "no runnable contract";
-  const resultHash = result?.response_hash ? "deterministic response recorded" : "no response body stored";
-  const code = result?.error_code ? ` Code: ${result.error_code}.` : "";
-  detailNode.textContent = `FAKE ${wslHarnessStatus}; ${hash}; ${resultHash}. This result is never reused as WSL proof.${code}`;
+  statusNode.textContent = `가짜 실행: ${statusLabel(wslHarnessStatus)}`;
+  const hash = result?.contract_hash ? "변경 불가 계약 일치" : "실행 가능한 계약 없음";
+  const resultHash = result?.response_hash ? "결정적 응답 기록됨" : "응답 본문 저장 없음";
+  const code = result?.error_code ? ` 오류 코드: ${result.error_code}.` : "";
+  detailNode.textContent = `가짜 실행 ${statusLabel(wslHarnessStatus)}; ${hash}; ${resultHash}. 이 결과는 실제 WSL 증명으로 재사용하지 않습니다.${code}`;
   const button = $("run-wsl-egress-harness");
   if (button) button.disabled = wslHarnessStatus !== "READY";
 }
@@ -343,15 +390,15 @@ function renderActualWSLEgressHarness(result) {
   const statusNode = $("actual-wsl-harness-status");
   const detailNode = $("actual-wsl-harness-result");
   if (!statusNode || !detailNode) return;
-  statusNode.textContent = `WSL ${actualWSLHarnessStatus}`;
-  const proof = result?.status === "READY" ? "current Canary and Repro proof matched" : "proof or contract not ready";
-  const implementation = result?.runner_implementation_hash ? "runner implementation sealed" : "runner implementation unavailable";
+  statusNode.textContent = `WSL ${statusLabel(actualWSLHarnessStatus)}`;
+  const proof = result?.status === "READY" ? "현재 Canary와 Repro 증명이 일치함" : "증명 또는 계약이 준비되지 않음";
+  const implementation = result?.runner_implementation_hash ? "실행기 구현이 봉인됨" : "실행기 구현 확인 불가";
   const window = result?.execution_window || { status: "DISABLED", remaining_seconds: 0 };
   const windowState = window.status || "DISABLED";
-  const remaining = windowState === "ARMED" ? ` ${window.remaining_seconds || 0}s remaining.` : "";
-  const binding = window.binding_hash ? ` Binding ${window.binding_hash.slice(0, 16)}…` : "";
-  const code = result?.error_code ? ` Code: ${result.error_code}.` : "";
-  detailNode.textContent = `Actual WSL: ${actualWSLHarnessStatus}; ${proof}; ${implementation}. Window ${windowState}.${remaining}${binding}${code} The window authorizes one harness request only; Runtime and live execution stay locked.`;
+  const remaining = windowState === "ARMED" ? ` ${window.remaining_seconds || 0}초 남음.` : "";
+  const binding = window.binding_hash ? ` 바인딩 ${window.binding_hash.slice(0, 16)}…` : "";
+  const code = result?.error_code ? ` 오류 코드: ${result.error_code}.` : "";
+  detailNode.textContent = `실제 WSL: ${statusLabel(actualWSLHarnessStatus)}; ${proof}; ${implementation}. 창 상태 ${statusLabel(windowState)} (${windowState}).${remaining}${binding}${code} 이 창은 하니스 요청 1회만 허용하며 런타임과 실제 실행은 잠겨 있습니다.`;
   const armButton = $("arm-actual-wsl-egress-harness");
   const runButton = $("run-actual-wsl-egress-harness");
   if (armButton) armButton.disabled = result?.status !== "READY" || windowState === "ARMED";
@@ -365,13 +412,13 @@ function renderCodexProcessCanary(result) {
   const status = result?.status || "DISABLED";
   const permit = result?.execution_permit || { status: "DISABLED", remaining_seconds: 0 };
   const window = result?.execution_window || { status: "DISABLED", remaining_seconds: 0 };
-  const permitRemaining = permit.status === "ARMED" ? ` ${permit.remaining_seconds || 0}s remaining.` : "";
-  const remaining = window.status === "ARMED" ? ` ${window.remaining_seconds || 0}s remaining.` : "";
-  const implementation = result?.implementation_hash ? "implementation sealed" : "implementation not runnable";
-  const code = result?.error_code ? ` Code: ${result.error_code}.` : "";
-  statusNode.textContent = status;
+  const permitRemaining = permit.status === "ARMED" ? ` ${permit.remaining_seconds || 0}초 남음.` : "";
+  const remaining = window.status === "ARMED" ? ` ${window.remaining_seconds || 0}초 남음.` : "";
+  const implementation = result?.implementation_hash ? "구현 봉인됨" : "실행 가능한 구현 없음";
+  const code = result?.error_code ? ` 오류 코드: ${result.error_code}.` : "";
+  statusNode.textContent = statusLabel(status);
   const claim = result?.execution_claim || { status: "DISABLED" };
-  detailNode.textContent = `Offline Codex canary ${status}; ${implementation}. Server Permit ${permit.status || "DISABLED"}.${permitRemaining} Canary window ${window.status || "DISABLED"}.${remaining} One-shot claim ${claim.status || "DISABLED"}.${code} One local click performs the complete sealed handoff; external model tokens remain 0 and Runtime/live execution remain locked.`;
+  detailNode.textContent = `오프라인 Codex Canary ${statusLabel(status)}; ${implementation}. 서버 Permit ${statusLabel(permit.status)}.${permitRemaining} Canary 창 ${statusLabel(window.status)}.${remaining} 1회용 청구 ${statusLabel(claim.status)}.${code} 로컬 클릭 한 번으로 봉인된 전달을 완료하며 외부 모델 토큰은 0이고 런타임과 실제 실행은 잠겨 있습니다.`;
   const runButton = $("run-codex-process-canary-one-shot");
   if (runButton) {
     // The integrated endpoint refreshes a near-expiry isolation proof inside
@@ -392,7 +439,7 @@ async function refreshOfflineCodexCanaryReadiness() {
       execution_window: { status: "DISABLED", remaining_seconds: 0 },
       execution_claim: { status: "DISABLED" },
     });
-    if (readiness.reason_code) say("Offline Canary readiness: " + readiness.reason_code + ".", true);
+    if (readiness.reason_code) say("오프라인 Canary 준비 상태: " + readiness.reason_code + ".", true);
   } catch (error) {
     say(error.message, true);
   }
@@ -401,10 +448,10 @@ async function refreshOfflineCodexCanaryReadiness() {
 async function runIsolationProbe() {
   try {
     $("run-isolation-probe").disabled = true;
-    say("Testing app-server read isolation without starting a model turn...");
+    say("모델 턴을 시작하지 않고 app-server 읽기 격리를 점검하는 중입니다…");
     const result = await api("/api/isolation/probe", { method: "POST" });
     renderIsolation(result);
-    say(`Isolation probe recorded: ${result.status}. Live execution remains locked.`, result.status !== "SAFE_CANDIDATE");
+    say(`격리 점검 결과를 기록했습니다: ${statusLabel(result.status)} (${result.status}). 실제 실행은 잠겨 있습니다.`, result.status !== "SAFE_CANDIDATE");
   } catch (error) {
     say(error.message, true);
   } finally {
@@ -419,7 +466,7 @@ async function saveWSLIsolationConfig() {
       body: JSON.stringify({ distro: $("wsl-isolation-distro").value }),
     });
     $("wsl-isolation-distro").value = data.distro;
-    say("WSL distribution saved. Run the fixed bwrap preflight when ready.");
+    say("WSL 배포판을 저장했습니다. 준비되면 고정 bwrap 사전 점검을 실행하세요.");
   } catch (error) {
     say(error.message, true);
   }
@@ -428,7 +475,7 @@ async function saveWSLIsolationConfig() {
 async function runWSLIsolationProbe() {
   try {
     $("run-wsl-isolation-probe").disabled = true;
-    say("Running fixed WSL2+bubblewrap canaries without an app-server or model turn...");
+    say("app-server나 모델 턴 없이 고정 WSL2+bubblewrap 카나리를 실행하는 중입니다…");
     const result = await api("/api/isolation/wsl/probe", { method: "POST" });
     renderWSLIsolation(result);
     // A successful probe is not readiness. Read the current DB-backed
@@ -446,12 +493,12 @@ async function runWSLIsolationProbe() {
       const requiredRemaining = Number(readiness.offline_canary_min_remaining_seconds || 0);
       if (readiness.status !== "READY" || Number(readiness.remaining_seconds || 0) <= requiredRemaining) {
         const detail = readiness.reason_code === "isolation_expiring"
-          ? `issued_at=${readiness.issued_at || "unknown"}, expires_at=${readiness.expires_at || "unknown"}, remaining_seconds=${Number(readiness.remaining_seconds || 0)}`
+          ? `발급 시각=${readiness.issued_at || "확인 불가"}, 만료 시각=${readiness.expires_at || "확인 불가"}, 남은 시간(초)=${Number(readiness.remaining_seconds || 0)}`
           : (readiness.reason_code || readiness.status || "readiness_blocked");
-        say(`Offline Canary readiness blocked: ${detail}.`, true);
+        say(`오프라인 Canary 준비 조건이 차단되었습니다: ${detail}.`, true);
       }
     } else {
-      say(`WSL isolation probe recorded: ${result.status}. Live execution remains locked.`, true);
+      say(`WSL 격리 점검 결과를 기록했습니다: ${statusLabel(result.status)} (${result.status}). 실제 실행은 잠겨 있습니다.`, true);
     }
   } catch (error) {
     say(error.message, true);
@@ -463,10 +510,10 @@ async function runWSLIsolationProbe() {
 async function runWSLIsolationRepro() {
   try {
     $("run-wsl-isolation-repro").disabled = true;
-    say("Running the fixed 10-run WSL check without a model turn...");
+    say("모델 턴 없이 고정 WSL 점검 10회를 실행하는 중입니다…");
     const result = await api("/api/isolation/wsl/repro", { method: "POST" });
     renderWSLRepro(result);
-    say(`WSL repeatability check: ${result.status}. Live execution remains locked.`, result.status !== "SAFE_REPRODUCIBLE");
+    say(`WSL 반복성 점검: ${statusLabel(result.status)} (${result.status}). 실제 실행은 잠겨 있습니다.`, result.status !== "SAFE_REPRODUCIBLE");
   } catch (error) {
     say(error.message, true);
   } finally {
@@ -482,7 +529,7 @@ async function saveWSLCodexRuntimeConfig() {
       body: JSON.stringify({ binary_path: value }),
     });
     $("wsl-runtime-binary").value = "";
-    say("WSL Codex binary selection was saved privately. Validate metadata without starting Codex.");
+    say("WSL Codex 바이너리 선택을 비공개로 저장했습니다. Codex를 시작하지 않고 메타데이터를 검증하세요.");
   } catch (error) {
     say(error.message, true);
   }
@@ -491,10 +538,10 @@ async function saveWSLCodexRuntimeConfig() {
 async function runWSLCodexRuntimePreflight() {
   try {
     $("run-wsl-runtime-preflight").disabled = true;
-    say("Validating the selected WSL binary metadata only; no Codex process will start...");
+    say("선택한 WSL 바이너리의 메타데이터만 검증합니다. Codex 프로세스는 시작하지 않습니다…");
     const result = await api("/api/isolation/wsl/runtime/preflight", { method: "POST" });
     renderWSLCodexRuntime(result);
-    say(`Sealed runtime validation: ${result.status}. Egress and Codex start remain locked.`, result.status !== "EGRESS_UNCONFIGURED");
+    say(`봉인 런타임 검증: ${statusLabel(result.status)} (${result.status}). 외부 통신과 Codex 시작은 잠겨 있습니다.`, result.status !== "EGRESS_UNCONFIGURED");
   } catch (error) {
     say(error.message, true);
   } finally {
@@ -506,9 +553,9 @@ async function createSealedEgressContract() {
   const button = $("create-wsl-egress-contract");
   try {
     button.disabled = true;
-    say("Refreshing the sealed contract preview before creating an immutable instance...");
+    say("변경 불가 인스턴스를 만들기 전에 봉인 계약 미리보기를 새로 확인하는 중입니다…");
     const preview = await api("/api/isolation/wsl/egress-contract/preview");
-    if (!preview.preview_hash) throw new Error(preview.error_code || "contract preview is not ready");
+    if (!preview.preview_hash) throw new Error(preview.error_code || "계약 미리보기가 준비되지 않았습니다.");
     const result = await api("/api/isolation/wsl/egress-contract", {
       method: "POST",
       body: JSON.stringify({ expected_preview_hash: preview.preview_hash }),
@@ -517,8 +564,8 @@ async function createSealedEgressContract() {
     renderSealedEgressHarness(await api("/api/isolation/wsl/egress-harness"));
     renderActualWSLEgressHarness(await api("/api/isolation/wsl/egress-harness/actual"));
     renderCodexProcessCanary(await api("/api/isolation/wsl/codex-process-canary"));
-    const lifecycle = result.reused ? "Existing Contract reused." : result.created ? "New Contract created." : "";
-    say(`Sealed egress contract: ${result.status}. ${lifecycle} Authentication and all starts remain locked.`, result.status !== "AUTH_UNCONFIGURED");
+    const lifecycle = result.reused ? "기존 계약을 재사용했습니다." : result.created ? "새 계약을 생성했습니다." : "";
+    say(`봉인 외부 통신 계약: ${statusLabel(result.status)} (${result.status}). ${lifecycle} 인증과 모든 시작은 잠겨 있습니다.`, result.status !== "AUTH_UNCONFIGURED");
   } catch (error) {
     say(error.message, true);
   } finally {
@@ -530,7 +577,7 @@ async function armActualWSLEgressHarness() {
   try {
     actualWSLHarnessArm = await api("/api/isolation/wsl/egress-harness/actual/arm", { method: "POST" });
     renderActualWSLEgressHarness(await api("/api/isolation/wsl/egress-harness/actual"));
-    say("A two-minute, one-time WSL harness window is armed locally. The next actual harness request consumes both capabilities.");
+    say("2분짜리 1회용 WSL 하니스 창을 로컬에서 열었습니다. 다음 실제 하니스 요청이 두 capability를 모두 소비합니다.");
   } catch (error) {
     actualWSLHarnessArm = null;
     say(error.message, true);
@@ -564,7 +611,7 @@ async function runOfflineCodexOneShot() {
   try {
     const result = await api("/api/isolation/wsl/codex-process-canary/execute-one-shot", { method: "POST", headers: {} });
     renderCodexProcessCanary(result);
-    say("Offline Canary completed once; external model tokens remain 0.");
+    say("오프라인 Canary를 1회 완료했습니다. 외부 모델 토큰은 계속 0입니다.");
   } catch (error) {
     // The server has already consumed or aborted its internal capabilities;
     // never re-enable this one-shot button after any response.
@@ -576,10 +623,10 @@ async function runSealedEgressHarness() {
   const button = $("run-wsl-egress-harness");
   try {
     button.disabled = true;
-    say("Running the deterministic in-memory harness only; the Phase 3 WSL runner is not selected, so no WSL, socket, network, Codex, or model process starts...");
+    say("결정적 인메모리 하니스만 실행합니다. 3단계 WSL 실행기는 선택되지 않았으므로 WSL, 소켓, 네트워크, Codex, 모델 프로세스는 시작하지 않습니다…");
     const result = await api("/api/isolation/wsl/egress-harness", { method: "POST" });
     renderSealedEgressHarness(result);
-    say(`Sealed egress fake harness: ${result.status}. Authentication and every live start remain locked.`, result.status !== "PASSED");
+    say(`봉인 외부 통신 가짜 하니스: ${statusLabel(result.status)} (${result.status}). 인증과 모든 실제 시작은 잠겨 있습니다.`, result.status !== "PASSED");
   } catch (error) {
     say(error.message, true);
   } finally {
@@ -593,23 +640,23 @@ function updateExecuteState() {
 
 function resetCapsule() {
   currentCapsule = null;
-  $("capsule-status").textContent = "NOT CREATED";
+  $("capsule-status").textContent = "생성 전";
   $("capsule-files").textContent = "0";
-  $("capsule-size").textContent = "0 bytes";
-  $("capsule-ranges").textContent = "None";
+  $("capsule-size").textContent = "0바이트";
+  $("capsule-ranges").textContent = "없음";
   $("capsule-reasons").textContent = "";
   $("create-capsule").disabled = !currentPlan;
 }
 
 function renderCapsule(capsule) {
   currentCapsule = capsule;
-  $("capsule-status").textContent = capsule.status || "UNKNOWN";
+  $("capsule-status").textContent = statusLabel(capsule.status);
   $("capsule-files").textContent = String(capsule.file_count || 0);
-  $("capsule-size").textContent = `${Number(capsule.total_bytes || 0).toLocaleString()} bytes`;
+  $("capsule-size").textContent = `${Number(capsule.total_bytes || 0).toLocaleString()}바이트`;
   const ranges = capsule.ranges || [];
   $("capsule-ranges").textContent = ranges.length
     ? ranges.map((entry) => `${entry.path}:${entry.start_line}-${entry.end_line}`).join(", ")
-    : "None";
+    : "없음";
   $("capsule-reasons").textContent = (capsule.hold_reasons || []).join("\n");
   $("create-capsule").disabled = !currentPlan;
 }
@@ -625,21 +672,21 @@ function invalidateRoutePlan() {
 function renderRoutePlan(plan) {
   currentPlan = plan;
   $("route-plan").classList.remove("hidden");
-  $("plan-status").textContent = plan.status;
+  $("plan-status").textContent = statusLabel(plan.status);
   $("plan-id").textContent = plan.plan_id;
   $("plan-hash").textContent = plan.decision_hash;
   $("plan-expiry").textContent = new Date(plan.expires_at).toLocaleString();
-  $("plan-final").textContent = plan.final ? `${plan.final.model} / ${plan.final.effort}` : "HOLD";
+  $("plan-final").textContent = plan.final ? `${plan.final.model} / ${plan.final.effort}` : "보류";
   $("plan-budget").textContent = plan.budget
-    ? `${plan.budget_level} · ${Number(plan.budget.tokens).toLocaleString()} tokens / ${plan.budget.tools} tools / ${plan.budget.changed_files} files`
+    ? `${plan.budget_level} · ${Number(plan.budget.tokens).toLocaleString()}토큰 / ${plan.budget.tools}개 도구 / ${plan.budget.changed_files}개 파일`
     : "—";
   $("planned-budget").value = plan.budget
-    ? `${plan.budget_level} · ${Number(plan.budget.tokens).toLocaleString()} tokens`
-    : "HOLD";
-  $("plan-scope").textContent = `${plan.planned_file_count} exact files`;
+    ? `${plan.budget_level} · ${Number(plan.budget.tokens).toLocaleString()}토큰`
+    : "보류";
+  $("plan-scope").textContent = `${plan.planned_file_count}개 파일(정확히 지정됨)`;
   const evidence = plan.validation_evidence || {};
   $("plan-validation").textContent =
-    `commands=${Boolean(evidence.validation_commands_present)}, local_target=${Boolean(evidence.local_test_target_exists)}`;
+    `검증 명령=${Boolean(evidence.validation_commands_present)}, 로컬 대상=${Boolean(evidence.local_test_target_exists)}`;
   $("plan-reasons").textContent = (plan.hold_reasons || []).join("\n");
   resetCapsule();
   updateExecuteState();
@@ -647,20 +694,20 @@ function renderRoutePlan(plan) {
   const delay = Math.max(0, Date.parse(plan.expires_at) - Date.now());
   planExpiryTimer = setTimeout(() => {
     updateExecuteState();
-    say("Route Plan expired. Create a new plan before execution.", true);
+    say("Route Plan이 만료되었습니다. 실행 전에 새 계획을 생성하세요.", true);
   }, Math.min(delay + 50, 2_147_483_647));
 }
 
 async function createCapsule() {
   try {
     if (!currentPlan) {
-      throw new Error("Create a Route Plan before creating an Evidence Capsule.");
+      throw new Error("증거 캡슐을 만들기 전에 Route Plan을 생성하세요.");
     }
-    say("Creating bounded Evidence Capsule...");
+    say("제한된 증거 캡슐을 생성하는 중입니다…");
     const capsule = await api(`/api/route-plans/${encodeURIComponent(currentPlan.plan_id)}/capsule`, { method: "POST" });
     renderCapsule(capsule);
     say(
-      capsule.status === "READY" ? "Evidence Capsule created without starting Codex." : "Evidence Capsule is HOLD or INVALID.",
+      capsule.status === "READY" ? "Codex를 시작하지 않고 증거 캡슐을 생성했습니다." : "증거 캡슐이 보류 또는 무효 상태입니다.",
       capsule.status !== "READY",
     );
   } catch (error) {
@@ -680,17 +727,17 @@ async function createRoutePlan() {
       permission: $("permission").value,
       explicit_ultra_approval: $("router-ultra-approval").checked,
     };
-    say("Creating immutable Route Plan...");
+    say("변경 불가 Route Plan을 생성하는 중입니다…");
     const plan = await api("/api/route-plans", { method: "POST", body: JSON.stringify(payload) });
     renderRoutePlan(plan);
     renderRoutePreview(plan.route_preview);
     say(
-      plan.status === "PREVIEW" ? "Route Plan created. Live execution remains locked in this release." : "Route Plan is HOLD.",
+      plan.status === "PREVIEW" ? "Route Plan을 생성했습니다. 이 버전에서는 실제 실행이 계속 잠겨 있습니다." : "Route Plan이 보류 상태입니다.",
       plan.status !== "PREVIEW",
     );
   } catch (error) {
     invalidateRoutePlan();
-    say(error.message.includes("JSON") ? "The decision JSON is invalid." : error.message, true);
+    say(error.message.includes("JSON") ? "결정 JSON이 올바르지 않습니다." : error.message, true);
   }
 }
 
@@ -704,10 +751,10 @@ async function makePreflight() {
     const data = await api("/api/preflight", { method: "POST", body: JSON.stringify(payload) });
     $("risk").textContent = data.risk;
     $("file-count").textContent = data.candidate_files;
-    $("context").textContent = `${data.estimated_context.toLocaleString()} tokens`;
-    $("git-status").textContent = `Git: ${data.git_status}`;
+    $("context").textContent = `${data.estimated_context.toLocaleString()}토큰`;
+    $("git-status").textContent = `Git 상태: ${data.git_status}`;
     $("web-packet").value = data.web_packet;
-    say("Preflight packet generated.");
+    say("사전 분석 패킷을 생성했습니다.");
   } catch (error) {
     say(error.message, true);
   }
@@ -716,9 +763,9 @@ async function makePreflight() {
 async function copyPacket() {
   try {
     await navigator.clipboard.writeText($("web-packet").value);
-    say("Preflight packet copied to clipboard.");
+    say("사전 분석 패킷을 클립보드에 복사했습니다.");
   } catch {
-    say("Clipboard copy is unavailable in this browser.", true);
+    say("이 브라우저에서는 클립보드 복사를 사용할 수 없습니다.", true);
   }
 }
 
@@ -737,15 +784,15 @@ function renderApprovalCard(approval) {
   card.className = "approval-card";
 
   const title = document.createElement("h3");
-  title.textContent = `Approval request · ${approval.kind}`;
+  title.textContent = `승인 요청 · ${approval.kind}`;
 
   const dl = document.createElement("dl");
   const pairs = [
-    ["Command", approval.command || "—"],
-    ["CWD", approval.cwd || "—"],
-    ["Files", (approval.paths || []).join(", ") || "—"],
-    ["Reason", approval.reason || "—"],
-    ["Permissions", approval.permissions ? JSON.stringify(approval.permissions, null, 2) : "—"],
+    ["명령", approval.command || "—"],
+    ["작업 폴더", approval.cwd || "—"],
+    ["파일", (approval.paths || []).join(", ") || "—"],
+    ["사유", approval.reason || "—"],
+    ["권한", approval.permissions ? JSON.stringify(approval.permissions, null, 2) : "—"],
   ];
   for (const [labelText, valueText] of pairs) {
     const label = document.createElement("dt");
@@ -758,10 +805,10 @@ function renderApprovalCard(approval) {
   const actions = document.createElement("div");
   actions.className = "approval-actions";
   const labels = {
-    accept: "Allow once",
-    acceptForSession: "Allow session",
-    decline: "Decline",
-    cancel: "Cancel",
+    accept: "이번 한 번 허용",
+    acceptForSession: "이 세션 동안 허용",
+    decline: "거부",
+    cancel: "취소",
   };
   const decisions = ["accept", "acceptForSession", "decline", "cancel"].filter((decision) =>
     (approval.available_decisions || []).includes(decision),
@@ -793,13 +840,13 @@ function renderApprovals(approvals) {
 function renderRun(run) {
   currentRun = run;
   $("run-panel").classList.remove("hidden");
-  $("run-status").textContent = run.status;
+  $("run-status").textContent = statusLabel(run.status);
   $("run-tokens").textContent = `${run.tokens.toLocaleString()} / ${run.budget.tokens.toLocaleString()}`;
   $("run-tools").textContent = `${run.tool_calls} / ${run.budget.tools}`;
   $("run-files").textContent = `${run.changed_files.length} / ${run.budget.changed_files}`;
-  $("run-failures").textContent = `${run.failed_commands} cmd / ${run.failed_tests} test`;
+  $("run-failures").textContent = `${run.failed_commands}개 명령 / ${run.failed_tests}개 테스트`;
   $("run-model").textContent = `${run.model} / ${run.effort}`;
-  $("events").textContent = run.events.join("\n") || "Waiting for events...";
+  $("events").textContent = run.events.join("\n") || "이벤트를 기다리는 중…";
   $("interrupt").disabled = !["running", "starting", "interrupting"].includes(run.status);
   renderApprovals(run.approvals || []);
   refreshTokenLedger().catch(() => {});
@@ -812,7 +859,7 @@ async function answerApproval(requestId, decision) {
       method: "POST",
       body: JSON.stringify({ decision }),
     });
-    say(`Approval reply sent: ${decision}`);
+    say(`승인 응답을 보냈습니다: ${decision}`);
   } catch (error) {
     say(error.message, true);
   }
@@ -824,7 +871,7 @@ function watch(runId) {
   stream.addEventListener("run", (event) => renderRun(JSON.parse(event.data)));
   stream.onerror = () => {
     if (currentRun && !["completed", "failed", "interrupted"].includes(currentRun.status)) {
-      say("Connection to the event stream was interrupted.", true);
+      say("이벤트 스트림 연결이 끊겼습니다.", true);
     }
   };
 }
@@ -832,20 +879,20 @@ function watch(runId) {
 async function execute() {
   try {
     if (!planIsExecutable()) {
-      throw new Error("Live execution remains locked in this release.");
+      throw new Error("이 버전에서는 실제 실행이 잠겨 있습니다.");
     }
     const payload = {
       route_plan_id: currentPlan.plan_id,
     };
-    say("Creating Codex run...");
+    say("Codex 실행을 생성하는 중입니다…");
     const run = await api("/api/run", { method: "POST", body: JSON.stringify(payload) });
     renderRun(run);
     watch(run.id);
     currentPlan.used = true;
     updateExecuteState();
-    say("Run started.");
+    say("실행을 시작했습니다.");
   } catch (error) {
-    say(error.message.includes("JSON") ? "The decision JSON is invalid." : error.message, true);
+    say(error.message.includes("JSON") ? "결정 JSON이 올바르지 않습니다." : error.message, true);
   }
 }
 
@@ -873,7 +920,7 @@ async function startBridge() {
     });
     bridgeManualMode = null;
     renderBridge(bridge);
-    say("Bridge task created. Copy the architecture packet.");
+    say("브리지 작업을 생성했습니다. 아키텍처 패킷을 복사하세요.");
   } catch (error) {
     say(error.message, true);
   }
@@ -892,11 +939,11 @@ async function copyBridgePacket() {
       const tab = window.open(bridge.chat_url, "_blank", "noopener");
       if (tab) tab.opener = null;
     }
-    say("Packet copied. The configured Web GPT URL was opened in a new tab.");
+    say("패킷을 복사했고 설정된 웹 GPT URL을 새 탭에서 열었습니다.");
   } catch {
     bridgeManualMode = "mark-copied";
     renderBridge(currentBridge);
-    say("Clipboard copy failed. Copy the collapsed packet manually, then confirm.", true);
+    say("클립보드 복사에 실패했습니다. 접힌 패킷을 직접 복사한 뒤 확인하세요.", true);
   }
 }
 
@@ -910,7 +957,7 @@ async function importBridgeResponse() {
     } catch {
       bridgeManualMode = "import";
       renderBridge(currentBridge);
-      say("Clipboard read failed. Paste the response packet into the manual field.", true);
+      say("클립보드 읽기에 실패했습니다. 수동 입력란에 응답 패킷을 붙여넣으세요.", true);
       return;
     }
   }
@@ -920,7 +967,7 @@ async function importBridgeResponse() {
   $("bridge-manual-response").value = "";
   bridgeManualMode = null;
   renderBridge(bridge);
-  say("Web GPT response validated and recorded.");
+  say("웹 GPT 응답을 검증하고 기록했습니다.");
 }
 
 async function prepareBridgeReview() {
@@ -930,7 +977,7 @@ async function prepareBridgeReview() {
     method: "POST", body: JSON.stringify({ result, validation }),
   });
   renderBridge(bridge);
-  say("Review packet is ready to copy.");
+  say("검토 패킷을 복사할 준비가 되었습니다.");
 }
 
 async function bridgeAction() {
@@ -958,26 +1005,26 @@ async function bridgeAction() {
         renderBridge(await api(`/api/bridge/tasks/${encodeURIComponent(currentBridge.task_id)}/restart`, { method: "POST" }));
         break;
       default:
-        throw new Error("Bridge action is unavailable.");
+        throw new Error("현재 브리지 작업을 사용할 수 없습니다.");
     }
   } catch (error) {
-    say(error.message.includes("JSON") ? "Bridge result and validation must be valid JSON." : error.message, true);
+    say(error.message.includes("JSON") ? "브리지 결과와 검증 내용은 올바른 JSON이어야 합니다." : error.message, true);
   }
 }
 
 function bridgePresentation(bridge) {
   const actions = {
-    copy_architect_request: ["Local -> Web GPT", "ARCHITECT_REQUEST", "Copy the architecture packet.", "Import the response.", "send"],
-    import_architect_response: ["Web GPT -> Local", "ARCHITECT_RESPONSE", "Import the architecture response.", "The app validates it locally.", "receive"],
-    prepare_review_request: ["Local -> Local", "REVIEW_REQUEST", "Enter actual result and validation.", "Copy the review packet.", "auto"],
-    processing_response: ["Web GPT -> Local", bridge?.packet_type || "-", "The pasted response is being validated locally.", "Wait for the updated snapshot.", "auto"],
-    prepare_evidence: ["Local -> Local", "EVIDENCE_REQUIRED", "Map each request to an exact project-relative file and collect it.", "A new ARCHITECT_REQUEST is enabled when required evidence is ready.", "auto"],
-    copy_review_request: ["Local -> Web GPT", "REVIEW_REQUEST", "Copy the review packet.", "Import the review response.", "send"],
-    import_review_response: ["Web GPT -> Local", "REVIEW_RESPONSE", "Import the review response.", "The app records the verdict.", "receive"],
-    restart: ["Local -> Web GPT", "ARCHITECT_REQUEST", "Start a new architecture cycle.", "A fresh nonce and Route Plan are required.", bridge.status === "SUCCESS" ? "done" : "hold"],
-    restart_required: ["Local", "v1", "This v1 task cannot be converted.", "Start a new v2 Bridge task.", "hold"],
+    copy_architect_request: ["로컬 → 웹 GPT", "ARCHITECT_REQUEST", "아키텍처 패킷을 복사하세요.", "응답을 가져오세요.", "send"],
+    import_architect_response: ["웹 GPT → 로컬", "ARCHITECT_RESPONSE", "아키텍처 응답을 가져오세요.", "앱이 로컬에서 검증합니다.", "receive"],
+    prepare_review_request: ["로컬 → 로컬", "REVIEW_REQUEST", "실제 결과와 검증 내용을 입력하세요.", "검토 패킷을 복사하세요.", "auto"],
+    processing_response: ["웹 GPT → 로컬", bridge?.packet_type || "-", "붙여넣은 응답을 로컬에서 검증하는 중입니다.", "업데이트된 상태를 기다리세요.", "auto"],
+    prepare_evidence: ["로컬 → 로컬", "EVIDENCE_REQUIRED", "각 요청을 프로젝트 상대 경로의 정확한 파일에 매핑하고 수집하세요.", "필수 증거가 준비되면 새 ARCHITECT_REQUEST가 활성화됩니다.", "auto"],
+    copy_review_request: ["로컬 → 웹 GPT", "REVIEW_REQUEST", "검토 패킷을 복사하세요.", "검토 응답을 가져오세요.", "send"],
+    import_review_response: ["웹 GPT → 로컬", "REVIEW_RESPONSE", "검토 응답을 가져오세요.", "앱이 판정을 기록합니다.", "receive"],
+    restart: ["로컬 → 웹 GPT", "ARCHITECT_REQUEST", "새 아키텍처 사이클을 시작하세요.", "새 nonce와 Route Plan이 필요합니다.", bridge.status === "SUCCESS" ? "done" : "hold"],
+    restart_required: ["로컬", "v1", "이 v1 작업은 변환할 수 없습니다.", "새 v2 브리지 작업을 시작하세요.", "hold"],
   };
-  return actions[bridge?.active_action] || ["Local", "-", "No action is available.", "Start a new Bridge task.", "idle"];
+  return actions[bridge?.active_action] || ["로컬", "-", "사용 가능한 작업이 없습니다.", "새 브리지 작업을 시작하세요.", "idle"];
 }
 
 function renderBridgeEvidence(bridge) {
@@ -993,11 +1040,11 @@ function renderBridgeEvidence(bridge) {
     const why = document.createElement("p");
     why.textContent = request.reason;
     const input = document.createElement("input");
-    input.type = "text"; input.placeholder = "Project-relative file path"; input.value = request.mapped_path || "";
+    input.type = "text"; input.placeholder = "프로젝트 상대 경로"; input.value = request.mapped_path || "";
     const map = document.createElement("button");
-    map.type = "button"; map.className = "button ghost"; map.textContent = "Map local file";
+    map.type = "button"; map.className = "button ghost"; map.textContent = "로컬 파일 매핑";
     const collect = document.createElement("button");
-    collect.type = "button"; collect.className = "button"; collect.textContent = "Collect safe summary";
+    collect.type = "button"; collect.className = "button"; collect.textContent = "안전한 요약 수집";
     map.onclick = async () => {
       try { renderBridge(await api(`/api/bridge/tasks/${encodeURIComponent(bridge.task_id)}/evidence/${encodeURIComponent(request.request_id)}/map`, {method:"POST", body: JSON.stringify({path: input.value})})); } catch (error) { say(error.message, true); }
     };
@@ -1006,7 +1053,7 @@ function renderBridgeEvidence(bridge) {
       try { renderBridge(await api(`/api/bridge/tasks/${encodeURIComponent(bridge.task_id)}/evidence/${encodeURIComponent(request.request_id)}/collect`, {method:"POST"})); } catch (error) { say(error.message, true); }
     };
     const status = document.createElement("small");
-    status.textContent = request.error_reason || (request.required ? "Required evidence" : "Optional evidence");
+    status.textContent = request.error_reason || (request.required ? "필수 증거" : "선택 증거");
     card.append(title, why, input, map, collect, status); panel.appendChild(card);
   }
 }
@@ -1016,15 +1063,15 @@ function renderBridge(bridge) {
   const start = $("bridge-start");
   const action = $("bridge-action");
   if (!bridge) {
-    $("bridge-status").textContent = "NOT STARTED";
+    $("bridge-status").textContent = "시작 전";
     $("bridge-status").className = "status bridge-flag idle";
     $("bridge-phase").textContent = "-";
-    $("bridge-source").textContent = "Local";
-    $("bridge-destination").textContent = "Web GPT";
+    $("bridge-source").textContent = "로컬";
+    $("bridge-destination").textContent = "웹 GPT";
     $("bridge-type").textContent = "-";
-    $("bridge-now").textContent = "Start a Bridge task.";
-    $("bridge-next").textContent = "Copy the architecture packet.";
-    $("bridge-message").textContent = "No Bridge task is active.";
+    $("bridge-now").textContent = "브리지 작업을 시작하세요.";
+    $("bridge-next").textContent = "아키텍처 패킷을 복사하세요.";
+    $("bridge-message").textContent = "진행 중인 브리지 작업이 없습니다.";
     start.disabled = false; start.classList.remove("hidden"); action.disabled = true; action.classList.add("hidden");
     $("bridge-review-fields").classList.add("hidden");
     $("bridge-evidence").classList.add("hidden");
@@ -1032,23 +1079,23 @@ function renderBridge(bridge) {
   }
   const [direction, type, now, next, color] = bridgePresentation(bridge);
   const [source, destination] = direction.split(" -> ");
-  $("bridge-status").textContent = bridge.status;
+  $("bridge-status").textContent = statusLabel(bridge.status);
   $("bridge-status").className = `status bridge-flag ${color}`;
   $("bridge-phase").textContent = bridge.phase || "-";
-  $("bridge-source").textContent = source || "Local";
-  $("bridge-destination").textContent = destination || "Local";
+  $("bridge-source").textContent = source || "로컬";
+  $("bridge-destination").textContent = destination || "로컬";
   $("bridge-type").textContent = type;
   $("bridge-now").textContent = now;
   $("bridge-next").textContent = next;
   $("bridge-message").textContent = bridge.restart_required
-    ? "Protocol v1 is restart-required and was not converted."
+    ? "프로토콜 v1은 재시작이 필요하며 변환되지 않았습니다."
     : bridge.active_action === "processing_response"
-      ? "The pasted response is being validated locally."
-      : bridge.hold_reason || (bridge.requested_evidence?.length ? `Requested evidence: ${bridge.requested_evidence.map((item) => item.label || item).join("; ")}` : "Only the displayed action is enabled.");
+      ? "붙여넣은 응답을 로컬에서 검증하는 중입니다."
+      : bridge.hold_reason || (bridge.requested_evidence?.length ? `요청된 증거: ${bridge.requested_evidence.map((item) => item.label || item).join("; ")}` : "화면에 표시된 작업만 활성화되어 있습니다.");
   start.disabled = true; start.classList.add("hidden"); action.classList.remove("hidden");
   action.disabled = ["prepare_evidence", "restart_required", "processing_response"].includes(bridge.active_action);
-  const labels = {copy_architect_request:"Copy architecture packet", import_architect_response: bridgeManualMode === "import" ? "Import pasted architecture response" : "Read and import architecture response", prepare_review_request:"Create review packet from local result", processing_response:"Processing response", prepare_evidence:"Prepare required evidence below", copy_review_request:"Copy review packet", import_review_response: bridgeManualMode === "import" ? "Import pasted review response" : "Read and import review response", restart:"Start a new architecture cycle", restart_required:"Start a new v2 Bridge task"};
-  action.textContent = bridgeManualMode === "mark-copied" ? "Mark packet copied manually" : labels[bridge.active_action] || "Unavailable";
+  const labels = {copy_architect_request:"아키텍처 패킷 복사", import_architect_response: bridgeManualMode === "import" ? "붙여넣은 아키텍처 응답 가져오기" : "아키텍처 응답 읽고 가져오기", prepare_review_request:"로컬 결과로 검토 패킷 생성", processing_response:"응답 처리 중", prepare_evidence:"아래 필수 증거 준비", copy_review_request:"검토 패킷 복사", import_review_response: bridgeManualMode === "import" ? "붙여넣은 검토 응답 가져오기" : "검토 응답 읽고 가져오기", restart:"새 아키텍처 사이클 시작", restart_required:"새 v2 브리지 작업 시작"};
+  action.textContent = bridgeManualMode === "mark-copied" ? "패킷을 수동으로 복사 완료 표시" : labels[bridge.active_action] || "사용할 수 없음";
   $("bridge-review-fields").classList.toggle("hidden", bridge.active_action !== "prepare_review_request");
   $("bridge-manual-response").classList.toggle("hidden", bridgeManualMode !== "import");
   $("bridge-packet-details").classList.toggle("hidden", bridge.active_action === "processing_response");
@@ -1067,9 +1114,9 @@ async function restoreBridge() {
   try {
     const data = await api("/api/bridge/tasks/recent");
     const tasks = data.tasks || [];
-    $("bridge-recent").textContent = tasks.length ? `Recovered ${tasks.length} active Bridge task(s); latest is shown.` : "No unfinished Bridge task to recover.";
+    $("bridge-recent").textContent = tasks.length ? `진행 중인 브리지 작업 ${tasks.length}개를 복구했습니다. 최신 작업을 표시합니다.` : "복구할 미완료 브리지 작업이 없습니다.";
     if (data.latest) { bridgeManualMode = null; renderBridge(data.latest); await showBridgePacket(data.latest.task_id); }
-  } catch { $("bridge-recent").textContent = "Bridge recovery is unavailable."; }
+  } catch { $("bridge-recent").textContent = "브리지 복구를 사용할 수 없습니다."; }
 }
 
 function renderCatalogEntries(entries) {
@@ -1111,8 +1158,8 @@ async function refreshCatalogEntries() {
 
 function renderCatalogScan(scan) {
   const metrics = scan.metrics || {};
-  $("catalog-scan-status").textContent = scan.status;
-  $("catalog-progress").textContent = `${currentCatalogSource?.alias || "Source"}: ${metrics.files_seen || 0} files, ${metrics.bytes_indexed || 0} indexed bytes, ${metrics.content_bytes_read || 0} content bytes read; added ${metrics.added || 0}, modified ${metrics.modified || 0}, missing ${metrics.missing || 0}, rejected ${metrics.rejected || 0}.`;
+  $("catalog-scan-status").textContent = statusLabel(scan.status);
+  $("catalog-progress").textContent = `${currentCatalogSource?.alias || "원본"}: 파일 ${metrics.files_seen || 0}개, 색인 바이트 ${metrics.bytes_indexed || 0}, 읽은 본문 바이트 ${metrics.content_bytes_read || 0}; 추가 ${metrics.added || 0}, 수정 ${metrics.modified || 0}, 누락 ${metrics.missing || 0}, 거부 ${metrics.rejected || 0}.`;
   $("catalog-scan").disabled = false;
   $("catalog-resume").disabled = scan.status !== "INTERRUPTED";
   $("catalog-cancel").disabled = true;
@@ -1122,8 +1169,8 @@ function updateCatalogProbeButton() {
   const count = selectedCatalogEntries.size;
   $("catalog-probe").disabled = !currentCatalogSource || count === 0 || count > 50;
   $("catalog-probe-summary").textContent = count
-    ? `${count} catalog entr${count === 1 ? "y" : "ies"} selected. Probe reads limited header/sample bytes only and never returns an absolute path.`
-    : "Select up to 50 catalog entries. Phase 2 samples only limited file regions and never parses the whole file.";
+    ? `카탈로그 항목 ${count}개를 선택했습니다. 점검은 제한된 헤더/샘플 바이트만 읽으며 절대 경로를 반환하지 않습니다.`
+    : "카탈로그 항목을 최대 50개 선택하세요. 2단계에서는 파일의 제한된 영역만 샘플링하며 전체 파일을 분석하지 않습니다.";
 }
 
 function renderFormatProbeResults(results) {
@@ -1151,7 +1198,7 @@ async function registerCatalogSource() {
     selectedCatalogEntries = new Set();
     $("catalog-scan").disabled = false;
     $("catalog-resume").disabled = true;
-    $("catalog-progress").textContent = `${source.alias} is registered. Its local path remains private.`;
+    $("catalog-progress").textContent = `${source.alias} 원본을 등록했습니다. 로컬 경로는 비공개로 유지됩니다.`;
     renderCatalogEntries([]);
     renderFormatProbeResults([]);
   } catch (error) { say(error.message, true); }
@@ -1163,19 +1210,19 @@ async function scanCatalog(resume = false) {
     $("catalog-scan").disabled = true;
     $("catalog-resume").disabled = true;
     $("catalog-cancel").disabled = false;
-    $("catalog-scan-status").textContent = "SCANNING";
+    $("catalog-scan-status").textContent = "스캔 중";
     const action = resume ? "resume" : "scan";
     const scan = await api(`/api/catalog/sources/${encodeURIComponent(currentCatalogSource.source_id)}/${action}`, {method: "POST", body: JSON.stringify({})});
     renderCatalogScan(scan);
     await refreshCatalogEntries();
-  } catch (error) { $("catalog-scan-status").textContent = "FAILED"; $("catalog-scan").disabled = false; say(error.message, true); }
+  } catch (error) { $("catalog-scan-status").textContent = "실패"; $("catalog-scan").disabled = false; say(error.message, true); }
 }
 
 async function cancelCatalog() {
   if (!currentCatalogSource) return;
   try {
     await api(`/api/catalog/sources/${encodeURIComponent(currentCatalogSource.source_id)}/cancel`, {method: "POST"});
-    $("catalog-progress").textContent = "Cancellation requested; the current metadata batch will finish safely.";
+    $("catalog-progress").textContent = "취소를 요청했습니다. 현재 메타데이터 묶음을 안전하게 마무리합니다.";
   } catch (error) { say(error.message, true); }
 }
 
@@ -1188,7 +1235,7 @@ async function runFormatProbe() {
       body: JSON.stringify({catalog_entry_ids: Array.from(selectedCatalogEntries).slice(0, 50)}),
     });
     renderFormatProbeResults(data.results || []);
-    say(`Format probe completed for ${(data.results || []).length} catalog entr${(data.results || []).length === 1 ? "y" : "ies"}.`);
+    say(`카탈로그 항목 ${(data.results || []).length}개의 형식 점검을 완료했습니다.`);
   } catch (error) {
     say(error.message, true);
   } finally {
@@ -1204,15 +1251,15 @@ function formatLedgerCount(value) {
 function formatLedgerValue(record) {
   if (!record) return "?";
   const processed = typeof record.processed_tokens === "number" ? record.processed_tokens.toLocaleString() : "?";
-  const quality = record.quality || "UNKNOWN";
+  const quality = record.quality || "확인 전";
   return `${processed} (${quality})`;
 }
 
 function renderTokenLedger(report) {
   const summary = report?.summary || {};
   const usage = report?.usage_totals || {};
-  $("ledger-summary-status").textContent = summary.comparison_count ? "ACTIVE" : "NO DATA";
-  $("ledger-summary-message").textContent = summary.message || "?? ?? ?? ???";
+  $("ledger-summary-status").textContent = summary.comparison_count ? "활성" : "데이터 없음";
+  $("ledger-summary-message").textContent = summary.message || "비교 가능한 절감 데이터가 없습니다.";
   $("ledger-baseline-processed").textContent = formatLedgerCount(report?.baselines?.[0]?.processed_tokens);
   $("ledger-actual-processed").textContent = formatLedgerCount(report?.runs?.[0]?.processed_tokens);
   $("ledger-processed-savings").textContent = summary.comparable_count ? String(report?.comparisons?.[0]?.processed_savings ?? "?") : "?";
@@ -1224,7 +1271,7 @@ function renderTokenLedger(report) {
   for (const comparison of report?.comparisons || []) {
     const row = document.createElement("tr");
     appendCell(row, comparison.comparison_key || "?");
-    appendCell(row, comparison.status || "NOT_COMPARABLE");
+    appendCell(row, statusLabel(comparison.status || "NOT_COMPARABLE"));
     const baseline = document.createElement("td");
     baseline.textContent = formatLedgerValue(comparison.baseline);
     baseline.className = `ledger-quality ${(comparison.baseline?.quality || "").toLowerCase()}`;
@@ -1239,7 +1286,7 @@ function renderTokenLedger(report) {
     body.appendChild(row);
   }
   if (usage.web_packet_bytes || usage.evidence_bytes || usage.catalog_source_bytes || usage.probe_bytes) {
-    $("ledger-summary-message").textContent = `${summary.message || "?? ?? ?? ???"} Bridge=${usage.web_packet_bytes || 0} Evidence=${usage.evidence_bytes || 0} Catalog=${usage.catalog_source_bytes || 0} Probe=${usage.probe_bytes || 0}`;
+    $("ledger-summary-message").textContent = `${summary.message || "비교 가능한 절감 데이터가 없습니다."} 브리지=${usage.web_packet_bytes || 0}, 증거=${usage.evidence_bytes || 0}, 카탈로그=${usage.catalog_source_bytes || 0}, 점검=${usage.probe_bytes || 0}`;
   }
 }
 
@@ -1248,7 +1295,7 @@ async function refreshTokenLedger() {
     const report = await api("/api/token-ledger/report");
     renderTokenLedger(report);
   } catch (error) {
-    $("ledger-summary-status").textContent = "ERROR";
+    $("ledger-summary-status").textContent = "오류";
     $("ledger-summary-message").textContent = error.message;
   }
 }
@@ -1260,7 +1307,7 @@ async function importTokenLedgerBaseline() {
       body: $("ledger-baseline-input").value,
     });
     renderTokenLedger(report.token_ledger || report);
-    say("Token ledger baseline imported.");
+    say("토큰 원장 기준선을 가져왔습니다.");
   } catch (error) {
     say(error.message, true);
   }
@@ -1272,7 +1319,7 @@ async function exportTokenLedger(format) {
       headers: { "Content-Type": "application/json" },
     });
     const text = await response.text();
-    if (!response.ok) throw new Error(text || "Export failed");
+    if (!response.ok) throw new Error(text || "내보내기에 실패했습니다.");
     const mime = format === "markdown" ? "text/markdown" : "application/json";
     const blob = new Blob([text], { type: `${mime};charset=utf-8` });
     const url = URL.createObjectURL(blob);
