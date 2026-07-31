@@ -272,6 +272,17 @@ tool_fingerprint = compute_tool_fingerprint
 cache_key = compute_cache_key
 
 
+def _remaining_seconds(expires_at: Any) -> int:
+    """Return a sanitized, integer freshness window for a stored result."""
+    try:
+        expiry = datetime.fromisoformat(str(expires_at))
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        return max(0, int((expiry - _now()).total_seconds()))
+    except (TypeError, ValueError):
+        return 0
+
+
 def public_result(result: dict[str, Any]) -> dict[str, Any]:
     """Return only redacted state; paths, canaries, commands, and raw output never leave memory."""
     fields = (
@@ -279,6 +290,7 @@ def public_result(result: dict[str, Any]) -> dict[str, Any]:
         "tool_fingerprint", "cache_key", "probe_version", "environment_changed", "error_code", "inside_read_succeeded",
         "outside_data_denied", "host_mount_denied", "capsule_write_denied",
         "tmp_write_succeeded", "network_denied", "local_duration_ms", "reused",
+        "result_id", "actual_probe_executed", "probe_request_count", "remaining_seconds",
     )
     return {field: result.get(field) for field in fields if field in result}
 
@@ -345,7 +357,9 @@ class WSLBubblewrapIsolation:
                 cache_key=current_cache_key,
             )
             if self._reusable(cached, config_hash, tool_fingerprint_value, current_cache_key, minimum_remaining):
-                return {**cached, "reused": True, "environment_changed": False}
+                return {**cached, "reused": True, "actual_probe_executed": False, "probe_request_count": 1,
+                        "remaining_seconds": _remaining_seconds(cached.get("expires_at")),
+                        "environment_changed": False}
         elif not preflight.get("ok"):
             result = self._base_result(
                 status=UNAVAILABLE if preflight.get("error_code") in {"wsl_unavailable", "distro_unavailable", "python_unavailable", "bwrap_unavailable", "distro_query_error", "command_unavailable"} else ERROR,
@@ -359,6 +373,9 @@ class WSLBubblewrapIsolation:
             result["preflight_duration_ms"] = preflight_duration_ms
             result["environment_changed"] = True
             result["reused"] = False
+            result["actual_probe_executed"] = False
+            result["probe_request_count"] = 1
+            result["remaining_seconds"] = _remaining_seconds(result.get("expires_at"))
             # A preflight failure is not a canary result.  Keep any legacy
             # UNAVAILABLE row untouched and expose only this sanitized attempt.
             return result
@@ -372,7 +389,9 @@ class WSLBubblewrapIsolation:
                 cache_key=current_cache_key,
             )
             if self._reusable(cached, config_hash, tool_fingerprint_value, current_cache_key, minimum_remaining):
-                return {**cached, "reused": True, "environment_changed": False}
+                return {**cached, "reused": True, "actual_probe_executed": False, "probe_request_count": 1,
+                        "remaining_seconds": _remaining_seconds(cached.get("expires_at")),
+                        "environment_changed": False}
             started = time.monotonic()
             probing = self._base_result(
                 status=PROBING,
@@ -404,9 +423,55 @@ class WSLBubblewrapIsolation:
             result["tool_versions"] = tool_versions
             result["environment_changed"] = bool(cached.get("status") == "UNCONFIGURED")
             result["reused"] = False
+            result["actual_probe_executed"] = True
+            result["probe_request_count"] = 1
+            result["remaining_seconds"] = _remaining_seconds(result.get("expires_at"))
             saved = self.store.save_wsl_isolation_result(result)
             self.store.record_wsl_isolation_probe_ledger(saved)
             return saved
+
+    async def ensure_fresh_isolation_for_offline_canary(self) -> dict[str, Any]:
+        """Ensure the integrated Offline Canary request has a fresh proof.
+
+        The freshness threshold is sealed server policy.  A near-expiry row is
+        never returned as a cache hit: ``probe`` serializes concurrent refreshes
+        and this method reads the singleton row again after the transaction so
+        callers cannot continue on a stale read.
+        """
+        before = self.store.wsl_isolation_result()
+        before_id = before.get("result_id") if isinstance(before, dict) else None
+        probed = await self.probe(offline_canary_refresh=True)
+        latest = self.store.wsl_isolation_result()
+        actual = bool(probed.get("actual_probe_executed"))
+        if actual:
+            latest_id = latest.get("result_id") if isinstance(latest, dict) else None
+            if not isinstance(latest_id, str) or (before_id and latest_id == before_id):
+                raise PolicyError("isolation_stale_read")
+        if not isinstance(latest, dict) or actual and latest.get("result_id") != probed.get("result_id"):
+            raise PolicyError("isolation_stale_read")
+        remaining = _remaining_seconds(latest.get("expires_at"))
+        reused = bool(probed.get("reused"))
+        if not reused and probed.get("status") != SAFE_CANDIDATE:
+            raise PolicyError(str(probed.get("error_code") or "isolation_not_safe_candidate"))
+        result = {
+            "status": latest.get("status"),
+            "error_code": latest.get("error_code"),
+            "config_hash": latest.get("config_hash"),
+            "tool_fingerprint": latest.get("tool_fingerprint"),
+            "cache_key": latest.get("cache_key"),
+            "result_id": latest.get("result_id"),
+            "issued_at": latest.get("checked_at"),
+            "expires_at": latest.get("expires_at"),
+            "remaining_seconds": remaining,
+            "reused": reused,
+            "actual_probe_executed": actual,
+            "probe_request_count": 1,
+        }
+        if latest.get("status") != SAFE_CANDIDATE:
+            raise PolicyError(str(latest.get("error_code") or "isolation_not_safe_candidate"))
+        if remaining < OFFLINE_CANARY_MIN_REMAINING_SECONDS:
+            raise PolicyError("isolation_expiring")
+        return result
 
     def _base_result(
         self,
@@ -420,6 +485,7 @@ class WSLBubblewrapIsolation:
     ) -> dict[str, Any]:
         checked = _now()
         return {
+            "result_id": str(uuid.uuid4()),
             "backend": WSL2_BWRAP,
             "distro": distro,
             "status": status,

@@ -374,8 +374,11 @@ function renderCodexProcessCanary(result) {
   detailNode.textContent = `Offline Codex canary ${status}; ${implementation}. Server Permit ${permit.status || "DISABLED"}.${permitRemaining} Canary window ${window.status || "DISABLED"}.${remaining} One-shot claim ${claim.status || "DISABLED"}.${code} One local click performs the complete sealed handoff; external model tokens remain 0 and Runtime/live execution remain locked.`;
   const runButton = $("run-codex-process-canary-one-shot");
   if (runButton) {
-    runButton.disabled = result?.permit_ready !== true
-      || (result?.readiness !== true && !["READY", "DISABLED"].includes(status));
+    // The integrated endpoint refreshes a near-expiry isolation proof inside
+    // the same server handoff.  Keep other blocked reasons fail-closed.
+    const refreshableIsolation = result?.reason_code === "isolation_expiring";
+    runButton.disabled = !refreshableIsolation && (result?.permit_ready !== true
+      || (result?.readiness !== true && !["READY", "DISABLED"].includes(status)));
   }
 }
 
@@ -559,7 +562,7 @@ async function runOfflineCodexOneShot() {
   const button = $("run-codex-process-canary-one-shot");
   if (button) button.disabled = true;
   try {
-    const result = await api("/api/isolation/wsl/codex-process-canary/execute-one-shot", { method: "POST" });
+    const result = await api("/api/isolation/wsl/codex-process-canary/execute-one-shot", { method: "POST", headers: {} });
     renderCodexProcessCanary(result);
     say("Offline Canary completed once; external model tokens remain 0.");
   } catch (error) {

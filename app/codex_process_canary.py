@@ -30,7 +30,7 @@ from .codex_process_executor_wsl import (
     build_sealed_codex_argv,
     compute_executor_implementation,
 )
-from .codex_wire_contract import WIRE_CONTRACT_HASH, WIRE_CONTRACT_STATUS, fixture_stream_hash
+from .codex_wire_contract import WIRE_CONTRACT_HASH, WIRE_CONTRACT_STATUS, full_turn_fixture_hash
 from .egress_contract import (
     AUTH_UNCONFIGURED, BROKER_REQUEST_PATH, LOOPBACK_HOST, LOOPBACK_PORT,
     canonical_provider_toml, provider_config_hash, validate_sealed_execution_proof,
@@ -64,7 +64,7 @@ def _digest(value: bytes | str) -> str:
 
 
 EXPECTED_REQUEST_HASH = SEALED_REQUEST_HASH
-EXPECTED_RESPONSE_HASH = fixture_stream_hash()
+EXPECTED_RESPONSE_HASH = full_turn_fixture_hash()
 EXPECTED_CONFIG_HASH = provider_config_hash(canonical_provider_toml())
 EXPECTED_PROMPT_HASH = _digest(FIXED_PROMPT)
 EXPECTED_OUTPUT_HASH = _digest(SUCCESS_MARKER)
@@ -127,6 +127,37 @@ class CanaryExecution:
     stderr_bytes: int
     local_processes: int
     marker: str | None
+    request_seen: int = 0
+    request_validated: int = 0
+    response_sent: int = 0
+    accepted_post: int = 0
+    response_byte_count: int = 0
+    event_types: tuple[str, ...] = ()
+    event_counts: Mapping[str, int] | None = None
+    event_sequence_hash: str | None = None
+    tool_event_count: int = 0
+    agent_message_count: int = 0
+    output_byte_count: int = 0
+    output_sha256: str | None = None
+    last_message_exists: bool = False
+    last_message_regular: bool = False
+    last_message_size: int = 0
+    last_message_sha256: str | None = None
+    last_message_match: bool = False
+    last_message_marker_match: bool = False
+    marker_match: bool = False
+    stdout_eof: bool = False
+    stderr_eof: bool = False
+    readers_joined: bool = False
+    codex_exit_code: int | None = None
+    strict_http_reject_reason: str | None = None
+    request_header_count: int = 0
+    request_body_bytes: int = 0
+    request_body_sha256: str | None = None
+    request_json_keyset_hash: str | None = None
+    input_shape: Mapping[str, Any] | None = None
+    stderr_sha256: str | None = None
+    stderr_category: str | None = None
     tool_calls: int = 0
     second_requests: int = 0
     websockets: int = 0
@@ -138,6 +169,8 @@ class CanaryExecution:
     retries: int = 0
     reroutes: int = 0
     sensitive_headers_removed: bool = True
+    removed_count: int = 0
+    post_filter_count: int = 0
     process_terminated: bool = True
     resources_cleaned: bool = True
     runner_kind: str = CANARY_RUNNER_KIND
@@ -302,6 +335,10 @@ class FakeCodexProcessCanaryRunner:
             await asyncio.sleep(self.delay_seconds)
         return CanaryExecution(
             request_count=self.request_count,
+            request_seen=1 if self.request_count == 1 else 0,
+            request_validated=1 if self.request_count == 1 else 0,
+            response_sent=1 if self.request_count == 1 else 0,
+            accepted_post=1 if self.request_count == 1 else 0,
             request_hash=EXPECTED_REQUEST_HASH,
             response_hash=EXPECTED_RESPONSE_HASH,
             config_hash=EXPECTED_CONFIG_HASH,
@@ -314,6 +351,16 @@ class FakeCodexProcessCanaryRunner:
             marker=self.marker,
             output_hash=EXPECTED_OUTPUT_HASH,
             marker_verified=True,
+            agent_message_count=1,
+            output_byte_count=len(SUCCESS_MARKER.encode("utf-8")),
+            output_sha256=EXPECTED_OUTPUT_HASH,
+            last_message_exists=True,
+            last_message_regular=True,
+            last_message_size=len(SUCCESS_MARKER.encode("utf-8")),
+            last_message_sha256=EXPECTED_OUTPUT_HASH,
+            last_message_match=True,
+            last_message_marker_match=True,
+            marker_match=True,
             tool_calls=self.tool_calls,
             second_requests=self.second_requests,
             websockets=self.websockets,
@@ -373,8 +420,11 @@ def public_canary_result(result: Mapping[str, Any] | None) -> dict[str, Any]:
         return {"status": DISABLED, "start_allowed": False, "error_code": "canary_not_run"}
     fields = (
         "canary_id", "contract_hash", "status", "started_at", "finished_at", "error_code",
-        "request_count", "request_hash", "response_hash", "config_hash", "prompt_hash",
-        "expected_output_hash", "output_hash", "sensitive_headers_removed", "marker_verified", "exit_code", "output_bytes", "local_processes",
+        "request_count", "request_seen", "request_validated", "response_sent", "accepted_post", "request_hash", "response_hash", "config_hash", "prompt_hash",
+        "expected_output_hash", "output_hash", "sensitive_headers_removed", "removed_count", "post_filter_count", "marker_verified", "exit_code", "output_bytes", "local_processes",
+        "agent_message_count", "output_byte_count", "output_sha256",
+        "last_message_exists", "last_message_regular", "last_message_size", "last_message_sha256",
+        "last_message_match", "last_message_marker_match", "marker_match",
         "stdout_bytes", "stderr_bytes", "stage", "cleanup_ok", "legacy_error",
         "local_duration_ms", "runner_kind", "runner_version", "runner_implementation_hash",
         "implementation_hash", "reused", "start_allowed",
@@ -708,15 +758,23 @@ class SealedOfflineCodexProcessCanary:
         running = {
             "canary_id": str(uuid.uuid4()), "contract_hash": binding["contract_hash"], "binding_hash": binding["binding_hash"],
             "status": RUNNING, "started_at": started_at, "finished_at": None, "error_code": None,
-            "request_count": 0, "request_hash": None, "response_hash": None, "config_hash": binding["config_hash"],
+            "request_count": 0, "request_seen": 0, "request_validated": 0, "response_sent": 0, "accepted_post": 0,
+            "request_hash": None, "response_hash": None, "config_hash": binding["config_hash"],
             "prompt_hash": EXPECTED_PROMPT_HASH, "expected_output_hash": EXPECTED_OUTPUT_HASH,
             "exit_code": None, "output_bytes": 0, "local_processes": 0, "local_duration_ms": 0,
             "stdout_bytes": 0, "stderr_bytes": 0, "stage": "BOOT", "cleanup_ok": None,
-            "output_hash": None, "sensitive_headers_removed": False, "marker_verified": False,
+            "output_hash": None, "sensitive_headers_removed": False, "removed_count": 0, "post_filter_count": 0, "marker_verified": False,
             "supervisor_processes": 0, "bwrap_processes": 0, "codex_processes": 0,
             "runner_kind": runner_kind, "runner_version": runner_version,
             "runner_implementation_hash": runner_implementation_hash, "implementation_hash": runner_implementation_hash,
             "start_allowed": False,
+            "strict_http_reject_reason": None, "request_header_count": 0, "request_body_bytes": 0,
+            "request_body_sha256": hashlib.sha256(b"").hexdigest(), "request_json_keyset_hash": None,
+            "input_shape": None,
+            "agent_message_count": 0, "output_byte_count": 0, "output_sha256": None,
+            "last_message_exists": False, "last_message_regular": False, "last_message_size": 0,
+            "last_message_sha256": None, "last_message_match": False,
+            "last_message_marker_match": False, "marker_match": False,
         }
         self.store.begin_codex_process_canary(running)
         began = time.monotonic()
@@ -749,12 +807,24 @@ class SealedOfflineCodexProcessCanary:
                 exc.codex_processes = execution.codex_processes
                 raise
             result = {
-                **running, "status": PASSED, "request_count": execution.request_count,
+                **running, "status": PASSED, "request_count": execution.accepted_post,
+                "request_seen": execution.request_seen, "request_validated": execution.request_validated,
+                "response_sent": execution.response_sent, "accepted_post": execution.accepted_post,
                 "request_hash": execution.request_hash, "response_hash": execution.response_hash,
                 "config_hash": execution.config_hash, "prompt_hash": execution.prompt_hash,
                 "expected_output_hash": execution.expected_output_hash, "exit_code": execution.exit_code,
                 "output_hash": execution.output_hash, "sensitive_headers_removed": execution.sensitive_headers_removed,
+                "removed_count": execution.removed_count, "post_filter_count": execution.post_filter_count,
                 "marker_verified": execution.marker_verified,
+                "agent_message_count": execution.agent_message_count,
+                "output_byte_count": execution.output_byte_count, "output_sha256": execution.output_sha256,
+                "last_message_exists": execution.last_message_exists,
+                "last_message_regular": execution.last_message_regular,
+                "last_message_size": execution.last_message_size,
+                "last_message_sha256": execution.last_message_sha256,
+                "last_message_match": execution.last_message_match,
+                "last_message_marker_match": execution.last_message_marker_match,
+                "marker_match": execution.marker_match,
                 "output_bytes": execution.stdout_bytes + execution.stderr_bytes, "local_processes": execution.local_processes,
                 "supervisor_processes": execution.supervisor_processes, "bwrap_processes": execution.bwrap_processes,
                 "codex_processes": execution.codex_processes,
@@ -775,6 +845,7 @@ class SealedOfflineCodexProcessCanary:
                 "canary_request_policy_violation", "canary_tool_policy_violation", "canary_model_policy_violation",
                 "canary_websocket_policy_violation", "canary_header_policy_violation", "canary_implementation_mismatch",
                 "actual_runner_policy_violation", "supervisor_implementation_mismatch", "supervisor_policy_violation",
+                "tool_event_policy_violation",
             } else ERROR
             result = {**running, **observed_counts, "status": status, "error_code": code if code in {
                 "canary_timeout", "canary_output_limit", "canary_marker_invalid", "canary_process_exit_nonzero",
@@ -782,24 +853,101 @@ class SealedOfflineCodexProcessCanary:
                 "canary_tool_policy_violation", "canary_model_policy_violation", "canary_websocket_policy_violation",
                 "canary_header_policy_violation",
                 "canary_implementation_mismatch", "canary_runner_identity_mismatch",
-                "actual_runner_policy_violation",
+                "actual_runner_policy_violation", "tool_event_policy_violation",
             } else (code if isinstance(code, str) and len(code) <= 80 and code.replace("_", "").isalnum() else "canary_policy_error"),
                 "stage": getattr(exc, "stage", None) or running.get("stage"),
                 "substage": getattr(exc, "substage", None),
                 "cleanup_ok": getattr(exc, "cleanup_ok", None), "stdout_bytes": getattr(exc, "stdout_bytes", 0),
                 "stderr_bytes": getattr(exc, "stderr_bytes", 0), "exit_code": getattr(exc, "exit_code", None),
+                "request_seen": int(getattr(exc, "request_seen", 0) or 0),
+                "request_validated": int(getattr(exc, "request_validated", 0) or 0),
+                "response_sent": int(getattr(exc, "response_sent", 0) or 0),
+                "accepted_post": int(getattr(exc, "accepted_post", 0) or 0),
+                "request_count": int(getattr(exc, "accepted_post", 0) or 0),
+                "request_hash": getattr(exc, "request_hash", None),
+                "sensitive_headers_removed": bool(getattr(exc, "sensitive_headers_removed", False)),
+                "removed_count": int(getattr(exc, "removed_count", 0) or 0),
+                "post_filter_count": int(getattr(exc, "post_filter_count", 0) or 0),
+                "response_hash": getattr(exc, "response_hash", None),
+                "strict_http_reject_reason": getattr(exc, "strict_http_reject_reason", None),
+                "request_header_count": int(getattr(exc, "request_header_count", 0) or 0),
+                "request_body_bytes": int(getattr(exc, "request_body_bytes", 0) or 0),
+                "request_body_sha256": getattr(exc, "request_body_sha256", None),
+                "request_json_keyset_hash": getattr(exc, "request_json_keyset_hash", None),
+                "input_shape": getattr(exc, "input_shape", None),
+                "output_hash": getattr(exc, "output_hash", None),
+                "marker_verified": bool(getattr(exc, "marker_match", False)),
+                "agent_message_count": int(getattr(exc, "agent_message_count", 0) or 0),
+                "output_byte_count": int(getattr(exc, "output_byte_count", 0) or 0),
+                "output_sha256": getattr(exc, "output_sha256", None),
+                "last_message_exists": bool(getattr(exc, "last_message_exists", False)),
+                "last_message_regular": bool(getattr(exc, "last_message_regular", False)),
+                "last_message_size": int(getattr(exc, "last_message_size", 0) or 0),
+                "last_message_sha256": getattr(exc, "last_message_sha256", None),
+                "last_message_match": bool(getattr(exc, "last_message_match", False)),
+                "last_message_marker_match": bool(getattr(exc, "last_message_marker_match", False)),
+                "marker_match": bool(getattr(exc, "marker_match", False)),
                 "output_bytes": int(getattr(exc, "stdout_bytes", 0) or 0) + int(getattr(exc, "stderr_bytes", 0) or 0)}
             delay = getattr(exc, "connection_delay_ms", None)
             category = getattr(exc, "child_exit_category", None)
             if isinstance(delay, int) and delay >= 0:
                 transient_diagnostic["connection_delay_ms"] = delay
-            if category in {"CODEX_HOME_WRITE_FAILED", "ARG0_INIT_FAILED", "CONFIG_LOAD_FAILED", "AUTH_REQUIRED", "CLI_USAGE_ERROR", "CHILD_EXIT_OTHER"}:
-                transient_diagnostic["child_exit_category"] = category
+            if category in {
+                "CODEX_HOME_WRITE_FAILED", "ARG0_INIT_FAILED", "CONFIG_LOAD_FAILED", "AUTH_REQUIRED",
+                "CLI_USAGE_ERROR", "STRICT_CONFIG_ERROR", "CONFIG_INVALID", "PROVIDER_MISSING",
+                "AUTH_ENV_MISSING", "CHILD_EXIT_OTHER",
+            }:
+                transient_diagnostic["stderr_category"] = category
+            transient_diagnostic.update({
+                "event_types": list(getattr(exc, "event_types", ()) or ()),
+                "event_counts": dict(getattr(exc, "event_counts", {}) or {}),
+                "event_sequence_hash": getattr(exc, "event_sequence_hash", None),
+                "tool_event_count": int(getattr(exc, "tool_event_count", 0) or 0),
+                "agent_message_count": int(getattr(exc, "agent_message_count", 0) or 0),
+                "output_byte_count": int(getattr(exc, "output_byte_count", 0) or 0),
+                "output_sha256": getattr(exc, "output_sha256", None),
+                "accepted_post": int(getattr(exc, "accepted_post", 0) or 0),
+                "response_byte_count": int(getattr(exc, "response_byte_count", 0) or 0),
+                "last_message": {
+                    "exists": bool(getattr(exc, "last_message_exists", False)),
+                    "regular": bool(getattr(exc, "last_message_regular", False)),
+                    "size": int(getattr(exc, "last_message_size", 0) or 0),
+                    "sha256": getattr(exc, "last_message_sha256", None),
+                    "match": bool(getattr(exc, "last_message_match", False)),
+                    "marker_match": bool(getattr(exc, "last_message_marker_match", False)),
+                },
+                "marker_match": bool(getattr(exc, "marker_match", False)),
+                "stdout_eof": bool(getattr(exc, "stdout_eof", False)),
+                "stderr_eof": bool(getattr(exc, "stderr_eof", False)),
+                "readers_joined": bool(getattr(exc, "readers_joined", False)),
+                "codex_exit_code": getattr(exc, "codex_exit_code", None),
+                "stderr_sha256": getattr(exc, "stderr_sha256", None),
+                "input_shape": getattr(exc, "input_shape", None),
+            })
         except Exception:
             result = {**running, "status": ERROR, "error_code": "canary_error", "stage": "BOOT", "cleanup_ok": False}
         if execution is not None:
             result.update({
-                "request_count": execution.request_count,
+                "request_count": execution.accepted_post,
+                "request_seen": execution.request_seen, "request_validated": execution.request_validated,
+                "response_sent": execution.response_sent, "accepted_post": execution.accepted_post,
+                "request_hash": execution.request_hash, "response_hash": execution.response_hash,
+                "strict_http_reject_reason": execution.strict_http_reject_reason,
+                "request_header_count": execution.request_header_count,
+                "request_body_bytes": execution.request_body_bytes,
+                "request_body_sha256": execution.request_body_sha256,
+                "request_json_keyset_hash": execution.request_json_keyset_hash,
+                "input_shape": execution.input_shape,
+                "agent_message_count": execution.agent_message_count,
+                "output_byte_count": execution.output_byte_count,
+                "output_sha256": execution.output_sha256,
+                "last_message_exists": execution.last_message_exists,
+                "last_message_regular": execution.last_message_regular,
+                "last_message_size": execution.last_message_size,
+                "last_message_sha256": execution.last_message_sha256,
+                "last_message_match": execution.last_message_match,
+                "last_message_marker_match": execution.last_message_marker_match,
+                "marker_match": execution.marker_match,
                 "output_bytes": execution.stdout_bytes + execution.stderr_bytes,
                 "local_processes": execution.local_processes,
                 "supervisor_processes": execution.supervisor_processes,
@@ -811,7 +959,35 @@ class SealedOfflineCodexProcessCanary:
                 "substage": execution.supervisor_substage or result.get("substage"),
                 "cleanup_ok": execution.cleanup_ok if execution.cleanup_ok is not None else execution.resources_cleaned,
                 "output_hash": execution.output_hash, "sensitive_headers_removed": execution.sensitive_headers_removed,
+                "removed_count": execution.removed_count, "post_filter_count": execution.post_filter_count,
                 "marker_verified": execution.marker_verified,
+            })
+            transient_diagnostic.update({
+                "event_types": list(execution.event_types),
+                "event_counts": dict(execution.event_counts or {}),
+                "event_sequence_hash": execution.event_sequence_hash,
+                "tool_event_count": execution.tool_event_count,
+                "agent_message_count": execution.agent_message_count,
+                "output_byte_count": execution.output_byte_count,
+                "output_sha256": execution.output_sha256,
+                "accepted_post": execution.accepted_post,
+                "response_byte_count": execution.response_byte_count,
+                "last_message": {
+                    "exists": execution.last_message_exists,
+                    "regular": execution.last_message_regular,
+                    "size": execution.last_message_size,
+                    "sha256": execution.last_message_sha256,
+                    "match": execution.last_message_match,
+                    "marker_match": execution.last_message_marker_match,
+                },
+                "marker_match": execution.marker_match,
+                "stdout_eof": execution.stdout_eof,
+                "stderr_eof": execution.stderr_eof,
+                "readers_joined": execution.readers_joined,
+                "codex_exit_code": execution.codex_exit_code,
+                "stderr_sha256": execution.stderr_sha256,
+                "stderr_category": execution.stderr_category,
+                "input_shape": execution.input_shape,
             })
         result = {
             **result, "finished_at": _now(), "local_duration_ms": max(0, round((time.monotonic() - began) * 1000)),
@@ -819,6 +995,7 @@ class SealedOfflineCodexProcessCanary:
         }
         persistable = dict(result)
         persistable.pop("substage", None)
+        persistable["request_count"] = int(persistable.get("accepted_post") or 0)
         saved = self.store.finish_codex_process_canary(persistable)
         ledger_source = "LOCAL_ESTIMATE" if bool(getattr(active_runner, "is_fake", False)) else "LOCAL_OBSERVED"
         ledger_quality = "ESTIMATED" if ledger_source == "LOCAL_ESTIMATE" else "OBSERVED"
@@ -842,7 +1019,8 @@ class SealedOfflineCodexProcessCanary:
             raise PolicyError("canary_exit_invalid" if bool(getattr(active_runner, "is_fake", False)) else "canary_process_exit_nonzero")
         observed_marker = execution.marker == SUCCESS_MARKER or (
             not bool(getattr(active_runner, "is_fake", False))
-            and execution.marker_verified and execution.output_hash == EXPECTED_OUTPUT_HASH
+            and execution.marker_verified and execution.marker_match
+            and execution.output_hash == EXPECTED_OUTPUT_HASH
         )
         if not observed_marker:
             raise PolicyError("canary_marker_invalid" if bool(getattr(active_runner, "is_fake", False)) else "canary_marker_mismatch")
@@ -850,22 +1028,32 @@ class SealedOfflineCodexProcessCanary:
             raise PolicyError("canary_process_termination_failed")
         if not execution.resources_cleaned:
             raise PolicyError("canary_resource_cleanup_failed")
-        if execution.request_count != 1 or execution.second_requests != 0:
+        if (
+            execution.request_count != execution.accepted_post or execution.request_count != 1
+            or execution.request_seen != 1 or execution.request_validated != 1
+            or execution.response_sent != 1 or execution.accepted_post != 1 or execution.second_requests != 0
+        ):
             raise PolicyError("canary_request_policy_violation")
         if execution.websockets != 0:
             raise PolicyError("canary_websocket_policy_violation")
         if execution.different_models != 0:
             raise PolicyError("canary_model_policy_violation")
         if any(getattr(execution, field) != 0 for field in (
-            "tool_calls", "command_executions", "file_changes", "network_tools", "subagents", "retries", "reroutes",
+            "tool_calls", "tool_event_count", "command_executions", "file_changes", "network_tools",
+            "subagents", "retries", "reroutes",
         )):
             raise PolicyError("canary_tool_policy_violation")
         if not execution.sensitive_headers_removed:
             raise PolicyError("canary_header_policy_violation")
-        if not all(_is_hash(getattr(execution, field)) for field in ("request_hash", "response_hash", "config_hash", "prompt_hash", "expected_output_hash", "output_hash")):
+        if execution.post_filter_count != 0 or execution.removed_count < 0:
+            raise PolicyError("canary_header_policy_violation")
+        if not all(_is_hash(getattr(execution, field)) for field in (
+            "request_hash", "response_hash", "config_hash", "prompt_hash", "expected_output_hash",
+            "output_hash", "output_sha256", "last_message_sha256",
+        )):
             raise PolicyError("canary_request_policy_violation")
         if (
-            execution.request_hash != EXPECTED_REQUEST_HASH or execution.response_hash != EXPECTED_RESPONSE_HASH
+            execution.response_hash != EXPECTED_RESPONSE_HASH
             or execution.config_hash != EXPECTED_CONFIG_HASH or execution.prompt_hash != EXPECTED_PROMPT_HASH
             or execution.expected_output_hash != EXPECTED_OUTPUT_HASH
         ):
@@ -874,6 +1062,23 @@ class SealedOfflineCodexProcessCanary:
             if (
                 (execution.supervisor_processes, execution.bwrap_processes, execution.codex_processes) != (1, 2, 1)
                 or execution.local_processes != 4 or execution.output_hash != EXPECTED_OUTPUT_HASH
+                or execution.output_sha256 != EXPECTED_OUTPUT_HASH
+                or execution.agent_message_count != 1
+                or execution.output_byte_count != len(SUCCESS_MARKER.encode("utf-8"))
+                or execution.event_counts is None
+                or execution.event_counts.get("thread.started") != 1
+                or execution.event_counts.get("turn.started") != 1
+                or execution.event_counts.get("item.completed", 0) < 1
+                or execution.event_counts.get("turn.completed") != 1
+                or not execution.stdout_eof or not execution.stderr_eof
+                or not execution.readers_joined
+                or execution.response_byte_count <= 0
+                or execution.codex_exit_code != 0
+                or not execution.last_message_exists or not execution.last_message_regular
+                or execution.last_message_sha256 != EXPECTED_OUTPUT_HASH
+                or not execution.last_message_match
+                or not execution.last_message_marker_match
+                or not execution.marker_match
             ):
                 raise PolicyError("canary_success_proof_invalid")
 
@@ -891,9 +1096,10 @@ class CodexCanaryExecutionPermitGate:
 
     PERMIT_TTL_SECONDS = 120
 
-    def __init__(self, store, service: SealedOfflineCodexProcessCanary):
+    def __init__(self, store, service: SealedOfflineCodexProcessCanary, isolation_service=None):
         self.store = store
         self.service = service
+        self.isolation_service = isolation_service
         self._permit_lock = asyncio.Lock()
         self._one_shot_lock = asyncio.Lock()
 
@@ -960,6 +1166,9 @@ class CodexCanaryExecutionPermitGate:
         window_nonce: str | None = None
         permit_id: str | None = None
         try:
+            freshness: dict[str, Any] | None = None
+            if self.isolation_service is not None:
+                freshness = await self.isolation_service.ensure_fresh_isolation_for_offline_canary()
             binding = self._sealed_binding()
             async with self._permit_lock:
                 permit = self.store.issue_codex_canary_execution_permit(
@@ -979,7 +1188,15 @@ class CodexCanaryExecutionPermitGate:
             if not isinstance(window_nonce, str):
                 self.store.abort_codex_canary_execution_permit(permit_id, "server_handoff_failed")
                 raise PolicyError("server_handoff_failed")
-            return await self.run_one_shot(permit_nonce, window_nonce)
+            result = await self.run_one_shot(permit_nonce, window_nonce)
+            if freshness is not None:
+                result.update({
+                    "reused": bool(freshness.get("reused")),
+                    "actual_probe_executed": bool(freshness.get("actual_probe_executed")),
+                    "remaining_seconds": int(freshness.get("remaining_seconds") or 0),
+                    "probe_request_count": int(freshness.get("probe_request_count") or 1),
+                })
+            return result
         finally:
             permit_nonce = None
             window_nonce = None

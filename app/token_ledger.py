@@ -185,7 +185,16 @@ def normalize_usage_event(payload: Mapping[str, Any]) -> dict[str, Any]:
         "request_hash",
         "response_hash",
         "output_hash",
+        "agent_message_count",
+        "output_byte_count",
+        "output_sha256",
+        "last_message_exists",
+        "last_message_sha256",
+        "last_message_match",
+        "marker_match",
         "sensitive_headers_removed",
+        "removed_count",
+        "post_filter_count",
         "supervisor_processes",
         "bwrap_processes",
         "codex_processes",
@@ -224,17 +233,25 @@ def normalize_usage_event(payload: Mapping[str, Any]) -> dict[str, Any]:
     for field in ("stage", "error_code"):
         if field in record and record[field] is not None:
             record[field] = _string_field(record, field, required=False)
-    for field in ("exit_code", "stdout_bytes", "stderr_bytes", "supervisor_processes", "bwrap_processes", "codex_processes", "local_processes"):
+    for field in ("exit_code", "stdout_bytes", "stderr_bytes", "supervisor_processes", "bwrap_processes", "codex_processes", "local_processes", "agent_message_count", "output_byte_count"):
         if field in record:
             record[field] = _optional_int(record, field)
     if "cleanup_ok" in record and record["cleanup_ok"] is not None and not isinstance(record["cleanup_ok"], bool):
         raise PolicyError("usage event cleanup flag is invalid")
     if "sensitive_headers_removed" in record and record["sensitive_headers_removed"] is not None and not isinstance(record["sensitive_headers_removed"], bool):
         raise PolicyError("usage event header proof is invalid")
-    for field in ("request_hash", "response_hash", "output_hash"):
+    for field in ("request_hash", "response_hash", "output_hash", "output_sha256", "last_message_sha256"):
         if field in record and record[field] is not None:
             if not isinstance(record[field], str) or not re.fullmatch(r"[0-9a-f]{64}", record[field]):
                 raise PolicyError("usage event proof hash is invalid")
+    for field in ("removed_count", "post_filter_count"):
+        if field in record and (isinstance(record[field], bool) or not isinstance(record[field], int) or record[field] < 0):
+            raise PolicyError("usage event header proof counter is invalid")
+    if record.get("post_filter_count", 0) != 0:
+        raise PolicyError("usage event header proof is invalid")
+    for field in ("last_message_exists", "last_message_match", "marker_match"):
+        if field in record and record[field] is not None and not isinstance(record[field], bool):
+            raise PolicyError("usage event output proof flag is invalid")
     _normalize_tokens(record)
     for field in ("codex_context_bytes", "web_packet_bytes", "evidence_bytes", "source_bytes", "catalog_source_bytes", "probe_bytes", "model_turns", "high_model_turns", "retries", "reroutes", "compactions", "subagent_count"):
         record[field] = _optional_int(record, field)

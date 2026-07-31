@@ -23,6 +23,7 @@ from .policy import (
     validate_wsl_distro,
 )
 from .token_ledger import build_report, normalize_baseline_payload, normalize_run_record, normalize_usage_event, render_markdown
+from .codex_wire_contract import INPUT_SHAPE_FIELDS
 
 
 DEFAULT_USAGE_THRESHOLDS = {"conserve": 70, "critical": 90, "blocked": 100}
@@ -2924,10 +2925,36 @@ class Store:
         legacy_diagnostic_fields = {"stage", "stdout_bytes", "stderr_bytes", "cleanup_ok"}
         diagnostic_fields = {
             "stage", "stdout_bytes", "stderr_bytes", "cleanup_ok", "output_hash",
-            "sensitive_headers_removed", "marker_verified",
+            "sensitive_headers_removed", "removed_count", "post_filter_count", "marker_verified", "request_seen", "request_validated",
+            "response_sent", "accepted_post",
+            "strict_http_reject_reason", "request_header_count", "request_body_bytes",
+            "request_body_sha256", "request_json_keyset_hash", "input_shape",
+            "agent_message_count", "output_byte_count", "output_sha256",
+            "last_message_exists", "last_message_regular", "last_message_size",
+            "last_message_sha256", "last_message_match", "last_message_marker_match", "marker_match",
         }
         legacy = set(value) == required or set(value) == required | legacy_diagnostic_fields
-        if not legacy and set(value) != required | diagnostic_fields:
+        if legacy:
+            # Historical RUNNING records predate sealed relay observations.
+            # Normalize absence to explicit NOT_REACHED values without
+            # inventing any output proof.
+            value.update({
+                "stage": value.get("stage"), "stdout_bytes": value.get("stdout_bytes", 0),
+                "stderr_bytes": value.get("stderr_bytes", 0), "cleanup_ok": value.get("cleanup_ok"),
+                "output_hash": None, "sensitive_headers_removed": False, "marker_verified": False,
+                "removed_count": 0, "post_filter_count": 0,
+                "request_seen": 0, "request_validated": 0, "response_sent": 0,
+                "accepted_post": value.get("request_count", 0),
+                "strict_http_reject_reason": None, "request_header_count": 0,
+                "request_body_bytes": 0, "request_body_sha256": hashlib.sha256(b"").hexdigest(),
+                "request_json_keyset_hash": None, "input_shape": None,
+                "agent_message_count": 0, "output_byte_count": 0, "output_sha256": None,
+                "last_message_exists": False, "last_message_regular": False,
+                "last_message_size": 0, "last_message_sha256": None,
+                "last_message_match": False, "last_message_marker_match": False,
+                "marker_match": False,
+            })
+        elif set(value) != required | diagnostic_fields:
             raise PolicyError("codex process canary fields are invalid")
         try:
             uuid.UUID(str(value["canary_id"]))
@@ -2948,9 +2975,13 @@ class Store:
             raise PolicyError("codex process canary timestamp is invalid")
         if final != (value["finished_at"] is not None) or (value["finished_at"] is not None and not isinstance(value["finished_at"], str)):
             raise PolicyError("codex process canary completion timestamp is invalid")
-        for field in ("request_count", "output_bytes", "local_processes", "local_duration_ms", "supervisor_processes", "bwrap_processes", "codex_processes"):
+        for field in ("request_count", "request_seen", "request_validated", "response_sent", "accepted_post", "output_bytes", "local_processes", "local_duration_ms", "supervisor_processes", "bwrap_processes", "codex_processes"):
             if isinstance(value[field], bool) or not isinstance(value[field], int) or value[field] < 0:
                 raise PolicyError("codex process canary counter is invalid")
+        if any(value[field] not in (0, 1) for field in ("request_seen", "request_validated", "response_sent", "accepted_post")):
+            raise PolicyError("codex process canary counter is invalid")
+        if not legacy and value["request_count"] != value["accepted_post"]:
+            raise PolicyError("codex process canary counter is invalid")
         if any(value[field] for field in ("supervisor_processes", "bwrap_processes", "codex_processes")) and value["local_processes"] != sum(
             value[field] for field in ("supervisor_processes", "bwrap_processes", "codex_processes")
         ):
@@ -2979,8 +3010,68 @@ class Store:
                 raise PolicyError("codex process canary cleanup flag is invalid")
             if value["output_hash"] is not None and (not isinstance(value["output_hash"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["output_hash"])):
                 raise PolicyError("codex process canary output hash is invalid")
+            for field in ("agent_message_count", "output_byte_count", "last_message_size"):
+                if isinstance(value[field], bool) or not isinstance(value[field], int) or value[field] < 0:
+                    raise PolicyError("codex process canary output proof counter is invalid")
+            for field in ("output_sha256", "last_message_sha256"):
+                if value[field] is not None and (not isinstance(value[field], str) or not re.fullmatch(r"[0-9a-f]{64}", value[field])):
+                    raise PolicyError("codex process canary output proof hash is invalid")
+            if any(not isinstance(value[field], bool) for field in (
+                "last_message_exists", "last_message_regular", "last_message_match",
+                "last_message_marker_match", "marker_match",
+            )):
+                raise PolicyError("codex process canary output proof flag is invalid")
+            if (
+                value["last_message_match"] != value["last_message_marker_match"]
+                or value["last_message_match"] and (
+                    not value["last_message_exists"] or not value["last_message_regular"]
+                    or value["last_message_sha256"] is None
+                )
+                or value["agent_message_count"] == 0 and (
+                    value["output_byte_count"] != 0 or value["output_sha256"] is not None
+                )
+                or value["agent_message_count"] > 0 and (
+                    value["output_byte_count"] <= 0 or value["output_sha256"] is None
+                )
+                or value["marker_match"] and (
+                    value["agent_message_count"] != 1 or value["output_sha256"] is None
+                    or value["last_message_sha256"] is None or not value["last_message_match"]
+                    or value["output_sha256"] != value["last_message_sha256"]
+                )
+            ):
+                raise PolicyError("codex process canary output proof is invalid")
             if not isinstance(value["sensitive_headers_removed"], bool) or not isinstance(value["marker_verified"], bool):
                 raise PolicyError("codex process canary proof flag is invalid")
+            for field in ("removed_count", "post_filter_count"):
+                if isinstance(value[field], bool) or not isinstance(value[field], int) or value[field] < 0:
+                    raise PolicyError("codex process canary header proof counter is invalid")
+            if value["post_filter_count"] != 0:
+                raise PolicyError("codex process canary header proof is invalid")
+            if value.get("strict_http_reject_reason") is not None and value["strict_http_reject_reason"] not in {
+                "request_line", "method", "path", "host", "duplicate_header", "content_type", "content_length",
+                "transfer_encoding", "body_size", "json_decode", "json_schema", "model", "stream", "store",
+                "input", "include", "unknown_field", "input_not_array", "input_count", "input_item_type",
+                "input_item_schema", "input_role", "input_content_type", "input_text", "input_prompt_hash",
+            }:
+                raise PolicyError("codex process canary reject reason is invalid")
+            shape = value.get("input_shape")
+            if shape is not None:
+                if not isinstance(shape, dict) or set(shape) != set(INPUT_SHAPE_FIELDS):
+                    raise PolicyError("codex process canary input shape is invalid")
+                for field in ("item_count",):
+                    if isinstance(shape.get(field), bool) or not isinstance(shape.get(field), int) or shape[field] < 0:
+                        raise PolicyError("codex process canary input shape is invalid")
+                for field in ("item_type_ids", "role_ids", "content_type_ids", "item_key_presence_masks", "content_counts", "text_byte_counts", "text_sha256s"):
+                    if not isinstance(shape.get(field), list):
+                        raise PolicyError("codex process canary input shape is invalid")
+                if not isinstance(shape.get("shape_hash"), str) or not re.fullmatch(r"[0-9a-f]{64}", shape["shape_hash"]):
+                    raise PolicyError("codex process canary input shape is invalid")
+            for field in ("request_header_count", "request_body_bytes"):
+                if isinstance(value.get(field), bool) or not isinstance(value.get(field), int) or value[field] < 0:
+                    raise PolicyError("codex process canary request counter is invalid")
+            for field in ("request_body_sha256", "request_json_keyset_hash"):
+                if value.get(field) is not None and (not isinstance(value[field], str) or not re.fullmatch(r"[0-9a-f]{64}", value[field])):
+                    raise PolicyError("codex process canary request digest is invalid")
         # Every stored field is an identifier, scalar counter, timestamp, or
         # digest.  This prevents accidental storage of private process inputs.
         return value
@@ -3941,6 +4032,17 @@ class Store:
             raise PolicyError("codex_canary_ledger_counter_invalid")
         if any(component_counts.values()) and sum(component_counts.values()) != observed_processes:
             raise PolicyError("codex_canary_ledger_counter_invalid")
+        relay_counts = {
+            field: int(result.get(field) or 0) if not plan and action in {"BLOCKED", "RUN"} else 0
+            for field in ("request_seen", "request_validated", "response_sent", "accepted_post")
+        }
+        if (
+            any(value not in (0, 1) for value in relay_counts.values())
+            or relay_counts["accepted_post"] != relay_counts["request_validated"]
+            or relay_counts["response_sent"] > relay_counts["accepted_post"]
+            or relay_counts["request_validated"] > relay_counts["request_seen"]
+        ):
+            raise PolicyError("codex_canary_ledger_counter_invalid")
         record = {
             "source_event_id": f"sealed-offline-codex-process-canary:{identifier}:{action}",
             "source": source, "quality": quality,
@@ -3961,7 +4063,18 @@ class Store:
             "request_hash": result.get("request_hash") if isinstance(result.get("request_hash"), str) else None,
             "response_hash": result.get("response_hash") if isinstance(result.get("response_hash"), str) else None,
             "output_hash": result.get("output_hash") if isinstance(result.get("output_hash"), str) else None,
+            "agent_message_count": int(result.get("agent_message_count") or 0) if not plan else 0,
+            "output_byte_count": int(result.get("output_byte_count") or 0) if not plan else 0,
+            "output_sha256": result.get("output_sha256") if isinstance(result.get("output_sha256"), str) else None,
+            "last_message_exists": result.get("last_message_exists") if isinstance(result.get("last_message_exists"), bool) else False,
+            "last_message_sha256": result.get("last_message_sha256") if isinstance(result.get("last_message_sha256"), str) else None,
+            "last_message_match": result.get("last_message_match") if isinstance(result.get("last_message_match"), bool) else False,
+            "marker_match": result.get("marker_match") if isinstance(result.get("marker_match"), bool) else False,
             "sensitive_headers_removed": result.get("sensitive_headers_removed") if isinstance(result.get("sensitive_headers_removed"), bool) else None,
+            "removed_count": int(result.get("removed_count") or 0),
+            "post_filter_count": int(result.get("post_filter_count") or 0),
+            "request_count": relay_counts["accepted_post"],
+            **relay_counts,
             "planned_local_processes": 1 if plan and action == "ARM" else (1 if plan and action == "RUN" else 0),
             "local_executions": 1 if action in {"BLOCKED", "RUN"} and not plan else 0,
             "local_processes": observed_processes,

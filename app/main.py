@@ -302,6 +302,7 @@ async def lifespan(app: FastAPI):
     )
     app.state.codex_canary_execution_permit_gate = CodexCanaryExecutionPermitGate(
         store, app.state.codex_process_canary_service,
+        isolation_service=app.state.wsl_isolation_service,
     )
     app.state.sealed_egress_harness_runner_version = WSL_EGRESS_RUNNER_VERSION
     BridgeService(store, gate_instance.create_route_plan).recover_processing_on_startup()

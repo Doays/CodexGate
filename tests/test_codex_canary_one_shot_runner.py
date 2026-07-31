@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -56,16 +57,51 @@ class NoIoSupervisor:
         if on_started is not None:
             on_started()
         proof = synthetic_relay_broker_roundtrip()
+        event_types = [] if self.bad_frame else ["thread.started", "turn.started", "item.completed", "turn.completed"]
+        event_counts = {} if self.bad_frame else {
+            "thread.started": 1, "turn.started": 1, "item.completed": 1, "turn.completed": 1,
+        }
         payload = {
             "status": "ERROR" if self.bad_frame else "PASSED", "stage": "CLEANUP", "substage": None,
             "error_code": "cleanup_failed" if self.bad_frame else None,
             "process_counts": {"supervisor": 1, "broker_bwrap": 1, "relay_codex_bwrap": 1, "codex_cli": 1},
             "cleanup_ok": not self.bad_frame, "implementation_hash": EXECUTOR_IMPLEMENTATION_HASH,
-            "request_count": 0 if self.bad_frame else proof["request_count"],
+            "request_seen": 0 if self.bad_frame else proof["request_seen"],
+            "request_validated": 0 if self.bad_frame else proof["request_validated"],
+            "response_sent": 0 if self.bad_frame else proof["response_sent"],
+            "accepted_post": 0 if self.bad_frame else proof["accepted_post"],
             "request_hash": None if self.bad_frame else proof["request_hash"],
             "response_hash": None if self.bad_frame else proof["response_hash"],
+            "response_byte_count": 0 if self.bad_frame else proof["response_byte_count"],
             "output_hash": None if self.bad_frame else proof["output_hash"],
             "sensitive_headers_removed": False if self.bad_frame else proof["sensitive_headers_removed"],
+            "event_types": event_types,
+            "event_counts": event_counts,
+            "event_sequence_hash": hashlib.sha256(
+                canonical_json({"event_types": event_types, "event_counts": event_counts}).encode("utf-8")
+            ).hexdigest(),
+            "last_message_exists": not self.bad_frame,
+            "last_message_regular": not self.bad_frame,
+            "last_message_size": 0 if self.bad_frame else len(SUCCESS_MARKER.encode("utf-8")),
+            "last_message_sha256": None if self.bad_frame else proof["output_hash"],
+            "last_message_match": not self.bad_frame,
+            "last_message_marker_match": not self.bad_frame,
+            "marker_match": not self.bad_frame,
+            "agent_message_count": 0 if self.bad_frame else 1,
+            "output_byte_count": 0 if self.bad_frame else len(SUCCESS_MARKER.encode("utf-8")),
+            "output_sha256": None if self.bad_frame else proof["output_hash"],
+            "eof_stdout_drained": not self.bad_frame,
+            "eof_stderr_drained": not self.bad_frame,
+            "readers_joined": not self.bad_frame,
+            "usage": None if self.bad_frame else {
+                "input_tokens": 7,
+                "cached_input_tokens": 2,
+                "cache_write_input_tokens": 0,
+                "output_tokens": 3,
+                "reasoning_output_tokens": 1,
+            },
+            "child_schema_diagnostic": None,
+            "codex_exit_code": None if self.bad_frame else 0,
         }
         return ProcessResult(exit_code=0, stdout=encode_supervisor_frame(payload), stderr="")
 
@@ -119,6 +155,51 @@ def test_one_shot_claim_precedes_runner_and_executor_creation(tmp_path):
     assert permit["permit_nonce"] not in repr(claim) and window["canary_nonce"] not in repr(claim)
     assert store.codex_canary_execution_permit()["status"] == "CONSUMED"
     assert store.codex_process_canary_window()["status"] == "CONSUMED"
+    assert {
+        field: result[field]
+        for field in (
+            "request_seen", "request_validated", "response_sent", "accepted_post",
+        )
+    } == {
+        "request_seen": 1, "request_validated": 1,
+        "response_sent": 1, "accepted_post": 1,
+    }
+    stored = store.codex_process_canary_result(
+        result["contract_hash"], result["runner_kind"], result["runner_version"],
+        result["runner_implementation_hash"],
+    )
+    assert stored["request_count"] == stored["accepted_post"] == 1
+    ledger = next(
+        event for event in store.ledger_usage_events()
+        if event.get("action") == "RUN"
+    )
+    assert {
+        field: ledger[field]
+        for field in (
+            "request_seen", "request_validated", "response_sent", "accepted_post",
+        )
+    } == {
+        "request_seen": 1, "request_validated": 1,
+        "response_sent": 1, "accepted_post": 1,
+    }
+    assert ledger["request_count"] == ledger["accepted_post"] == 1
+    for proof in (result, stored, ledger):
+        assert {
+            field: proof[field]
+            for field in (
+                "agent_message_count", "output_byte_count", "output_sha256",
+                "last_message_exists", "last_message_sha256", "last_message_match", "marker_match",
+            )
+        } == {
+            "agent_message_count": 1,
+            "output_byte_count": len(SUCCESS_MARKER.encode("utf-8")),
+            "output_sha256": EXPECTED_OUTPUT_HASH,
+            "last_message_exists": True,
+            "last_message_sha256": EXPECTED_OUTPUT_HASH,
+            "last_message_match": True,
+            "marker_match": True,
+        }
+        assert SUCCESS_MARKER not in repr(proof)
 
 
 @pytest.mark.parametrize("permit_nonce,window_nonce,error", [
@@ -210,6 +291,16 @@ def test_partial_failure_records_only_observed_started_processes(tmp_path):
     assert event["source"] == "LOCAL_OBSERVED" and event["quality"] == "OBSERVED"
     assert event["local_processes"] == 4 and event["local_duration_ms"] >= 0
     assert (event["supervisor_processes"], event["bwrap_processes"], event["codex_processes"]) == (1, 2, 1)
+    assert {
+        field: event[field]
+        for field in (
+            "request_seen", "request_validated", "response_sent", "accepted_post",
+        )
+    } == {
+        "request_seen": 0, "request_validated": 0,
+        "response_sent": 0, "accepted_post": 0,
+    }
+    assert event["request_count"] == event["accepted_post"] == 0
     assert event["provider_total_tokens"] is None and event["external_model_requests"] == 0
     assert event["app_server_rpc_calls"] == 0 and event["ignored_usage"] is True
 
@@ -228,7 +319,6 @@ def test_one_shot_returns_exact_supervisor_substage(tmp_path):
                 "process_counts": {"supervisor": 1, "broker_bwrap": 1, "relay_codex_bwrap": 0, "codex_cli": 0},
                 "cleanup_ok": True,
                 "implementation_hash": EXECUTOR_IMPLEMENTATION_HASH,
-                "request_count": 0,
                 "request_hash": None,
                 "response_hash": None,
                 "output_hash": None,

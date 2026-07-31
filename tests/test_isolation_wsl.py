@@ -213,6 +213,46 @@ def test_offline_canary_refresh_bypasses_a_near_expiry_cache_once(tmp_path):
     )
 
 
+def test_offline_freshness_reuses_only_when_601_seconds_remain(tmp_path):
+    store, service = configured(tmp_path)
+    first = asyncio.run(service.probe())
+    cached = {
+        **first,
+        "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=601)).isoformat(),
+        "reused": False,
+    }
+    store.save_wsl_isolation_result(cached)
+    before = sum("--unshare-all" in call for call in service.runner.calls)
+    result = asyncio.run(service.ensure_fresh_isolation_for_offline_canary())
+    after = sum("--unshare-all" in call for call in service.runner.calls)
+    assert result["reused"] is True
+    assert result["actual_probe_executed"] is False
+    assert result["remaining_seconds"] >= 600
+    assert after == before
+
+
+def test_offline_freshness_refreshes_when_599_seconds_remain_and_reads_new_row(tmp_path):
+    store, service = configured(tmp_path)
+    first = asyncio.run(service.probe())
+    stale = {
+        **first,
+        "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=599)).isoformat(),
+        "reused": False,
+    }
+    store.save_wsl_isolation_result(stale)
+    before_id = stale["result_id"]
+    before = sum("--unshare-all" in call for call in service.runner.calls)
+    result = asyncio.run(service.ensure_fresh_isolation_for_offline_canary())
+    after = sum("--unshare-all" in call for call in service.runner.calls)
+    latest = store.wsl_isolation_result()
+    assert result["reused"] is False
+    assert result["actual_probe_executed"] is True
+    assert result["result_id"] == latest["result_id"]
+    assert result["result_id"] != before_id
+    assert result["remaining_seconds"] >= 600
+    assert after == before + 1
+
+
 def test_orphaned_probing_record_is_recovered_once(tmp_path):
     store = Store(tmp_path / "data")
     now = datetime.now(timezone.utc).isoformat()
